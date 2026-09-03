@@ -459,5 +459,140 @@ class TestFormatScanner(unittest.TestCase):
         self.assertEqual(scan_typography_flaws(all_newlines), [])
 
 
+    def test_unclosed_bracket_not_swallowing_full_text(self):
+        """测试未闭合括号（【 或 [）在超步长、连续空行或到达 EOF 时严禁贪婪吞噬全文"""
+        # 场景 A：直到 EOF 仍无闭合括号，不能把正文全部吞掉
+        text_eof = (
+            "【这是一段未闭合的备忘或前瞻设定\n"
+            "第一章 降临\n"
+            "少年站在高耸入云的山巅之上，衣袍随狂风猎猎作响。\n"
+            "然而山脚下的万千妖兽早已集结完毕，嘶吼声响彻云霄。\n"
+            "他的宿主系统并没有给出任何升级警报。"
+        )
+        masked_eof, masks_eof = mask_special_blocks(text_eof)
+        self.assertEqual(masked_eof.count("\n"), text_eof.count("\n"))
+        # 未闭合括号不应形成 system_panel 掩码
+        panel_masks_eof = [m for m in masks_eof if m["type"] == "system_panel"]
+        self.assertEqual(len(panel_masks_eof), 0)
+        # 正文内容完全保留
+        masked_lines_eof = masked_eof.split("\n")
+        self.assertEqual(masked_lines_eof[0], "【这是一段未闭合的备忘或前瞻设定")
+        self.assertEqual(masked_lines_eof[3], "然而山脚下的万千妖兽早已集结完毕，嘶吼声响彻云霄。")
+
+        # 验证格式扫描器依然能检出正文中的 AI 连词
+        flaws_eof = scan_typography_flaws(text=masked_eof, original_text=text_eof)
+        ai_flaws_eof = [f for f in flaws_eof if f.flaw_type == "AI_CONJUNCTION"]
+        self.assertEqual(len(ai_flaws_eof), 1)
+        self.assertEqual(ai_flaws_eof[0].line_number, 4)
+        self.assertIn("然而", ai_flaws_eof[0].snippet)
+
+        # 场景 B：遇到连续空行提前中断，绝不吞噬后续独立正文段落
+        text_empty = (
+            "【未闭合章节备忘\n"
+            "随手记录的一些杂项灵感。\n"
+            "\n"
+            "\n"
+            "第二章 激战\n"
+            "刀光剑影之中，剑客拔剑出鞘。\n"
+            "与此同时，黑衣人首领冷笑一声。"
+        )
+        masked_empty, masks_empty = mask_special_blocks(text_empty)
+        self.assertEqual(masked_empty.count("\n"), text_empty.count("\n"))
+        panel_masks_empty = [m for m in masks_empty if m["type"] == "system_panel"]
+        self.assertEqual(len(panel_masks_empty), 0)
+        flaws_empty = scan_typography_flaws(text=masked_empty, original_text=text_empty)
+        ai_flaws_empty = [f for f in flaws_empty if f.flaw_type == "AI_CONJUNCTION"]
+        self.assertEqual(len(ai_flaws_empty), 1)
+        self.assertEqual(ai_flaws_empty[0].line_number, 7)
+        self.assertIn("与此同时", ai_flaws_empty[0].snippet)
+
+    def test_panel_followed_by_dialogue_not_swallowed(self):
+        """测试系统面板紧跟人物对话时，严禁误吞对话台词，对话中长句与AI连词仍可检出"""
+        text = (
+            "【系统面板】\n"
+            "宿主：林冲\n"
+            "境界：通幽境一层\n"
+            "力量：150\n"
+            "敏捷：120\n"
+            "林冲冷笑道：“贼将休走，吃我一枪！”\n"
+            "然而贼将拍马便走，丝毫不做停留。\n"
+            "李逵大吼道：“哪里跑，吃俺铁牛一双板斧，今日定要叫尔等贼寇死无葬身之地，休想全身而退！”"
+        )
+        masked, masks = mask_special_blocks(text)
+        self.assertEqual(masked.count("\n"), text.count("\n"))
+        # 仅第 1 到 5 行是系统面板
+        self.assertEqual(len(masks), 1)
+        self.assertEqual(masks[0]["type"], "system_panel")
+        self.assertEqual(masks[0]["start_line"], 1)
+        self.assertEqual(masks[0]["end_line"], 5)
+
+        masked_lines = masked.split("\n")
+        # 验证面板行被清空
+        for idx in range(5):
+            self.assertEqual(masked_lines[idx], "")
+        # 验证紧跟的对话行与后续正文行未被掩码吞噬
+        self.assertEqual(masked_lines[5], "林冲冷笑道：“贼将休走，吃我一枪！”")
+        self.assertEqual(masked_lines[6], "然而贼将拍马便走，丝毫不做停留。")
+
+        # 验证格式扫描器正常检出正文中的 AI 连词
+        flaws = scan_typography_flaws(text=masked, original_text=text)
+        ai_flaws = [f for f in flaws if f.flaw_type == "AI_CONJUNCTION"]
+        self.assertEqual(len(ai_flaws), 1)
+        self.assertEqual(ai_flaws[0].line_number, 7)
+        self.assertIn("然而", ai_flaws[0].snippet)
+
+    def test_bracket_multiline_panel_and_single_line_poems(self):
+        """测试 [ ... ] 跨行面板识别与单句断行诗词口诀掩码"""
+        text = (
+            "战局骤然逆转。\n"
+            "[\n"
+            "战局结算面板\n"
+            "宿主经验值增加：5000点\n"
+            "掉落战利品：玄铁重剑\n"
+            "战力评估：天阶初期\n"
+            "]\n"
+            "硝烟散去，长风吹过荒原。\n"
+            "白日依山尽，\n"
+            "黄河入海流。\n"
+            "欲穷千里目，\n"
+            "更上一层楼。\n"
+            "此情此景，让人心潮澎湃。"
+        )
+        masked, masks = mask_special_blocks(text)
+        self.assertEqual(masked.count("\n"), text.count("\n"))
+        self.assertEqual(len(masks), 2)
+        types = [m["type"] for m in masks]
+        self.assertIn("system_panel", types)
+        self.assertIn("poem", types)
+
+        panel_mask = next(m for m in masks if m["type"] == "system_panel")
+        self.assertEqual(panel_mask["start_line"], 2)
+        self.assertEqual(panel_mask["end_line"], 7)
+
+        poem_mask = next(m for m in masks if m["type"] == "poem")
+        self.assertEqual(poem_mask["start_line"], 9)
+        self.assertEqual(poem_mask["end_line"], 12)
+
+        masked_lines = masked.split("\n")
+        # 验证正文第 1、8、13 行保留
+        self.assertEqual(masked_lines[0], "战局骤然逆转。")
+        self.assertEqual(masked_lines[7], "硝烟散去，长风吹过荒原。")
+        self.assertEqual(masked_lines[12], "此情此景，让人心潮澎湃。")
+
+    def test_snippet_indent_alignment(self):
+        """测试左侧带有空白缩进时，AI连词与对话描写的 snippet 切片坐标精确对齐"""
+        text = (
+            "    然而事情的发展出乎了所有人的预料。\n"
+            "　　林冲叹息道：“罢了。”" + "长" * 90
+        )
+        flaws = scan_typography_flaws(text)
+        ai_flaw = next(f for f in flaws if f.flaw_type == "AI_CONJUNCTION")
+        self.assertTrue(ai_flaw.snippet.startswith("然而"))
+
+        dialogue_flaw = next(f for f in flaws if f.flaw_type == "DIALOGUE_MIXED")
+        self.assertTrue("罢了" in dialogue_flaw.snippet)
+        self.assertTrue(dialogue_flaw.snippet.startswith("“") or dialogue_flaw.snippet.startswith('"'))
+
+
 if __name__ == "__main__":
     unittest.main()
