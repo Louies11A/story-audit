@@ -132,13 +132,13 @@ class PatchSpec:
 - Create: `scripts/types.py`
 - Test: `tests/test_types.py`
 
-- [ ] **Step 1: 编写数据类测试**
+- [x] **Step 1: 编写数据类测试**
   测试 ChapterItem, FormatFinding, BoundaryContext, PatchSpec 的实例化与默认值。
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
   `python -m unittest tests/test_types.py`
-- [ ] **Step 3: 实现 scripts/types.py**
-- [ ] **Step 4: 运行测试确认通过**
-- [ ] **Step 5: 提交 Git**
+- [x] **Step 3: 实现 scripts/types.py**
+- [x] **Step 4: 运行测试确认通过**
+- [x] **Step 5: 提交 Git**
   `git add scripts/types.py tests/test_types.py && git commit -m "feat(core): 定义全系统核心数据类与类型注解契约"`
 
 ---
