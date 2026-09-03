@@ -27,23 +27,32 @@ SYSTEM_PANEL_KEYWORDS = {
     "面板", "抽奖", "积分", "金币", "声望", "掉落"
 }
 
-# AI 翻译腔高频连词库
-AI_CONJUNCTION_WORDS = (
-    "然而",
-    "与此同时",
-    "不可否认的是",
-    "值得注意的是",
-    "仿佛在昭示着什么",
-    "不由得",
-    "毫无疑问",
-    "显而易见的是",
-    "显而易见",
-    "不难看出",
-    "正如前文所述",
-    "毋庸置疑",
-    "总而言之",
-    "换句话说",
+# AI 翻译腔高频连词库（按长度降序预排序，确保正则引擎优先匹配最长连词）
+AI_CONJUNCTION_WORDS = tuple(
+    sorted(
+        (
+            "仿佛在昭示着什么",
+            "不可否认的是",
+            "值得注意的是",
+            "显而易见的是",
+            "正如前文所述",
+            "与此同时",
+            "毫无疑问",
+            "显而易见",
+            "不难看出",
+            "毋庸置疑",
+            "总而言之",
+            "换句话说",
+            "不由得",
+            "然而",
+        ),
+        key=len,
+        reverse=True,
+    )
 )
+
+# 预编译 AI 翻译腔高频连词正则模式
+AI_CONJUNCTION_PATTERN = re.compile("|".join(re.escape(w) for w in AI_CONJUNCTION_WORDS))
 
 # 标点符号与切分模式（包含所有常见中英文标点及空白）
 PUNCTUATION_SPLIT_PATTERN = re.compile(r'[。！？!?,，、；;：:—…“”"\'’（）()《》【】\s]+')
@@ -55,6 +64,66 @@ def _make_snippet(text: str, max_len: int = 60) -> str:
     if len(clean) <= max_len:
         return clean
     return clean[:max_len]
+
+
+def _is_panel_attr_line(line: str) -> bool:
+    """
+    判断一行是否为合法的系统面板属性键值行。
+
+    规则：
+    1. 严禁将包含对话引号（“、”、"）的人物台词误判为面板行；
+    2. 必须包含冒号（：或 :）；
+    3. 冒号前面的属性名长度需受限（如 <= 8 字且无标点逗号句号等），
+       或行内包含数值/等级特征。
+    """
+    s = line.strip()
+    if not s:
+        return False
+
+    # 规则 1：严禁包含任何对话引号
+    if any(q in s for q in ('“', '”', '"')):
+        return False
+
+    # 规则 2：必须包含冒号
+    pos_cn = s.find("：")
+    pos_en = s.find(":")
+    if pos_cn != -1 and pos_en != -1:
+        colon_pos = min(pos_cn, pos_en)
+    elif pos_cn != -1:
+        colon_pos = pos_cn
+    elif pos_en != -1:
+        colon_pos = pos_en
+    else:
+        return False
+
+    left_part = s[:colon_pos].strip()
+    right_part = s[colon_pos + 1:].strip()
+
+    # 清理前缀列表符号及两端常见属性括号
+    key = left_part.lstrip("-*•·| ").strip()
+    for b_start, b_end in (("【", "】"), ("[", "]"), ("(", ")"), ("（", "）")):
+        if key.startswith(b_start) and key.endswith(b_end):
+            key = key[len(b_start):-len(b_end)].strip()
+            break
+
+    if not key:
+        return False
+
+    # 属性名严禁包含断句标点（逗号句号感叹号问号分号等）
+    if any(p in key for p in '，。！？；,!?;、…~'):
+        return False
+
+    # 属性名长度受限（<= 8 字）
+    key_len_valid = len(key) <= 8
+
+    # 行内包含数值/等级特征
+    has_feature = bool(
+        re.search(r'\d+|[a-zA-Z]+|[+%/]|级|阶|层|重|品|星|段|榜', s)
+        or any(kw in key for kw in SYSTEM_PANEL_KEYWORDS)
+        or any(kw in right_part for kw in ("无", "正常", "良好", "重伤", "中毒", "濒死", "封印", "满", "未知"))
+    )
+
+    return key_len_valid or has_feature
 
 
 def _analyze_couplet_line(line: str) -> Optional[int]:
@@ -152,48 +221,105 @@ def mask_special_blocks(text: str) -> Tuple[str, List[Dict[str, Any]]]:
         line_s = lines[i].lstrip()
         if line_s.startswith(("【", "[", "|")):
             start_idx = i
-            # 探索该连续块的范围
+
             if line_s.startswith("|"):
                 # 表格块：连续以 | 开头
                 while i < n_lines and lines[i].lstrip().startswith("|"):
                     i += 1
-            elif line_s.startswith("【") and not line_s.endswith("】") and "】" not in line_s:
-                # 跨多行未闭合的【 ... 】
-                while i < n_lines and "】" not in lines[i]:
-                    i += 1
-                if i < n_lines:
-                    i += 1
-            elif line_s.startswith("[") and not line_s.endswith("]") and "]" not in line_s:
-                # 跨多行未闭合的 [ ... ]
-                while i < n_lines and "]" not in lines[i]:
-                    i += 1
-                if i < n_lines:
-                    i += 1
+                end_idx = i - 1
+                block_content = "\n".join(lines[start_idx:end_idx + 1])
+                if any(kw in block_content for kw in SYSTEM_PANEL_KEYWORDS):
+                    for k in range(start_idx, end_idx + 1):
+                        masked_line_indices.add(k)
+                    masks_info.append({
+                        "type": "system_panel",
+                        "start_line": start_idx + 1,
+                        "end_line": end_idx + 1,
+                        "raw_content": block_content,
+                    })
+
+            elif (line_s.startswith("【") and "】" not in line_s) or (line_s.startswith("[") and "]" not in line_s):
+                # 跨多行未闭合的【 ... 】或 [ ... ]
+                close_char = "】" if line_s.startswith("【") else "]"
+                found_close = False
+                close_idx = -1
+                consecutive_empty = 0
+                MAX_SPAN_LINES = 25
+
+                j = start_idx + 1
+                while j < n_lines and (j - start_idx) <= MAX_SPAN_LINES:
+                    curr_line = lines[j]
+                    if not curr_line.strip():
+                        consecutive_empty += 1
+                        if consecutive_empty >= 2:
+                            # 连续空行提前中断
+                            break
+                    else:
+                        consecutive_empty = 0
+
+                    if close_char in curr_line:
+                        found_close = True
+                        close_idx = j
+                        break
+                    j += 1
+
+                if not found_close:
+                    # 未找到闭合括号（EOF、超步长或连续空行中断），判定为非面板普通文本
+                    # 回滚游标 i = start_idx + 1，严禁将整章正文清空
+                    i = start_idx + 1
+                    continue
+
+                end_idx = close_idx
+                i = close_idx + 1
+                block_content = "\n".join(lines[start_idx:end_idx + 1])
+                if any(kw in block_content for kw in SYSTEM_PANEL_KEYWORDS):
+                    for k in range(start_idx, end_idx + 1):
+                        masked_line_indices.add(k)
+                    masks_info.append({
+                        "type": "system_panel",
+                        "start_line": start_idx + 1,
+                        "end_line": end_idx + 1,
+                        "raw_content": block_content,
+                    })
+
             else:
-                # 单行或连续类似格式行
+                # 第一行已经闭合（如【系统面板】、[个人属性]）或单行属性块
+                # 探测后续连续面板行与合法属性键值行
+                i += 1
                 while i < n_lines:
                     curr_s = lines[i].lstrip()
                     if not curr_s:
+                        # 遇到空行中断面板扫描
                         break
+
+                    # 严禁将包含对话引号的人物台词误判为面板行
+                    if any(q in curr_s for q in ('“', '”', '"')):
+                        break
+
                     if curr_s.startswith(("【", "[", "|", "-", "*")):
-                        i += 1
-                    elif "：" in curr_s or ":" in curr_s:
+                        # 如果是属性行或包含系统关键词的面板行
+                        if _is_panel_attr_line(curr_s) or any(kw in curr_s for kw in SYSTEM_PANEL_KEYWORDS):
+                            i += 1
+                        elif curr_s.startswith(("-", "*", "|")) and len(curr_s) <= 40:
+                            i += 1
+                        else:
+                            break
+                    elif _is_panel_attr_line(curr_s):
                         i += 1
                     else:
                         break
 
-            end_idx = i - 1
-            block_content = "\n".join(lines[start_idx:end_idx + 1])
-            # 检验是否包含系统关键词
-            if any(kw in block_content for kw in SYSTEM_PANEL_KEYWORDS):
-                for k in range(start_idx, end_idx + 1):
-                    masked_line_indices.add(k)
-                masks_info.append({
-                    "type": "system_panel",
-                    "start_line": start_idx + 1,
-                    "end_line": end_idx + 1,
-                    "raw_content": block_content,
-                })
+                end_idx = i - 1
+                block_content = "\n".join(lines[start_idx:end_idx + 1])
+                if any(kw in block_content for kw in SYSTEM_PANEL_KEYWORDS):
+                    for k in range(start_idx, end_idx + 1):
+                        masked_line_indices.add(k)
+                    masks_info.append({
+                        "type": "system_panel",
+                        "start_line": start_idx + 1,
+                        "end_line": end_idx + 1,
+                        "raw_content": block_content,
+                    })
         else:
             i += 1
 
@@ -411,7 +537,8 @@ def scan_typography_flaws(text: str, original_text: str = "") -> List[FormatFind
 
             if len(desc_text) >= 80:
                 start_context = max(0, d_match.start())
-                snippet_text = orig_line[start_context:start_context + 60]
+                stripped_line = orig_line.strip()
+                snippet_text = stripped_line[start_context:start_context + 60]
                 findings.append(FormatFinding(
                     line_number=line_number,
                     flaw_type="DIALOGUE_MIXED",
@@ -425,20 +552,12 @@ def scan_typography_flaws(text: str, original_text: str = "") -> List[FormatFind
         # -------------------------------------------------------------
         # 4. 检测 AI_CONJUNCTION (P3)
         # -------------------------------------------------------------
-        ai_hits = []
-        occupied_spans: List[Tuple[int, int]] = []
-        sorted_conjs = sorted(AI_CONJUNCTION_WORDS, key=len, reverse=True)
-        for conj in sorted_conjs:
-            for m in re.finditer(re.escape(conj), clean_masked):
-                span = (m.start(), m.end())
-                if not any(s[0] <= span[0] < s[1] or s[0] < span[1] <= s[1] for s in occupied_spans):
-                    occupied_spans.append(span)
-                    ai_hits.append((m.start(), conj))
-
-        ai_hits.sort(key=lambda x: x[0])
-        for pos, conj in ai_hits:
+        for m in AI_CONJUNCTION_PATTERN.finditer(clean_masked):
+            conj = m.group(0)
+            pos = m.start()
             snippet_start = max(0, pos - 15)
-            snippet_text = orig_line[snippet_start:snippet_start + 60]
+            stripped_line = orig_line.strip()
+            snippet_text = stripped_line[snippet_start:snippet_start + 60]
             findings.append(FormatFinding(
                 line_number=line_number,
                 flaw_type="AI_CONJUNCTION",
