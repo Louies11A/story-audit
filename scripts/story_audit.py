@@ -15,6 +15,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+# 确保技能根目录在 sys.path 中，支持 python scripts/story_audit.py 直接独立调用
+import sys
+from pathlib import Path
+_SKILL_ROOT = Path(__file__).resolve().parent.parent
+if str(_SKILL_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SKILL_ROOT))
+
 from scripts.chapter_linker import extract_boundary_slices
 from scripts.chapter_resolver import ChapterResolver
 from scripts.format_scanner import scan_typography_flaws
@@ -719,6 +726,14 @@ def run_apply_fix(
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    if sys.platform == 'win32':
+        try:
+            if hasattr(sys.stdout, 'reconfigure') and sys.stdout.encoding and sys.stdout.encoding.lower() not in ('utf-8', 'utf8'):
+                sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+            if hasattr(sys.stderr, 'reconfigure') and sys.stderr.encoding and sys.stderr.encoding.lower() not in ('utf-8', 'utf8'):
+                sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+        except Exception:
+            pass
     """CLI 主入口函数"""
     parser = argparse.ArgumentParser(
         prog="story_audit",

@@ -309,6 +309,19 @@ class TestStoryAuditCLI(unittest.TestCase):
         ])
         self.assertEqual(exit_code, 3)
 
+    def test_direct_script_file_execution(self):
+        """验证通过脚本物理文件直接执行 python scripts/story_audit.py 的正常运作"""
+        script_path = Path(__file__).resolve().parent.parent / "scripts" / "story_audit.py"
+        res = subprocess.run(
+            [sys.executable, str(script_path), "--project", str(self.project_dir), "--chapter", "1"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+        )
+        self.assertEqual(res.returncode, 0)
+        self.assertIn("审查完成", res.stdout)
+
     def test_subprocess_real_execution(self):
         """验证通过 CLI 真实子进程调用的退出码与行为"""
         cmd = [
@@ -320,7 +333,7 @@ class TestStoryAuditCLI(unittest.TestCase):
             "--chapter",
             "1",
         ]
-        res = subprocess.run(cmd, capture_output=True, text=True)
+        res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
         self.assertEqual(res.returncode, 0)
 
 
