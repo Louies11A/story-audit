@@ -173,18 +173,18 @@ class PatchSpec:
 - Create: `scripts/chapter_resolver.py`
 - Test: `tests/test_chapter_resolver.py`
 
-- [ ] **Step 1: 编写失败的单元测试 (test_chapter_resolver.py)**
+- [x] **Step 1: 编写失败的单元测试 (test_chapter_resolver.py)**
   使用 `tempfile.TemporaryDirectory`：
   1. 测试中文大写数字位权算法："三十一" -> 31，"一百零五" -> 105，"十二" -> 12，"两千零八" -> 2008，"〇一" -> 1；
   2. 测试特殊序位："序章"/"楔子" -> 0.0，"第31章（上）" -> 31.1；
   3. 测试自然数值排序：测试列表 `["第10章.txt", "第2章.txt", "第1章.txt", "第20章.txt"]`, 结果必须为 `[1.0, 2.0, 10.0, 20.0]`；
   4. 测试断号体检：1~5章中缺失第3章时生成 P2 警告信息；
   5. 测试按索引定位章节文件。
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
   `python -m unittest tests/test_chapter_resolver.py`
-- [ ] **Step 3: 编写 chapter_resolver.py 最小实现**
-- [ ] **Step 4: 运行测试确认通过**
-- [ ] **Step 5: 提交 Git**
+- [x] **Step 3: 编写 chapter_resolver.py 最小实现**
+- [x] **Step 4: 运行测试确认通过**
+- [x] **Step 5: 提交 Git**
   `git add scripts/chapter_resolver.py tests/test_chapter_resolver.py && git commit -m "feat(resolver): 实现章节自然排序、中文大写数字转换与变体匹配"`
 
 ---
