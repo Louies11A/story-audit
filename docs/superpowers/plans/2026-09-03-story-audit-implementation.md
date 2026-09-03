@@ -311,14 +311,14 @@ class PatchSpec:
 - Create: `references/report-template.md`
 - Create: `SKILL.md`
 
-- [ ] **Step 1: 编写 6 份核心参考规则文档**
+- [x] **Step 1: 编写 6 份核心参考规则文档**
   从设计规范中提取出纯净、即插即用的规则字典，确保 `first-principles.md` 完整收录 4 维量化判定卡尺，`short-sentence-style.md` 包含 AI 连词禁词表。
-- [ ] **Step 2: 编写 SKILL.md**
+- [x] **Step 2: 编写 SKILL.md**
   定义技能 frontmatter、触发短语、4 专家（Agent A 账本、Agent B 事实、Agent C 排版、Agent D 对抗审判）协同协议、Solo 模式降级流程、报告归档目录收口。
-- [ ] **Step 3: 全局端到端集成测试**
+- [x] **Step 3: 全局端到端集成测试**
   运行：`python -m unittest discover tests`
   确保所有测试全部通过（PASS），0 外部依赖。
-- [ ] **Step 4: 提交 Git**
+- [x] **Step 4: 提交 Git**
   `git add references/ SKILL.md && git commit -m "feat(skill): 完成审查规范库与多 Agent 协同协议部署"`
 
 ---
