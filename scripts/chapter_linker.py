@@ -47,9 +47,9 @@ _ILLUSION_ENTRY_PATTERN = re.compile(
     r"(陷入心魔幻境|心魔幻境|心魔丛生|陷入幻境|坠入幻境|幻境之中|走火入魔.*?幻象|魔障由心生)"
 )
 
-# 叙事视界隔离：回忆闪回（FLASHBACK）进入模式
+# 叙事视界隔离：回忆闪回（FLASHBACK）进入模式（严禁无修饰纯时间词，强制要求事件/回忆后缀）
 _FLASHBACK_ENTRY_PATTERN = re.compile(
-    r"([一二三四五六七八九十两百千万\d]+年前(?:那一战|的那场|的那一天|发生的事)?|恍惚间|忆及往事|记忆如潮水般涌来|当年那一战|当年旧事|思绪飘回|回想起当年|蓦然回想)"
+    r"([一二三四五六七八九十两百千万\d]+年前(?:那一战|的那场|的那一天|发生的事|的旧事|的往事|的大劫|的惨剧)|恍惚间|忆及往事|记忆如潮水般涌来|当年那一战|当年旧事|思绪飘回|回想起当年|蓦然回想)"
 )
 
 # 叙事视界隔离：通用退出/复位模式
@@ -119,52 +119,53 @@ def detect_narrative_isolation_zones(text: str) -> List[Dict[str, Any]]:
 
     for line_idx, line in enumerate(lines):
         line_no = line_idx + 1
+        cursor = 0
+        line_len = len(line)
 
-        if current_zone is None:
-            # 优先检查心魔幻境（避免幻境中夹带回忆时间标记导致误判为普通闪回）
-            m_ill = _ILLUSION_ENTRY_PATTERN.search(line)
-            if m_ill:
-                clue = m_ill.group(1)
-                entry_end = m_ill.end()
-                current_zone = {
-                    "start_line": line_no,
-                    "end_line": line_no,
-                    "type": "ILLUSION",
-                    "clue": clue,
-                }
-                # 检查同一行在进入后是否紧随退出标记
-                m_exit_same = _ISOLATION_EXIT_PATTERN.search(line[entry_end:])
-                if m_exit_same:
+        while cursor < line_len:
+            if current_zone is not None:
+                m_exit = _ISOLATION_EXIT_PATTERN.search(line, cursor)
+                if m_exit:
                     current_zone["end_line"] = line_no
                     isolation_zones.append(current_zone)
                     current_zone = None
-                continue
+                    cursor = max(cursor + 1, m_exit.end())
+                else:
+                    # 当前仍处于隔离区中，本行未出现退出标记，跨行延续
+                    break
+            else:
+                m_ill = _ILLUSION_ENTRY_PATTERN.search(line, cursor)
+                m_fb = _FLASHBACK_ENTRY_PATTERN.search(line, cursor)
 
-            # 检查回忆闪回
-            m_fb = _FLASHBACK_ENTRY_PATTERN.search(line)
-            if m_fb:
-                clue = m_fb.group(1)
-                entry_end = m_fb.end()
-                current_zone = {
-                    "start_line": line_no,
-                    "end_line": line_no,
-                    "type": "FLASHBACK",
-                    "clue": clue,
-                }
-                # 检查同一行在进入后是否紧随退出标记
-                m_exit_same = _ISOLATION_EXIT_PATTERN.search(line[entry_end:])
-                if m_exit_same:
-                    current_zone["end_line"] = line_no
-                    isolation_zones.append(current_zone)
-                    current_zone = None
-                continue
-        else:
-            # 当前处于隔离区间中，检测退出/复位标记
-            m_exit = _ISOLATION_EXIT_PATTERN.search(line)
-            if m_exit:
-                current_zone["end_line"] = line_no
-                isolation_zones.append(current_zone)
-                current_zone = None
+                chosen_m = None
+                chosen_type = None
+
+                if m_ill and m_fb:
+                    # 优先选择在文本中更先出现的标记；若起始位置相同，优先判定为心魔幻境
+                    if m_ill.start() <= m_fb.start():
+                        chosen_m = m_ill
+                        chosen_type = "ILLUSION"
+                    else:
+                        chosen_m = m_fb
+                        chosen_type = "FLASHBACK"
+                elif m_ill:
+                    chosen_m = m_ill
+                    chosen_type = "ILLUSION"
+                elif m_fb:
+                    chosen_m = m_fb
+                    chosen_type = "FLASHBACK"
+
+                if chosen_m is not None:
+                    current_zone = {
+                        "start_line": line_no,
+                        "end_line": line_no,
+                        "type": chosen_type,
+                        "clue": chosen_m.group(1),
+                    }
+                    cursor = max(cursor + 1, chosen_m.end())
+                else:
+                    # 本行无新进入标记
+                    break
 
     # 若直到末尾未显式退出，闭合至文本总行数
     if current_zone is not None:
@@ -174,16 +175,22 @@ def detect_narrative_isolation_zones(text: str) -> List[Dict[str, Any]]:
     return isolation_zones
 
 
-def extract_boundary_slices(prev_text: Optional[str], curr_text: str) -> BoundaryContext:
+def extract_boundary_slices(
+    prev_text: Optional[str], curr_text: Optional[str] = ""
+) -> BoundaryContext:
     """提取跨章接缝切片并实施首章无上文边界防御。
 
     Args:
         prev_text: 上一章文本内容（若为首章或楔子则为 None 或空串）
-        curr_text: 本章文本内容
+        curr_text: 本章文本内容（若为 None 或空串则实施空值防御）
 
     Returns:
         组装好的 BoundaryContext 数据对象
     """
+    # 增加 curr_text 空值防御
+    if not curr_text:
+        curr_text = ""
+
     # 首章无上文边界防御：当 prev_text 为 None 或空白串时，安全返回
     if prev_text is None or not prev_text.strip():
         has_prev_chapter = False

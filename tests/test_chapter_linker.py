@@ -123,10 +123,13 @@ class TestDetectNarrativeIsolationZones(unittest.TestCase):
         self.assertIn("五年前那一战", z["clue"])
 
     def test_flashback_time_and_memory_clue_variants(self):
-        """测试多种时间与回忆型进入线索变体"""
+        """测试多种时间与回忆型进入线索变体（强制带有回忆/事件后缀）"""
         clues = [
-            ("三年前，他尚是一个毫无修为的凡人。", "三年前"),
-            ("十年前的那场大火，烧毁了他所有的温存。", "十年前"),
+            ("三年前发生的事，彻底改变了他的人生轨迹。", "三年前发生的事"),
+            ("十年前的那场大火，烧毁了他所有的温存。", "十年前的那场"),
+            ("五百年前的旧事，至今历历在目。", "五百年前的旧事"),
+            ("三千年前的大劫，导致修真界元气大伤。", "三千年前的大劫"),
+            ("百年前的惨剧，让他刻骨铭心。", "百年前的惨剧"),
             ("恍惚间，他仿佛又看到了母亲慈祥的脸庞。", "恍惚间"),
             ("忆及往事，林尘心中不禁掠过一丝悲凉。", "忆及往事"),
             ("记忆如潮水般涌来，几乎将他的理智吞没。", "记忆如潮水般涌来"),
@@ -234,6 +237,66 @@ class TestDetectNarrativeIsolationZones(unittest.TestCase):
         self.assertEqual(zones[1]["end_line"], 8)
         self.assertEqual(zones[1]["type"], "ILLUSION")
 
+    def test_negative_objective_historical_chronology(self):
+        """负样本：客观历史背景与年代叙述不得误判为回忆闪回隔离区"""
+        historical_texts = [
+            "据古籍记载，三千年前曾有一位大帝横空出世，独断万古……\n后世诸派皆尊其为祖师。\n如今万载岁月过去，帝威犹存。",
+            "五百年前，天元大陆发生了一场前所未有的地壳剧变，群山倾覆。",
+            "相传在两万年前，这片汪洋大海还只是一处灵脉干涸的盆地。",
+            "早在十年前，帝国皇室便已颁布法令禁止私自开采灵脉石矿。",
+            "三千年前飞升的强者数不胜数，但唯独不见那位剑神踪迹。",
+        ]
+        for text in historical_texts:
+            zones = detect_narrative_isolation_zones(text)
+            self.assertEqual(
+                zones,
+                [],
+                f"客观历史背景叙述被误判为视界隔离区: {text}",
+            )
+
+    def test_same_line_exit_and_reentry(self):
+        """测试同一行退出隔离区后紧随再次进入新隔离区的场景（同行闭合或留存）"""
+        # 场景 1：上一行在幻境中，当前行退出幻境后紧随进入回忆闪回，并跨行留存到文末
+        text_cross_exit_then_enter = (
+            "他陷入心魔幻境之中，四面皆是怨魂。\n"  # line 1: ILLUSION 开启
+            "猛然惊醒，浑身冷汗；然而不过数息，当年那一战的惨烈景象再度浮现。\n"  # line 2: 退出 ILLUSION，进入 FLASHBACK
+            "漫天血光，同门死伤殆尽。"  # line 3: FLASHBACK 持续
+        )
+        zones1 = detect_narrative_isolation_zones(text_cross_exit_then_enter)
+        self.assertEqual(len(zones1), 2)
+        self.assertEqual(zones1[0]["type"], "ILLUSION")
+        self.assertEqual(zones1[0]["start_line"], 1)
+        self.assertEqual(zones1[0]["end_line"], 2)
+        self.assertEqual(zones1[1]["type"], "FLASHBACK")
+        self.assertEqual(zones1[1]["start_line"], 2)
+        self.assertEqual(zones1[1]["end_line"], 3)
+
+        # 场景 2：同行内进入 -> 退出 -> 再次进入 -> 再次退出（双闭合）
+        text_same_line_double_cycle = (
+            "恍惚间，他猛然惊醒；可转瞬间又陷入心魔幻境，好在心魔消散，重回现实。"
+        )
+        zones2 = detect_narrative_isolation_zones(text_same_line_double_cycle)
+        self.assertEqual(len(zones2), 2)
+        self.assertEqual(zones2[0]["type"], "FLASHBACK")
+        self.assertEqual(zones2[0]["start_line"], 1)
+        self.assertEqual(zones2[0]["end_line"], 1)
+        self.assertEqual(zones2[1]["type"], "ILLUSION")
+        self.assertEqual(zones2[1]["start_line"], 1)
+        self.assertEqual(zones2[1]["end_line"], 1)
+
+        # 场景 3：同行内进入 -> 退出 -> 再次进入，无退出标记，留存至文末
+        text_same_line_reentry_unclosed = (
+            "恍惚间，他猛然惊醒；可下一瞬又陷入心魔幻境，四周漆黑如墨。"
+        )
+        zones3 = detect_narrative_isolation_zones(text_same_line_reentry_unclosed)
+        self.assertEqual(len(zones3), 2)
+        self.assertEqual(zones3[0]["type"], "FLASHBACK")
+        self.assertEqual(zones3[0]["start_line"], 1)
+        self.assertEqual(zones3[0]["end_line"], 1)
+        self.assertEqual(zones3[1]["type"], "ILLUSION")
+        self.assertEqual(zones3[1]["start_line"], 1)
+        self.assertEqual(zones3[1]["end_line"], 1)
+
     def test_empty_and_clean_text(self):
         """空文本或普通无闪回文本返回空列表"""
         self.assertEqual(detect_narrative_isolation_zones(""), [])
@@ -285,6 +348,28 @@ class TestExtractBoundarySlices(unittest.TestCase):
         self.assertEqual(len(ctx.curr_head_300), 300)
         self.assertEqual(ctx.prev_tail_300, prev_chars[-300:])
         self.assertEqual(ctx.curr_head_300, curr_chars[:300])
+
+    def test_curr_text_none_or_empty_defense(self):
+        """测试 curr_text 为 None 或空串时的安全防御与默认空值处理"""
+        for none_or_empty in [None, "", "   \t\n  "]:
+            ctx = extract_boundary_slices(prev_text="上一章正常结尾文字。", curr_text=none_or_empty)
+            self.assertIsInstance(ctx, BoundaryContext)
+            self.assertTrue(ctx.has_prev_chapter)
+            self.assertEqual(ctx.prev_tail_300, "上一章正常结尾文字。")
+            self.assertEqual(ctx.curr_head_300, "")
+            self.assertFalse(ctx.is_pov_transition)
+            self.assertIsNone(ctx.transition_clue)
+            self.assertEqual(ctx.isolation_zones, [])
+
+        # 双空防御：prev_text 与 curr_text 均为 None
+        ctx_both_none = extract_boundary_slices(prev_text=None, curr_text=None)
+        self.assertIsInstance(ctx_both_none, BoundaryContext)
+        self.assertFalse(ctx_both_none.has_prev_chapter)
+        self.assertEqual(ctx_both_none.prev_tail_300, "")
+        self.assertEqual(ctx_both_none.curr_head_300, "")
+        self.assertFalse(ctx_both_none.is_pov_transition)
+        self.assertIsNone(ctx_both_none.transition_clue)
+        self.assertEqual(ctx_both_none.isolation_zones, [])
 
     def test_boundary_context_integration_with_pov_and_isolation(self):
         """综合集成测试：接缝提取联动 POV 转场识别与视界隔离区间提取"""
