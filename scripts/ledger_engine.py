@@ -452,8 +452,10 @@ def sync_from_markdown(md_path: Path, json_path: Path) -> LedgerState:
             continue
 
         # 识别表头行
-        if "资产ID" in cells and "资产名称" in cells:
+        if "资产ID" in cells and ("资产名称" in cells or "名称" in cells):
             col_mapping = {col: idx for idx, col in enumerate(cells)}
+            if "名称" in col_mapping and "资产名称" not in col_mapping:
+                col_mapping["资产名称"] = col_mapping["名称"]
             continue
 
         # 跳过分隔行

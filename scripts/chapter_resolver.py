@@ -391,9 +391,13 @@ class ChapterResolver:
         scan_dir = content_dir if content_dir.is_dir() else root
 
         chapters: List[ChapterItem] = []
-        for file_path in scan_dir.iterdir():
+        skip_dirs = {".git", ".bak", "reports", "archive", ".cache", "设定", "追踪", "__pycache__"}
+        for file_path in scan_dir.rglob("*"):
             if not file_path.is_file():
                 continue
+            if any(part.startswith(".") or part.lower() in skip_dirs for part in file_path.parent.parts):
+                if not (content_dir.is_dir() and file_path.is_relative_to(content_dir)):
+                    continue
 
             file_name = file_path.name
             # 过滤隐藏文件与临时文件
