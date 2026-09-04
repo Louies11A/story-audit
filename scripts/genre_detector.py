@@ -12,10 +12,9 @@ genre_detector.py: 全题材自动探测与画像引擎
 
 import json
 import math
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, List, Optional
 
 __all__ = [
     "GenreProfile",
@@ -96,31 +95,35 @@ def resolve_canonical_genre(name_or_alias: Optional[str]) -> Optional[str]:
     return None
 
 
-def _extract_text(text_or_chapters: Any) -> str:
-    """安全展开输入为纯文本字符串"""
+def _extract_text(text_or_chapters: Any, max_chars: int = 20000) -> str:
+    """安全展开输入为纯文本字符串，支持采样截断防超长文本卡顿"""
     if not text_or_chapters:
         return ""
     if isinstance(text_or_chapters, str):
-        return text_or_chapters
+        return text_or_chapters[:max_chars]
     if isinstance(text_or_chapters, Path):
         try:
-            return text_or_chapters.read_text(encoding="utf-8", errors="replace")
+            return text_or_chapters.read_text(encoding="utf-8", errors="replace")[:max_chars]
         except Exception:
             return ""
     if hasattr(text_or_chapters, "path"):
         try:
             p = getattr(text_or_chapters, "path")
-            return Path(p).read_text(encoding="utf-8", errors="replace")
+            return Path(p).read_text(encoding="utf-8", errors="replace")[:max_chars]
         except Exception:
             return ""
     if isinstance(text_or_chapters, (list, tuple)):
         collected = []
+        cur_len = 0
         for item in text_or_chapters:
-            t = _extract_text(item)
+            t = _extract_text(item, max_chars=max_chars - cur_len)
             if t:
                 collected.append(t)
-        return "\n".join(collected)
-    return str(text_or_chapters)
+                cur_len += len(t)
+                if cur_len >= max_chars:
+                    break
+        return chr(10).join(collected)[:max_chars]
+    return str(text_or_chapters)[:max_chars]
 
 
 def detect_genre(
@@ -213,6 +216,19 @@ def detect_genre(
 
     # 3. 排序与置信度归一化
     sorted_items = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    if not sorted_items:
+        default_meta = GENRE_REGISTRY.get("传统玄幻", {})
+        return GenreProfile(
+            primary_genre="传统玄幻",
+            confidence=0.0,
+            secondary_genres=[],
+            category_group=default_meta.get("group", "仙侠玄幻"),
+            first_principles=default_meta.get("drive", ""),
+            red_lines=default_meta.get("red_lines", []),
+            keywords_matched=[],
+            scores=scores,
+        )
+
     top_genre, top_score = sorted_items[0]
 
     if top_score <= 0.001:

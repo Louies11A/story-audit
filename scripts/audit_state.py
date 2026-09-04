@@ -78,11 +78,19 @@ def save_audit_state(state: AuditState, reports_dir: Path) -> Path:
 
     json_str = json.dumps(state.to_dict(), ensure_ascii=False, indent=2)
 
-    with tempfile.NamedTemporaryFile("w", dir=reports_dir, delete=False, encoding="utf-8") as tf:
+    tf = tempfile.NamedTemporaryFile("w", dir=reports_dir, delete=False, encoding="utf-8")
+    temp_path = Path(tf.name)
+    try:
         tf.write(json_str)
-        temp_name = tf.name
-
-    os.replace(temp_name, state_file)
+        tf.flush()
+        tf.close()
+        os.replace(temp_path, state_file)
+    finally:
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
     return state_file
 
 

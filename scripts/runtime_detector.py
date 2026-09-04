@@ -13,7 +13,6 @@ runtime_detector.py: 宿主运行时环境探测与子代理递归防爆哨兵
 
 from __future__ import annotations
 
-import json
 import os
 from typing import Optional, Tuple
 

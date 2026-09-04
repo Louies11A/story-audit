@@ -26,6 +26,9 @@ SCHEMA_VERSION = 1
 STATE_MAX_BYTES = 2 * 1024 * 1024  # 2MB
 QUERY_HARD_LIMIT_BYTES = 2048
 
+
+MIN_QUERY_BUDGET_BYTES = 128
+
 VALID_CATEGORIES: Dict[str, str] = {
     "prose_style": "文风与表达",
     "story_design": "故事设计",
@@ -46,7 +49,7 @@ CONFIDENCE_LEVELS: Set[str] = {"low", "medium", "high"}
 
 # 反近亲繁殖违禁词列表（系统自身的警告、报错、模板标记严禁反向污染为作者偏好）
 FORBIDDEN_SYSTEM_PATTERNS = [
-    re.compile(r'P[0-3]'),
+    re.compile(r'(?<![a-zA-Z0-9])[Pp][0-3](?![a-zA-Z0-9])'),
     re.compile(r'FormatFinding', re.I),
     re.compile(r'DRAGGING_SENTENCE', re.I),
     re.compile(r'LONG_PARAGRAPH', re.I),
@@ -84,10 +87,19 @@ def _atomic_write_text(file_path: Path, content: str) -> None:
     """原子安全写文件，杜绝写入中断导致文件损坏"""
     file_path.parent.mkdir(parents=True, exist_ok=True)
     temp_dir = file_path.parent
-    with tempfile.NamedTemporaryFile('w', dir=temp_dir, delete=False, encoding='utf-8') as tf:
+    tf = tempfile.NamedTemporaryFile('w', dir=temp_dir, delete=False, encoding='utf-8')
+    temp_path = Path(tf.name)
+    try:
         tf.write(content)
-        temp_name = tf.name
-    os.replace(temp_name, file_path)
+        tf.flush()
+        tf.close()
+        os.replace(temp_path, file_path)
+    finally:
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
 
 
 def check_anti_inbreeding(text: str) -> None:
@@ -246,6 +258,8 @@ class AuthorMemory:
         查询有效偏好，输出严格控制在 <= limit_bytes (默认 2048 字节)。
         内嵌铁律约束提示：仅作意图解释辅助，绝对不能降低 Rubric 严重度！
         """
+        if limit_bytes < MIN_QUERY_BUDGET_BYTES:
+            return ""
         actual_limit = min(limit_bytes, QUERY_HARD_LIMIT_BYTES)
         state = self.load_state()
         prefs = state.get("preferences", {})
@@ -340,7 +354,7 @@ class AuthorMemory:
         ]
 
         if not active_prefs:
-            lines.append("| - | 暂无记录 | 请使用 `python scripts/author_memory.py record` 添加 | - | - | - |")
+            lines.append("| - | 暂无记录 | 请通过 `AuthorMemory().record(...)` API 录入 | - | - | - |")
         else:
             active_prefs.sort(key=lambda x: (x.get("category", ""), x.get("key", "")))
             for p in active_prefs:

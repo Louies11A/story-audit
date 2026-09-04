@@ -131,6 +131,14 @@ AI_CONJUNCTION_WORDS = tuple(
 )
 
 # 预编译 AI 翻译腔高频连词正则模式
+
+# 辅助预编译正则常量 (性能与复用优化)
+RE_NUM_OR_UNIT = re.compile(r'\d+|[a-zA-Z]+|[+%/]|级|阶|层|重|品|星|段|榜|点|条|张|文|两|元|分|票|值|度|率|位|卡|株|颗|枚')
+RE_COMMA_SPLIT = re.compile(r'[，；,;]')
+RE_HAN_CHAR = re.compile(r'[一-龥]')
+RE_SYSTEM_INNER = re.compile(r'(?:识别|状态|参数|报告|提示|方案|指令|告警|意图)[：:]')
+RE_MILITARY_REPORT = re.compile(r'^[“"【\[]?(?:报告(?:长官|舰长|总师|指挥官|司令)?|呼叫|数据流|战损统计|火控方案|指令确认|敌方意图|目标识别)')
+
 AI_CONJUNCTION_PATTERN = re.compile("|".join(re.escape(w) for w in AI_CONJUNCTION_WORDS))
 
 # 标点符号与切分模式（包含所有常见中英文标点及空白）
@@ -198,7 +206,7 @@ def _is_panel_attr_line(line: str, genre_keywords: Optional[Set[str]] = None) ->
     # 行内包含数值/等级特征或全题材面板关键词
     kw_set = genre_keywords if genre_keywords is not None else SYSTEM_PANEL_KEYWORDS
     has_feature = bool(
-        re.search(r'\d+|[a-zA-Z]+|[+%/]|级|阶|层|重|品|星|段|榜|点|条|张|文|两|元|分|票|值|度|率|位|卡|株|颗|枚', s)
+        RE_NUM_OR_UNIT.search(s)
         or any(kw in key for kw in kw_set)
         or any(kw in right_part for kw in kw_set)
         or any(kw in right_part for kw in ("无", "正常", "破损", "封印", "锁定", "激活", "未知", "已解密", "已收录"))
@@ -219,7 +227,7 @@ def _analyze_couplet_line(line: str) -> Optional[int]:
     if any(c in s for c in ('"', '“', '”', '>', '#', '|', '-', '*', '`', '：', ':')):
         return None
 
-    sub_parts = re.split(r'[，；,;]', s)
+    sub_parts = RE_COMMA_SPLIT.split(s)
     sub_parts = [p.strip() for p in sub_parts if p.strip()]
     if len(sub_parts) == 2:
         h1 = len(re.findall(r'[\u4e00-\u9fa5]', sub_parts[0]))
@@ -535,11 +543,11 @@ def _is_military_data_report(sentence: str) -> bool:
         inner = s.strip("【】[] ")
         if any(kw in inner for kw in MILITARY_DATA_KEYWORDS) or any(kw in inner for kw in SYSTEM_PANEL_KEYWORDS):
             return True
-        if re.search(r'(?:识别|状态|参数|报告|提示|方案|指令|告警|意图)[：:]', inner):
+        if RE_SYSTEM_INNER.search(inner):
             return True
 
     # 特征 2：以战术/系统指令或通信为核心的报文
-    if re.match(r'^[“"【\[]?(?:报告(?:长官|舰长|总师|指挥官|司令)?|呼叫|数据流|战损统计|火控方案|指令确认|敌方意图|目标识别)', s):
+    if RE_MILITARY_REPORT.match(s):
         if any(kw in s for kw in MILITARY_DATA_KEYWORDS) or any(kw in s for kw in SYSTEM_PANEL_KEYWORDS):
             return True
 
@@ -752,7 +760,7 @@ def scan_typography_flaws(text: str, original_text: str = "", genre: Optional[st
             continue
 
         line_number = line_idx + 1
-        orig_line = orig_lines[line_idx].rstrip("\r")
+        orig_line = orig_lines[line_idx].rstrip("\r") if line_idx < len(orig_lines) else clean_masked
 
         # -------------------------------------------------------------
         # 1. 检测 LONG_PARAGRAPH (P2 / P3 降级)

@@ -18,8 +18,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 # 确保技能根目录在 sys.path 中，支持 python scripts/story_audit.py 直接独立调用
-import sys
-from pathlib import Path
 _SKILL_ROOT = Path(__file__).resolve().parent.parent
 if str(_SKILL_ROOT) not in sys.path:
     sys.path.insert(0, str(_SKILL_ROOT))
@@ -61,14 +59,7 @@ from scripts.audit_state import (
 )
 from scripts.types import BoundaryContext, ChapterItem, Finding, FormatFinding, PatchSpec, format_factual_fix
 
-__all__ = [
-    "main",
-    "run_audit",
-    "build_pre_audit_bundle",
-    "get_report_archive_path",
-    "render_audit_report",
-    "parse_scope_range",
-]
+
 
 
 def parse_scope_range(scope_str: str) -> Tuple[float, float]:
@@ -584,7 +575,7 @@ def run_audit(
             if not silent:
                 print(
                     f"[防脏写拦截] Markdown 账本 ({md_path}) 修改时间晚于 JSON 数据源 ({json_path})！\n"
-                    f"存在未同步的手工编辑。请先执行 --sync-from-md 同步，或追加 --force 强制覆盖。",
+                    f"存在未同步的手工编辑。请先调用 sync_ledger_from_md() 同步，或传入 force=True 强制覆盖。",
                     file=sys.stderr,
                 )
             return 3
@@ -593,10 +584,19 @@ def run_audit(
 
     # 提取正文伏笔标签更新账本伏笔池
     new_tags = scan_foreshadowing_tags(curr_text)
+    has_new_tags = False
     if new_tags:
         for tag in new_tags:
             if tag not in state.foreshadowing_stash:
                 state.foreshadowing_stash.append(tag)
+                has_new_tags = True
+        # 若发现新伏笔标签，立即持久化更新账本数据源 (P1-05)
+        if has_new_tags and json_path.exists():
+            try:
+                save_ledger_state(state, json_path, md_path, force=True)
+            except Exception as e:
+                if not silent:
+                    print(f"[警告] 自动持久化新伏笔至账本失败: {e}", file=sys.stderr)
 
     # 8.5 汇集平台卡尺违规项
     p_findings = platform_data.get("findings", [])
@@ -681,6 +681,34 @@ def run_audit(
     latest_report_path = reports_dir / "LATEST_REPORT.md"
     if write_latest_report:
         write_file_safe(latest_report_path, report_content)
+        # 单章审查状态机同步 (P1-04)
+        audit_state = load_audit_state(reports_dir)
+        c_idx = curr_chapter.index
+        if c_idx not in audit_state.completed_chapters:
+            audit_state.completed_chapters.append(c_idx)
+            audit_state.completed_chapters.sort()
+        audit_state.last_scope = f"{c_idx:g}"
+        audit_state.open_defects = [
+            d for d in audit_state.open_defects
+            if abs(float(d.get("chapter", -1)) - c_idx) > 1e-4
+        ]
+        for p0_item in p0_list:
+            audit_state.open_defects.append({
+                "chapter": c_idx,
+                "severity": "P0",
+                "category": "causal",
+                "issue": p0_item,
+                "fix": "严格依据账本与主线事实对齐，杜绝主观文学发挥",
+            })
+        for p1_item in p1_list:
+            audit_state.open_defects.append({
+                "chapter": c_idx,
+                "severity": "P1",
+                "category": "causal",
+                "issue": p1_item,
+                "fix": "严格依据账本与主线事实对齐，杜绝主观文学发挥",
+            })
+        save_audit_state(audit_state, reports_dir)
 
     archived_report_path = get_report_archive_path(reports_dir, curr_chapter.index)
     archived_report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -709,11 +737,11 @@ def run_audit(
     elif p1_list:
         if strict:
             if not silent:
-                print(f"[黄灯严格中断] 发现 {len(p1_list)} 个 P1 级严重失误，已开启 --strict 中断！", file=sys.stderr)
+                print(f"[黄灯严格阻断] 发现 {len(p1_list)} 个 P1 级严重失误，strict=True 严格模式生效！", file=sys.stderr)
             exit_code = 1
         else:
             if not silent:
-                print(f"[黄灯放行] 发现 {len(p1_list)} 个 P1 级严重失误（未开启 --strict，允许通过）。")
+                print(f"[黄灯放行] 发现 {len(p1_list)} 个 P1 级严重失误（strict=False 宽松模式，允许通过）。")
             exit_code = 0
     else:
         if not silent:
@@ -747,7 +775,7 @@ def run_audit(
 
 
 def run_sync_from_md(project_dir: Path) -> int:
-    """执行 --sync-from-md 反向同步管线"""
+    """执行 sync_ledger_from_md 反向同步管线"""
     json_path, md_path = locate_ledger_paths(project_dir)
     if not md_path.is_file():
         print(f"[错误] 未找到 Markdown 账本文件: {md_path}", file=sys.stderr)
@@ -764,9 +792,9 @@ def run_sync_from_md(project_dir: Path) -> int:
 
 
 def run_checkpoint(project_dir: Path, volume: Optional[int], force: bool = False) -> int:
-    """执行 --checkpoint --volume 分卷封账结转管线"""
+    """执行 checkpoint_volume 分卷封账结转管线"""
     if volume is None:
-        print("[错误] --checkpoint 模式必须配对指定 --volume <卷号>！", file=sys.stderr)
+        print("[错误] checkpoint 结转操作必须指定 volume 卷号！", file=sys.stderr)
         return 3
 
     json_path, _ = locate_ledger_paths(project_dir)
@@ -799,13 +827,13 @@ def run_checkpoint(project_dir: Path, volume: Optional[int], force: bool = False
         return 3
 
 
-def run_init_mode(project_dir: Path, scope_str: Optional[str], force: bool, genre: str = "auto") -> int:
-    """执行 --init 首次建账模式，集成启发式资产与伏笔抽取"""
+def run_init_mode(project_dir: Path, scope_str: Optional[str] = None, force: bool = False, genre: str = "auto", silent: bool = False) -> Tuple[int, Path]:
+    """执行 init_ledger 首次建账管线，集成启发式资产与伏笔抽取"""
     resolver = ChapterResolver()
     chapters = resolver.discover_chapters(project_dir)
     if not chapters:
         print(f"[错误] 未发现任何章节文件，无法建账！", file=sys.stderr)
-        return 3
+        return 3, Path("")
 
     if scope_str:
         try:
@@ -813,19 +841,19 @@ def run_init_mode(project_dir: Path, scope_str: Optional[str], force: bool, genr
             target_chapters = [c for c in chapters if s_min <= c.index <= s_max]
         except Exception as e:
             print(f"[错误] 解析范围失败: {e}", file=sys.stderr)
-            return 3
+            return 3, Path("")
     else:
         target_chapters = chapters
 
     if not target_chapters:
         print(f"[错误] 范围内未发现章节！", file=sys.stderr)
-        return 3
+        return 3, Path("")
 
     json_path, md_path = locate_ledger_paths(project_dir)
     if md_path.is_file() and json_path.is_file() and not force:
         if check_dirty_state(md_path, json_path):
             print(f"[防脏写拦截] 账本存在未同步手工编辑，建账被拒绝！", file=sys.stderr)
-            return 3
+            return 3, Path("")
 
     # 优先尝试 load_ledger_state(json_path)，继承既有 assets，仅在账本不存在时初始化新对象
     if json_path.is_file():
@@ -903,8 +931,9 @@ def run_init_mode(project_dir: Path, scope_str: Optional[str], force: bool, genr
 
     write_file_safe(report_file, content)
 
-    print(f"首次建账完成！已过账 {len(target_chapters)} 章，提取候选资产 {len(state.assets)} 项，生成双轨账本与盘点报告。")
-    return 0
+    if not silent:
+        print(f"首次建账完成！已过账 {len(target_chapters)} 章，提取候选资产 {len(state.assets)} 项，生成双轨账本与盘点报告。")
+    return 0, report_file
 
 
 def render_scope_batch_summary(
@@ -1093,6 +1122,7 @@ def run_scope_audit(
     mode: str = "auto",
     platform: str = "generic",
     use_author_memory: bool = False,
+    silent: bool = False,
 ) -> int:
     """执行批量连审模式，生成大盘汇总报告与紧凑看板输出"""
     try:
@@ -1117,7 +1147,8 @@ def run_scope_audit(
     audit_state = load_audit_state(reports_dir)
     inherited_items = get_inherited_items(audit_state)
 
-    print(f"=== story-audit 深度审查报告 ===")
+    if not silent:
+        print(f"=== story-audit 深度审查报告 ===")
     print(f"Requested Mode: {mode}")
     print(f"Effective Mode: {effective_mode}")
     print(f"Fallback: {fallback_reason}")
@@ -1161,7 +1192,8 @@ def run_scope_audit(
             has_p1 = True
 
         status_tag = summary.get("status", "完成")
-        print(f"  [{idx:02d}/{n_total:02d}] 审查 第{chap.index:03g}章 《{chap.title}》 ... [{status_tag}]")
+        if not silent:
+            print(f"  [{idx:02d}/{n_total:02d}] 审查 第{chap.index:03g}章 《{chap.title}》 ... [{status_tag}]")
 
     # 打印终端紧凑汇总看板
     print(f"========================================================================================")
@@ -1235,25 +1267,38 @@ def run_scope_audit(
             audit_state.completed_chapters.append(chap.index)
     audit_state.completed_chapters.sort()
 
-    # 累积本批次发现的开放 P0/P1 缺陷
+    # 累积本批次发现的开放 P0/P1 缺陷 (P1-01: 先清理待审章节旧记录，防止重审无限堆叠)
+    target_chapter_indices = {c.index for c in target_chapters}
+    audit_state.open_defects = [
+        d for d in audit_state.open_defects
+        if float(d.get("chapter", -1)) not in target_chapter_indices
+    ]
+    seen_defect_keys = {(d.get("chapter"), d.get("severity"), d.get("issue")) for d in audit_state.open_defects}
+
     for s in chapter_summaries:
         c_idx = s.get("chapter_index", 0)
         for p0_item in s.get("p0_list", []):
-            audit_state.open_defects.append({
-                "chapter": c_idx,
-                "severity": "P0",
-                "category": "causal",
-                "issue": p0_item,
-                "fix": "严格依据账本与主线事实对齐，杜绝主观文学发挥",
-            })
+            k = (c_idx, "P0", p0_item)
+            if k not in seen_defect_keys:
+                seen_defect_keys.add(k)
+                audit_state.open_defects.append({
+                    "chapter": c_idx,
+                    "severity": "P0",
+                    "category": "causal",
+                    "issue": p0_item,
+                    "fix": "严格依据账本与主线事实对齐，杜绝主观文学发挥",
+                })
         for p1_item in s.get("p1_list", []):
-            audit_state.open_defects.append({
-                "chapter": c_idx,
-                "severity": "P1",
-                "category": "causal",
-                "issue": p1_item,
-                "fix": "严格依据账本与主线事实对齐，杜绝主观文学发挥",
-            })
+            k = (c_idx, "P1", p1_item)
+            if k not in seen_defect_keys:
+                seen_defect_keys.add(k)
+                audit_state.open_defects.append({
+                    "chapter": c_idx,
+                    "severity": "P1",
+                    "category": "causal",
+                    "issue": p1_item,
+                    "fix": "严格依据账本与主线事实对齐，杜绝主观文学发挥",
+                })
 
     save_audit_state(audit_state, reports_dir)
 
@@ -1279,7 +1324,7 @@ def run_apply_fix(
     context_after: str,
     patch_file: Optional[str],
 ) -> int:
-    """执行 --apply-fix 方案采纳回写管线"""
+    """执行 apply_fix 方案采纳回写管线"""
     resolver = ChapterResolver()
     chapters = resolver.discover_chapters(project_dir)
     if not chapters:
@@ -1317,7 +1362,7 @@ def run_apply_fix(
     else:
         if target_line is None or old_text is None or new_text is None:
             print(
-                "[错误] --apply-fix 必须提供完整补丁参数 (--target-line, --old-text, --new-text) 或 --patch-file！",
+                "[错误] apply_fix 必须提供完整补丁参数 (target_line, old_text, new_text) 或 patch_file！",
                 file=sys.stderr,
             )
             return 3
@@ -1364,6 +1409,7 @@ def audit_chapter(
     strict: bool = False,
     force: bool = False,
     author_memory: bool = False,
+    silent: bool = False,
 ) -> Tuple[int, Path]:
     """单章深度审查纯 Python API
 
@@ -1388,7 +1434,7 @@ def audit_chapter(
         strict=strict,
         force=force,
         write_latest_report=True,
-        silent=False,
+        silent=silent,
         summary_collector=summary,
         genre=genre,
         mode=mode,
@@ -1414,6 +1460,7 @@ def audit_scope(
     strict: bool = False,
     force: bool = False,
     author_memory: bool = False,
+    silent: bool = False,
 ) -> Tuple[int, Path]:
     """批量多章连审纯 Python API
 
@@ -1457,6 +1504,7 @@ def init_ledger(
     scope_str: Optional[str] = None,
     force: bool = False,
     genre: str = "auto",
+    silent: bool = False,
 ) -> Tuple[int, Path]:
     """首次全书/分卷建账纯 Python API
 
@@ -1465,44 +1513,26 @@ def init_ledger(
         scope_str: 扫描章节范围（如 "1-30"，可选）
         force: 忽略脏写拦截强制覆盖
         genre: 网文题材类型（默认 auto 自动探测）
+        silent: 是否静默输出
 
     Returns:
         Tuple[int, Path]: (状态码, 建账盘点报告路径)
     """
     p_dir = Path(project_dir).resolve()
-    exit_code = run_init_mode(
+    return run_init_mode(
         project_dir=p_dir,
         scope_str=scope_str,
         force=force,
         genre=genre,
+        silent=silent,
     )
-    if exit_code != 0:
-        return exit_code, Path("")
-
-    resolver = ChapterResolver()
-    chapters = resolver.discover_chapters(p_dir)
-    if scope_str:
-        try:
-            s_min, s_max = parse_scope_range(scope_str)
-            target_chapters = [c for c in chapters if s_min <= c.index <= s_max]
-        except Exception:
-            target_chapters = chapters
-    else:
-        target_chapters = chapters
-
-    if target_chapters:
-        s_fmt = str(int(target_chapters[0].index)).zfill(3)
-        e_fmt = str(int(target_chapters[-1].index)).zfill(3)
-        report_file = p_dir / "reports" / "阶段封账与里程碑" / f"初始建账盘点报告_第{s_fmt}-{e_fmt}章.md"
-        return exit_code, report_file
-
-    return exit_code, p_dir / "reports"
 
 
 def checkpoint_volume(
     project_dir: Union[str, Path] = ".",
     volume: Optional[int] = None,
     force: bool = False,
+    silent: bool = False,
 ) -> int:
     """分卷封账结转纯 Python API
 
@@ -1521,6 +1551,7 @@ def checkpoint_volume(
 def sync_ledger_from_md(
     project_dir: Union[str, Path] = ".",
     force: bool = False,
+    silent: bool = False,
 ) -> int:
     """从 Markdown 账本反向同步增量回 JSON 纯 Python API
 
@@ -1545,6 +1576,7 @@ def apply_fix(
     new_text: Optional[str] = None,
     context_before: str = "",
     context_after: str = "",
+    silent: bool = False,
 ) -> int:
     """采纳修复方案并安全回写正文纯 Python API
 

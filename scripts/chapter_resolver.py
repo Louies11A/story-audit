@@ -437,7 +437,7 @@ class ChapterResolver:
         return None
 
     @staticmethod
-    def diagnose_sequence_gaps(chapters: List[ChapterItem]) -> List[str]:
+    def diagnose_sequence_gaps(chapters: List[ChapterItem], allow_partial: bool = False) -> List[str]:
         """
         检查章序跳号（如 35 跳到 37 缺失第 36 章，或跨多章跳号如缺失 31, 32）与重号异常，返回诊断信息列表。
         所有异常均为 P2 级别。
@@ -464,7 +464,7 @@ class ChapterResolver:
         main_indices = sorted(set(int(item.index) for item in chapters if item.index >= 1.0))
         if main_indices:
             # 检查首章是否缺失（正文章号应从第 1 章起始）
-            if main_indices[0] > 1:
+            if not allow_partial and main_indices[0] > 1:
                 missing_first = list(range(1, main_indices[0]))
                 if len(missing_first) == 1:
                     diagnostics.append(

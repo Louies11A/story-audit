@@ -149,6 +149,12 @@ ACTION_VERBS = (
     "推开|拉开|打开|关上|放下|递给|挑开|掀开|扯开|拧开|倒出|端起|转身|回头|"
     "抬头|低头|弯腰|俯身|走到|走向|坐下|站起|看向|看着|盯着|扫过"
 )
+
+# 辅助预编译正则常量 (P3-03 优化)
+RE_NOT_IS_OR_ALSO = re.compile(r'不是[^，,。！？!?\n]{1,20}(?:就是|也是)')
+RE_AFFIRMATIVE_START = re.compile(r'^(?:是的|是啊|是呢|是的啊)[，,。.！!]')
+RE_DASH_ONLY = re.compile(r'^[—\-\s=]+$')
+
 ACTION_VERB_RE = re.compile(ACTION_VERBS)
 
 # 8. 上帝解释腔/替读者划重点 (god-view exposition)
@@ -161,7 +167,7 @@ GOD_VIEW_EXPOSITION_PATTERN = re.compile(
 
 def _is_either_or(subtext: str) -> bool:
     """排除连词短语：'不是A就是B' 或 '不是A也是B'"""
-    return bool(re.search(r'不是[^，,。！？!?\n]{1,20}(?:就是|也是)', subtext))
+    return bool(RE_NOT_IS_OR_ALSO.search(subtext))
 
 
 def _is_tag_question(subtext: str) -> bool:
@@ -173,7 +179,7 @@ def _is_tag_question(subtext: str) -> bool:
 def _is_confirmation_tag(subtext: str) -> bool:
     """排除段首承接确认词：'是的，……' / '是啊，……'"""
     s = subtext.strip()
-    return bool(re.match(r'^(?:是的|是啊|是呢|是的啊)[，,。.！!]', s))
+    return bool(RE_AFFIRMATIVE_START.match(s))
 
 
 def scan_ai_patterns(text: str) -> List[FormatFinding]:
@@ -213,7 +219,7 @@ def scan_ai_patterns(text: str) -> List[FormatFinding]:
         # -------------------------------------------------------------
         if "——" in masked_line:
             # 排除纯分隔线（如连续多个破折号组成的分割线）
-            if not re.match(r'^[—\-\s=]+$', clean_orig):
+            if not RE_DASH_ONLY.match(clean_orig):
                 findings.append(FormatFinding(
                     line_number=line_num,
                     flaw_type="AI_EM_DASH",

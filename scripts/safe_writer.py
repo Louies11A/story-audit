@@ -70,9 +70,10 @@ def _verify_anchor_before(
         return True
 
     # 1. 优先匹配本行对应半区 (0 到 start_pos)
+    cb_clean = cb.strip()
     line = lines[line_idx]
     prefix = line[:start_pos]
-    if cb in prefix or cb.strip() in prefix:
+    if cb in prefix or (cb_clean and cb_clean in prefix):
         return True
 
     # 2. 其次匹配前一非空行
@@ -81,7 +82,7 @@ def _verify_anchor_before(
         prev_idx -= 1
     if prev_idx >= 0:
         prev_line = lines[prev_idx]
-        if cb in prev_line or cb.strip() in prev_line:
+        if cb in prev_line or (cb_clean and cb_clean in prev_line):
             return True
 
     return False
@@ -98,9 +99,10 @@ def _verify_anchor_after(
         return True
 
     # 1. 优先匹配本行对应半区 (end_pos 之后)
+    ca_clean = ca.strip()
     line = lines[line_idx]
     suffix = line[end_pos:]
-    if ca in suffix or ca.strip() in suffix:
+    if ca in suffix or (ca_clean and ca_clean in suffix):
         return True
 
     # 2. 其次匹配后一非空行
@@ -109,7 +111,7 @@ def _verify_anchor_after(
         next_idx += 1
     if next_idx < len(lines):
         next_line = lines[next_idx]
-        if ca in next_line or ca.strip() in next_line:
+        if ca in next_line or (ca_clean and ca_clean in next_line):
             return True
 
     return False
@@ -138,8 +140,10 @@ def _find_all_matches(lines: List[str], patch: PatchSpec) -> List[_PatchMatch]:
 
             # 解耦分别判定前后锚点：分别优先匹配本行半区，其次匹配前一/后一非空行
             if _verify_anchor_before(lines, i, pos, cb) and _verify_anchor_after(lines, i, end_pos, ca):
-                cb_in_line = bool(cb and (cb in line[:pos] or cb.strip() in line[:pos]))
-                ca_in_line = bool(ca and (ca in line[end_pos:] or ca.strip() in line[end_pos:]))
+                cb_clean = cb.strip() if cb else ""
+                ca_clean = ca.strip() if ca else ""
+                cb_in_line = bool(cb and (cb in line[:pos] or (cb_clean and cb_clean in line[:pos])))
+                ca_in_line = bool(ca and (ca in line[end_pos:] or (ca_clean and ca_clean in line[end_pos:])))
                 if cb_in_line and ca_in_line:
                     m_type = "single_line"
                 elif not cb_in_line and not ca_in_line and (cb or ca):
@@ -249,7 +253,17 @@ def apply_patch_with_disambiguation(
 
     # 4. 强制原子备份（在正式修改写入前必须执行）
     if backup_dir is None:
-        actual_backup_dir = target_file.parent / "reports" / ".bak"
+        # 回溯查找项目顶层目录（包含 reports/、ledger.json 或 设定/），避免在正文子目录散落脏目录
+        resolved_file = target_file.resolve()
+        project_root = None
+        for parent in [resolved_file.parent] + list(resolved_file.parents):
+            if (parent / "reports").is_dir() or (parent / "ledger.json").is_file() or (parent / "设定").is_dir():
+                project_root = parent
+                break
+        if project_root is not None:
+            actual_backup_dir = project_root / "reports" / ".bak"
+        else:
+            actual_backup_dir = target_file.parent / "reports" / ".bak"
     else:
         actual_backup_dir = Path(backup_dir)
 

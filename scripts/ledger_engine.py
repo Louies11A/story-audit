@@ -49,6 +49,69 @@ ASSET_STATUSES: Set[str] = {
 }
 
 
+
+# 冷资产保护集合 (P2-04: Markdown 同步时防意外抹除)
+COLD_ASSET_STATUSES: Set[str] = {
+    "CONSUMED",
+    "DAMAGED",
+    "TRANSFERRED",
+}
+
+# 启发式抽取顶层预编译常量 (P2-02 优化)
+HEURISTIC_UNITS_REGEX = (
+    "门|座|台|艘|架|挺|只|箱|吨|斤|两|发|枚|颗|件|套|把|支|组|部|瓶|袋|罐|筒|具|"
+    "块|根|张|联|卷|桶|批|口|尊|点|亩|顷|间|栋|处|份|笔|宗|所|文|贯|元|分|角|个|"
+    "株|粒|股|成|页|册|柄|片|节|段|方|条|道|缕|丝|面|盏|贴|尺|寸|升|斗|石|匹|包|捆|扎|提|票|炉|鼎|副"
+)
+
+HEURISTIC_BRACKET_PATTERN = re.compile(
+    r'【(?P<header>[^】]*?(?:收录|发现|获得|激活|建造|升级|开启|解锁|掉落|装备|制造|打捞|缴获|入库|分得|分家|签约|奖励|结算|收获|进账|清点|盘点|核算|收容|继承|采购|购置)[^】]*?)[：:\s]*(?P<content>[^】]+)】'
+)
+
+HEURISTIC_NUMS_REGEX = r"(?:\d+(?:\.\d+)?|[一二两三四五六七八九十百千万半]+|上百|上千|上万|百|千|万)"
+
+HEURISTIC_KWS_REGEX = (
+    # 1. 仙侠玄幻 / 修真
+    r"(?:筑基丹|聚气丹|破境丹|培元丹|还魂丹|洗髓丹|补血丹|灵丹|丹药|灵石|下品灵石|中品灵石|上品灵石|极品灵石|"
+    r"灵草|灵药|灵芝|人参|兽核|妖丹|灵晶|灵液|灵泉|灵髓|龙血|凤羽|玄铁|秘银|"
+    r"飞剑|灵剑|灵器|法宝|灵宝|乾坤袋|储物袋|空间戒指|阵旗|阵盘|功法|秘籍|心法|剑诀|拳谱|残卷|身法|禁术|传承|"
+    # 2. 科幻末世 / 军工装备
+    r"速射炮|主炮|机炮|舰炮|近防炮|火炮|高射炮|迫击炮|加农炮|重炮|防空炮|火箭炮|"
+    r"鱼雷|导弹|火箭弹|深弹|穿甲弹|高爆弹|曳光弹|燃烧弹|子弹|炮弹|手雷|地雷|水雷|"
+    r"步枪|突击步枪|冲锋枪|狙击步枪|机枪|手枪|猎枪|霰弹枪|火箭筒|发射巢|发射管|发射器|"
+    r"防盾|军火箱|弹药箱|弹药|军火|装甲|骨甲|防弹衣|防弹插板|战术背心|夜视仪|消音器|瞄准镜|刺刀|枪塔|"
+    r"数控机床|五轴机床|五轴数控机床|机床|工业母机|发电机|柴油机|燃气轮机|发动机|电动机|增压机|汽油机|充电机|"
+    r"水泵|抽水机|空压机|潜水器|水肺|呼吸器|浮力气囊|气囊|千斤顶|电动绞盘|绞盘|铣刀|合金铣刀|焊机|电焊机|车床|"
+    r"蓄电池|储能电池|变压器|配电柜|轴系|舵机|螺旋桨|喷水推进器|推进器|相控阵声呐|声呐基阵|声呐|相控阵|水听器|"
+    r"火控系统|火控雷达|火控计算机|通信基站|无线电台|对讲机|巡逻艇|双体炮艇|炮艇|快艇|双体船|冲锋舟|皮划艇|防弹艇|救生艇|"
+    r"拖轮|驳船|货轮|护卫舰|驱逐舰|巡洋舰|战列舰|潜艇|潜航器|装甲车|重卡|"
+    r"大米|白面|面粉|小麦|糙米|粗粮|肉罐头|水果罐头|蔬菜罐头|鱼罐头|罐头|压缩饼干|单兵口粮|军粮|口粮|"
+    r"纯净水|矿泉水|纯水|抗生素|消炎药|止痛药|急救包|重油|柴油|汽油|航空煤油|机油|润滑油|防冻液|"
+    r"防弹钢|特种防弹钢|特种钢|钛合金|铝合金|钨钢|无缝钢管|钢材|钢板|"
+    r"重构点|进化核心|蓝图|改装蓝图|建造蓝图|设计图|图纸|能量核心|能量晶体|晶核|"
+    # 3. 都市高武 / 资产商战 / 文娱
+    r"气血丹|气血仪|淬骨膏|精神药剂|凶兽肉|版权|独家版权|股权|股份|定金|违约金|现金|支票|存折|黑卡|豪车|别墅|写字楼|"
+    # 4. 女频年代 / 宅斗宫斗 / 世情
+    r"粮票|全国粮票|布票|肉票|工业券|油票|工分|地契|房契|田契|铺面|商铺|庄园|宅院|四合院|嫁妆|聘礼|份例|月钱|体己|"
+    r"银票|碎银|白银|黄金|银两|铜钱|文钱|云锦|绸缎|首饰|头面|珍珠|金条|"
+    # 5. 悬疑怪谈 / 民俗规则
+    r"诡器|诡物|规则残片|羊皮纸|蜡烛|寿衣|替死娃娃|镇魂铃|判官笔|绣花鞋|问米碗|封印物|染血的剪刀|阴阳镜|纸人|骨灰盒)"
+)
+
+HEURISTIC_NATURAL_PATTERN = re.compile(
+    rf'(?P<num>{HEURISTIC_NUMS_REGEX})\s*(?P<unit>{HEURISTIC_UNITS_REGEX})\s*(?P<desc>[一-龥a-zA-Z0-9]{{0,10}}?)(?P<kw>{HEURISTIC_KWS_REGEX})'
+)
+
+HEURISTIC_ACQUISITION_VERBS: Set[str] = {
+    "收录", "发现", "获得", "激活", "建造", "升级", "开启", "解锁", "掉落", "装备", "制造",
+    "打捞", "缴获", "入库", "找到", "运回", "搜刮", "收获", "起出", "搬出", "运送", "加装",
+    "清点出", "清点", "囤积", "储备", "开出", "封存着", "拥有", "配备", "装载", "采购",
+    "进账", "得到", "采掘", "提炼", "生产", "改装完成", "捕获", "存有", "堆放着", "物资",
+    "战利品", "战备", "军械库", "仓库", "掩体", "车间", "补给", "起步", "亮剑", "上线", "改装完成", "完成改装", "总装", "买下", "购置", "兑换", "继承", "分得", "受封", "受赏", "赐予", "赏赐", "炼制", "采摘", "签约", "过户", "划归", "私藏", "缴存", "变现", "到账"
+}
+
+HEURISTIC_ENEMY_VERBS: Set[str] = {"击毁", "击沉", "打烂", "摧毁", "炸沉", "包抄", "呼啸而来", "截击", "逼近", "海盗船", "敌方"}
+
 class LedgerDirtyError(Exception):
     """防脏写拦截器异常：Markdown 编辑时间晚于 JSON 数据源"""
     pass
@@ -360,22 +423,13 @@ def extract_heuristic_assets(text: str, chapter_index: float, genre: Optional[st
     raw_candidates: List[Tuple[str, Union[int, float], str, str]] = []
 
     # 1. 扫描系统出装/提示括号块 【获得/收录/解锁/建造/打捞/缴获...】
-    bracket_pattern = re.compile(
-        r'【(?P<header>[^】]*?(?:收录|发现|获得|激活|建造|升级|开启|解锁|掉落|装备|制造|打捞|缴获|入库|分得|分家|签约|奖励|结算|收获|进账|清点|盘点|核算|收容|继承|采购|购置)[^】]*?)[：:\s]*(?P<content>[^】]+)】'
-    )
-    units_regex = (
-        "门|座|台|艘|架|挺|只|箱|吨|斤|两|发|枚|颗|件|套|把|支|组|部|瓶|袋|罐|筒|具|"
-        "块|根|张|联|卷|桶|批|口|尊|点|亩|顷|间|栋|处|份|笔|宗|所|文|贯|元|分|角|个|"
-        "株|粒|股|成|页|册|柄|片|节|段|方|条|道|缕|丝|面|盏|贴|尺|寸|升|斗|石|匹|包|捆|扎|提|票|炉|鼎|副"
-    )
-
-    for m in bracket_pattern.finditer(text):
+    for m in HEURISTIC_BRACKET_PATTERN.finditer(text):
         full_bracket = m.group(0)
         bracket_inner = full_bracket[1:-1].strip()
         # 优先以冒号切分标题与正文
         if "：" in bracket_inner or ":" in bracket_inner:
             hdr, body = re.split(r'[：:]', bracket_inner, maxsplit=1)
-            if re.match(rf'^\d+(?:\.\d+)?[万千百亿]?\s*(?:{units_regex})$', body.strip()):
+            if re.match(rf'^\d+(?:\.\d+)?[万千百亿]?\s*(?:{HEURISTIC_UNITS_REGEX})$', body.strip()):
                 content = f'{hdr.strip()}：{body.strip()}'
             else:
                 content = body.strip()
@@ -393,7 +447,7 @@ def extract_heuristic_assets(text: str, chapter_index: float, genre: Optional[st
                     raw_candidates.append((nm, qty, un, full_bracket))
                 continue
 
-            m_nu = re.match(rf'^(?P<name>.+?)(?<![\d.])(?P<num>\d+(?:\.\d+)?[万千百亿]?|[一二两三四五六七八九十百千万]+)\s*(?P<unit>{units_regex})$', sub)
+            m_nu = re.match(rf'^(?P<name>.+?)(?<![\d.])(?P<num>\d+(?:\.\d+)?[万千百亿]?|[一二两三四五六七八九十百千万]+)\s*(?P<unit>{HEURISTIC_UNITS_REGEX})$', sub)
             if m_nu:
                 nm = _clean_asset_name(m_nu.group("name"))
                 qty = parse_chinese_or_arabic_number(m_nu.group("num"))
@@ -402,7 +456,7 @@ def extract_heuristic_assets(text: str, chapter_index: float, genre: Optional[st
                     raw_candidates.append((nm, qty, un, full_bracket))
                 continue
 
-            m_un = re.match(rf'^(?P<num>\d+|[一二两三四五六七八九十百千万半]+)\s*(?P<unit>{units_regex})\s*(?P<name>.+)$', sub)
+            m_un = re.match(rf'^(?P<num>\d+|[一二两三四五六七八九十百千万半]+)\s*(?P<unit>{HEURISTIC_UNITS_REGEX})\s*(?P<name>.+)$', sub)
             if m_un:
                 nm = _clean_asset_name(m_un.group("name"))
                 qty = parse_chinese_or_arabic_number(m_un.group("num"))
@@ -417,53 +471,11 @@ def extract_heuristic_assets(text: str, chapter_index: float, genre: Optional[st
                 raw_candidates.append((nm, 1, un, full_bracket))
 
     # 2. 扫描自然文本中的 数量 + 单位 + 军工物资名称
-    nums_regex = r"(?:\d+(?:\.\d+)?|[一二两三四五六七八九十百千万半]+|上百|上千|上万|百|千|万)"
-    kws_regex = (
-        # 1. 仙侠玄幻 / 修真
-        r"(?:筑基丹|聚气丹|破境丹|培元丹|还魂丹|洗髓丹|补血丹|灵丹|丹药|灵石|下品灵石|中品灵石|上品灵石|极品灵石|"
-        r"灵草|灵药|灵芝|人参|兽核|妖丹|灵晶|灵液|灵泉|灵髓|龙血|凤羽|玄铁|秘银|"
-        r"飞剑|灵剑|灵器|法宝|灵宝|乾坤袋|储物袋|空间戒指|阵旗|阵盘|功法|秘籍|心法|剑诀|拳谱|残卷|身法|禁术|传承|"
-        # 2. 科幻末世 / 军工装备
-        r"速射炮|主炮|机炮|舰炮|近防炮|火炮|高射炮|迫击炮|加农炮|重炮|防空炮|火箭炮|"
-        r"鱼雷|导弹|火箭弹|深弹|穿甲弹|高爆弹|曳光弹|燃烧弹|子弹|炮弹|手雷|地雷|水雷|"
-        r"步枪|突击步枪|冲锋枪|狙击步枪|机枪|手枪|猎枪|霰弹枪|火箭筒|发射巢|发射管|发射器|"
-        r"防盾|军火箱|弹药箱|弹药|军火|装甲|骨甲|防弹衣|防弹插板|战术背心|夜视仪|消音器|瞄准镜|刺刀|枪塔|"
-        r"数控机床|五轴机床|五轴数控机床|机床|工业母机|发电机|柴油机|燃气轮机|发动机|电动机|增压机|汽油机|充电机|"
-        r"水泵|抽水机|空压机|潜水器|水肺|呼吸器|浮力气囊|气囊|千斤顶|电动绞盘|绞盘|铣刀|合金铣刀|焊机|电焊机|车床|"
-        r"蓄电池|储能电池|变压器|配电柜|轴系|舵机|螺旋桨|喷水推进器|推进器|相控阵声呐|声呐基阵|声呐|相控阵|水听器|"
-        r"火控系统|火控雷达|火控计算机|通信基站|无线电台|对讲机|巡逻艇|双体炮艇|炮艇|快艇|双体船|冲锋舟|皮划艇|防弹艇|救生艇|"
-        r"拖轮|驳船|货轮|护卫舰|驱逐舰|巡洋舰|战列舰|潜艇|潜航器|装甲车|重卡|"
-        r"大米|白面|面粉|小麦|糙米|粗粮|肉罐头|水果罐头|蔬菜罐头|鱼罐头|罐头|压缩饼干|单兵口粮|军粮|口粮|"
-        r"纯净水|矿泉水|纯水|抗生素|消炎药|止痛药|急救包|重油|柴油|汽油|航空煤油|机油|润滑油|防冻液|"
-        r"防弹钢|特种防弹钢|特种钢|钛合金|铝合金|钨钢|无缝钢管|钢材|钢板|"
-        r"重构点|进化核心|蓝图|改装蓝图|建造蓝图|设计图|图纸|能量核心|能量晶体|晶核|"
-        # 3. 都市高武 / 资产商战 / 文娱
-        r"气血丹|气血仪|淬骨膏|精神药剂|凶兽肉|版权|独家版权|股权|股份|定金|违约金|现金|支票|存折|黑卡|豪车|别墅|写字楼|"
-        # 4. 女频年代 / 宅斗宫斗 / 世情
-        r"粮票|全国粮票|布票|肉票|工业券|油票|工分|地契|房契|田契|铺面|商铺|庄园|宅院|四合院|嫁妆|聘礼|份例|月钱|体己|"
-        r"银票|碎银|白银|黄金|银两|铜钱|文钱|云锦|绸缎|首饰|头面|珍珠|金条|"
-        # 5. 悬疑怪谈 / 民俗规则
-        r"诡器|诡物|规则残片|羊皮纸|蜡烛|寿衣|替死娃娃|镇魂铃|判官笔|绣花鞋|问米碗|封印物|染血的剪刀|阴阳镜|纸人|骨灰盒)"
-    )
-
-    natural_pattern = re.compile(
-        rf'(?P<num>{nums_regex})\s*(?P<unit>{units_regex})\s*(?P<desc>[\u4e00-\u9fa5a-zA-Z0-9]{{0,10}}?)(?P<kw>{kws_regex})'
-    )
-
-    acquisition_verbs = {
-        "收录", "发现", "获得", "激活", "建造", "升级", "开启", "解锁", "掉落", "装备", "制造",
-        "打捞", "缴获", "入库", "找到", "运回", "搜刮", "收获", "起出", "搬出", "运送", "加装",
-        "清点出", "清点", "囤积", "储备", "开出", "封存着", "拥有", "配备", "装载", "采购",
-        "进账", "得到", "采掘", "提炼", "生产", "改装完成", "捕获", "存有", "堆放着", "物资",
-        "战利品", "战备", "军械库", "仓库", "掩体", "车间", "补给", "起步", "亮剑", "上线", "改装完成", "完成改装", "总装", "买下", "购置", "兑换", "继承", "分得", "受封", "受赏", "赐予", "赏赐", "炼制", "采摘", "签约", "过户", "划归", "私藏", "缴存", "变现", "到账"
-    }
-    enemy_verbs = {"击毁", "击沉", "打烂", "摧毁", "炸沉", "包抄", "呼啸而来", "截击", "逼近", "海盗船", "敌方"}
-
     for line in text.splitlines():
         clean_l = line.strip()
         if not clean_l:
             continue
-        for m in natural_pattern.finditer(clean_l):
+        for m in HEURISTIC_NATURAL_PATTERN.finditer(clean_l):
             matched_str = m.group(0)
             num_str = m.group("num")
             unit_str = m.group("unit")
@@ -482,8 +494,8 @@ def extract_heuristic_assets(text: str, chapter_index: float, genre: Optional[st
             if any(ef in full_name for ef in enemy_factions) and not any(lv in sent_context for lv in loot_verbs):
                 continue
 
-            has_acq = any(v in sent_context for v in acquisition_verbs)
-            has_enemy = any(v in sent_context for v in enemy_verbs)
+            has_acq = any(v in sent_context for v in HEURISTIC_ACQUISITION_VERBS)
+            has_enemy = any(v in sent_context for v in HEURISTIC_ENEMY_VERBS)
             if has_enemy and not any(lv in sent_context for lv in loot_verbs):
                 continue
 
@@ -605,7 +617,7 @@ def scan_foreshadowing_tags(text: str) -> List[Dict[str, str]]:
             results.append({"name": name, "origin": origin, "status": status})
 
     # 2. 扫描中文 HTML 注释标签 <!-- 伏笔:... -->
-    pattern_cn_html = re.compile(r'<!--\s*(?:伏笔|悬念|线索|暗线)\s*[：:]\s*(?P<content>.*?)\s*-->', re.DOTALL)
+    pattern_cn_html = re.compile(r'<!--\s*(?:audit:stash:)?(?:伏笔|悬念|线索|暗线)\s*[：:]\s*(?P<content>.*?)\s*-->', re.DOTALL)
     for match in pattern_cn_html.finditer(text):
         content = match.group("content").strip()
         _parse_foreshadowing_content(content, results, seen)
@@ -918,8 +930,13 @@ def sync_from_markdown(md_path: Path, json_path: Path) -> LedgerState:
             continue
 
     # 若成功识别到资产表头，对在 Markdown 中物理删除的条目从 state.assets 中同步清理
-    if col_mapping is not None:
-        removed_ids = [aid for aid in list(state.assets.keys()) if aid not in valid_asset_ids]
+    # 安全保护：如果识别到的有效资产集合不为空，且条目不属于冷资产（CONSUMED/DAMAGED/TRANSFERRED 等），才执行清理；
+    # 坚决防止 Markdown 仅展示活跃随身资产或发生空表时将冷资产历史记录一笔抹除！
+    if col_mapping is not None and valid_asset_ids:
+        removed_ids = [
+            aid for aid, item in list(state.assets.items())
+            if aid not in valid_asset_ids and item.status not in COLD_ASSET_STATUSES
+        ]
         for aid in removed_ids:
             del state.assets[aid]
 
