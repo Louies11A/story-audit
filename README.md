@@ -2,7 +2,7 @@
 
 [![Python Version](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-177%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-187%20passed-brightgreen.svg)]()
 [![Coverage](https://img.shields.io/badge/coverage-90%25-brightgreen.svg)]()
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-zero%20external-orange.svg)]()
 
@@ -174,7 +174,7 @@
 │   ├── ledger_engine.py                    # 双轨账本与脏写拦截
 │   ├── safe_writer.py                      # 三行锚点安全回写器
 │   └── story_audit.py                      # CLI 管线与预审包调度中枢
-└── tests/                                  # 单元与集成测试套件 (177 passed)
+└── tests/                                  # 单元与集成测试套件 (187 passed)
     ├── test_types.py
     ├── test_safe_io.py
     ├── test_chapter_resolver.py
@@ -296,7 +296,7 @@ pytest --cov=scripts --cov-report=term-missing
 
 ### 测试指标
 
-- **用例总数**：**177 项测试** 全部通过（100% Pass Rate）；
+- **用例总数**：**187 项测试** 全部通过（100% Pass Rate）；
 - **执行时间**：~ 1.70 秒（极速并发执行）；
 - **覆盖率统计**：全模块综合平均覆盖率 **90%**：
   - `scripts/chapter_linker.py`：**98%**
