@@ -230,8 +230,8 @@ def _analyze_couplet_line(line: str) -> Optional[int]:
     sub_parts = RE_COMMA_SPLIT.split(s)
     sub_parts = [p.strip() for p in sub_parts if p.strip()]
     if len(sub_parts) == 2:
-        h1 = len(re.findall(r'[\u4e00-\u9fa5]', sub_parts[0]))
-        h2 = len(re.findall(r'[\u4e00-\u9fa5]', sub_parts[1]))
+        h1 = len(RE_HAN_CHAR.findall(sub_parts[0]))
+        h2 = len(RE_HAN_CHAR.findall(sub_parts[1]))
         if h1 == h2 and h1 in (3, 4, 5, 6, 7, 8):
             return h1
     return None
@@ -252,7 +252,7 @@ def _analyze_single_poem_line(line: str) -> Optional[int]:
         # 句内不得再有逗号句号等停顿标点
         if any(p in s[:-1] for p in "，。！？；,;!?"):
             return None
-        han_chars = re.findall(r'[\u4e00-\u9fa5]', s)
+        han_chars = RE_HAN_CHAR.findall(s)
         total_han = len(han_chars)
         if total_han in (4, 5, 6, 7, 8):
             return total_han

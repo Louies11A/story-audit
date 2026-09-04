@@ -173,13 +173,63 @@ def test_p1_06_chapter_resolver_sequence_gaps_allow_partial():
 # 三、P2 一般级与架构一致性（7项）
 # ==============================================================================
 
-def test_p2_01_story_audit_api_silent_and_no_cli_terms():
-    """[P2-01] 顶层 API 支持 silent=True，且报错文案无 CLI 标志 (--sync-from-md 等)"""
+def test_p2_01_story_audit_api_silent_and_no_cli_terms(tmp_path, capsys):
+    """[P2-01] 真实验证所有 API 在 silent=True 下 0 字节泄漏，且报错文案无 CLI 标志"""
     src = Path(story_audit_mod.__file__).read_text(encoding="utf-8")
-    # 检查 CLI 选项字符串在报错中已清理
     assert "--sync-from-md" not in src
     assert "--checkpoint" not in src
     assert "--apply-fix" not in src
+
+    # 准备测试小说工程
+    project_dir = tmp_path / "silent_test_proj"
+    project_dir.mkdir()
+    (project_dir / "第001章.txt").write_text("第一章\n林冲拔剑上山。大雪纷飞。", encoding="utf-8")
+    story_audit_mod.init_ledger(project_dir, silent=True)
+    capsys.readouterr()  # 清空此前所有输出
+
+    # 1. 测试 audit_scope 在 silent=True 时完全静默
+    story_audit_mod.audit_scope(project_dir, scope_str="1-1", silent=True)
+    out1, err1 = capsys.readouterr()
+    assert out1 == "", f"audit_scope(silent=True) 泄露标准输出: {out1!r}"
+    assert err1 == "", f"audit_scope(silent=True) 泄露错误输出: {err1!r}"
+
+    # 2. 测试 checkpoint_volume 在 silent=True 时完全静默
+    story_audit_mod.checkpoint_volume(project_dir, volume=1, silent=True)
+    # 也测试非法参数时的报错静默
+    story_audit_mod.checkpoint_volume(project_dir, volume=None, silent=True)
+    out2, err2 = capsys.readouterr()
+    assert out2 == "", f"checkpoint_volume(silent=True) 泄露输出: {out2!r}"
+    assert err2 == "", f"checkpoint_volume(silent=True) 泄露错误: {err2!r}"
+
+    # 3. 测试 sync_ledger_from_md 在 silent=True 时完全静默
+    story_audit_mod.sync_ledger_from_md(project_dir, silent=True)
+    out3, err3 = capsys.readouterr()
+    assert out3 == "", f"sync_ledger_from_md(silent=True) 泄露输出: {out3!r}"
+    assert err3 == "", f"sync_ledger_from_md(silent=True) 泄露错误: {err3!r}"
+
+    # 4. 测试 apply_fix 在 silent=True 时完全静默 (即使修复失败)
+    story_audit_mod.apply_fix(
+        project_dir,
+        chapter_index=1,
+        target_line=1,
+        old_text="不存在的文本",
+        new_text="新文本",
+        context_before="林冲",
+        context_after="。",
+        silent=True,
+    )
+    # 测试参数缺失报错时的静默
+    story_audit_mod.apply_fix(project_dir, chapter_index=1, silent=True)
+    out4, err4 = capsys.readouterr()
+    assert out4 == "", f"apply_fix(silent=True) 泄露输出: {out4!r}"
+    assert err4 == "", f"apply_fix(silent=True) 泄露错误: {err4!r}"
+
+    # 5. 验证 Windows GBK 环境下 Emoji 打印不崩溃 (safe_console_print 编码容错)
+    if hasattr(story_audit_mod, "safe_console_print"):
+        import io
+        # 模拟一个仅支持 gbk 编码的输出流
+        gbk_stream = io.TextIOWrapper(io.BytesIO(), encoding="gbk", errors="strict")
+        story_audit_mod.safe_console_print("🚀 开始批量审查 📊 汇总看板 🔴 P0阻断 🟡 P1警告 🟢 合格通过 ✅ 完成", file=gbk_stream)
 
 
 def test_p2_02_ledger_engine_regex_precompiled():
@@ -320,3 +370,39 @@ def test_p3_05_author_memory_profile_view_guidance(tmp_path):
     profile_content = mem.render_profile_view()
     assert "AuthorMemory" in profile_content or "API" in profile_content
     assert "python scripts/author_memory.py record" not in profile_content
+
+def test_allow_partial_end_to_end_chain(tmp_path):
+    """[P2-API] 验证 allow_partial 在 audit_chapter、audit_scope 顶层完全贯通且自动推导"""
+    project_dir = tmp_path / "partial_test_proj"
+    project_dir.mkdir()
+    # 仅存在 31, 32, 33 章
+    (project_dir / "第031章.txt").write_text("第三十一章\n三十一章正文内容。", encoding="utf-8")
+    (project_dir / "第032章.txt").write_text("第三十二章\n三十二章正文内容。", encoding="utf-8")
+    (project_dir / "第033章.txt").write_text("第三十三章\n三十三章正文内容。", encoding="utf-8")
+    story_audit_mod.init_ledger(project_dir, silent=True)
+
+    # 1. 单章审查显式指定 allow_partial=True，报告中不应产生缺失 1-30 章的警告
+    code, rep_path = story_audit_mod.audit_chapter(
+        project_dir,
+        chapter_index=31,
+        allow_partial=True,
+        silent=True,
+    )
+    rep_text = rep_path.read_text(encoding="utf-8")
+    assert "缺失第 1 章" not in rep_text and "缺失章节" not in rep_text
+
+    # 2. 批量审查 31-33 范围，未显式传参时应自动推导 allow_partial=True
+    code_scope, rep_scope = story_audit_mod.audit_scope(
+        project_dir,
+        scope_str="31-33",
+        silent=True,
+    )
+    scope_text = rep_scope.read_text(encoding="utf-8")
+    assert "缺失第 1 章" not in scope_text and "缺失章节" not in scope_text
+
+
+def test_p3_format_scanner_no_bare_han_char_regex():
+    """[P3] format_scanner 中所有汉字匹配全部统一使用 RE_HAN_CHAR 预编译对象"""
+    src = Path(format_scanner_mod.__file__).read_text(encoding="utf-8")
+    assert "re.findall(r'[\\u4e00-\\u9fa5]'" not in src
+    assert 're.findall(r"[\\u4e00-\\u9fa5]"' not in src

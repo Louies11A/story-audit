@@ -62,6 +62,29 @@ from scripts.types import BoundaryContext, ChapterItem, Finding, FormatFinding, 
 
 
 
+
+def safe_console_print(msg: str, file: Any = None) -> None:
+    """安全控制台输出，自动处理 Windows GBK/ANSI 环境下的 Emoji 与 Unicode 编码兼容"""
+    target = file if file is not None else sys.stdout
+    try:
+        print(msg, file=target)
+    except UnicodeEncodeError:
+        encoding = getattr(target, "encoding", None) or "utf-8"
+        cleaned = (
+            msg.replace("🚀", "[启动]")
+            .replace("📊", "[看板]")
+            .replace("🔴", "[阻断]")
+            .replace("🟡", "[警告]")
+            .replace("🟢", "[通过]")
+            .replace("✅", "[完成]")
+            .replace("⚠️", "[注意]")
+        )
+        safe_text = cleaned.encode(encoding, errors="replace").decode(encoding)
+        try:
+            print(safe_text, file=target)
+        except Exception:
+            pass
+
 def parse_scope_range(scope_str: str) -> Tuple[float, float]:
     """解析范围字符串，如 '31-35' 或 '1-30'"""
     if not scope_str or "-" not in scope_str:
@@ -486,6 +509,7 @@ def run_audit(
     platform: str = "generic",
     use_author_memory: bool = False,
     inherited_items: Optional[Dict[str, Any]] = None,
+    allow_partial: bool = False,
 ) -> int:
     """执行单章审查管线，生成预审包与归档报告，返回退出码"""
     reports_dir = project_dir / "reports"
@@ -543,7 +567,7 @@ def run_audit(
     boundary_ctx = extract_boundary_slices(prev_text, curr_text)
 
     # 6. 序号体检
-    gap_warnings = resolver.diagnose_sequence_gaps(chapters)
+    gap_warnings = resolver.diagnose_sequence_gaps(chapters, allow_partial=allow_partial)
 
     # 5.5 题材自动探测与画像构建
     genre_profile = detect_genre(curr_text, specified_genre=genre)
@@ -774,32 +798,37 @@ def run_audit(
     return exit_code
 
 
-def run_sync_from_md(project_dir: Path) -> int:
+def run_sync_from_md(project_dir: Path, silent: bool = False) -> int:
     """执行 sync_ledger_from_md 反向同步管线"""
     json_path, md_path = locate_ledger_paths(project_dir)
     if not md_path.is_file():
-        print(f"[错误] 未找到 Markdown 账本文件: {md_path}", file=sys.stderr)
+        if not silent:
+            safe_console_print(f"[错误] 未找到 Markdown 账本文件: {md_path}", file=sys.stderr)
         return 3
 
     try:
         new_state = sync_from_markdown(md_path, json_path)
-        print(f"成功将 Markdown 账本增量同步至 JSON 数据源: {json_path}")
-        print(f"当前总资产数: {len(new_state.assets)}")
+        if not silent:
+            safe_console_print(f"成功将 Markdown 账本增量同步至 JSON 数据源: {json_path}")
+            safe_console_print(f"当前总资产数: {len(new_state.assets)}")
         return 0
     except Exception as e:
-        print(f"[错误] 反向同步失败: {e}", file=sys.stderr)
+        if not silent:
+            safe_console_print(f"[错误] 反向同步失败: {e}", file=sys.stderr)
         return 3
 
 
-def run_checkpoint(project_dir: Path, volume: Optional[int], force: bool = False) -> int:
+def run_checkpoint(project_dir: Path, volume: Optional[int], force: bool = False, silent: bool = False) -> int:
     """执行 checkpoint_volume 分卷封账结转管线"""
     if volume is None:
-        print("[错误] checkpoint 结转操作必须指定 volume 卷号！", file=sys.stderr)
+        if not silent:
+            safe_console_print("[错误] checkpoint 结转操作必须指定 volume 卷号！", file=sys.stderr)
         return 3
 
     json_path, _ = locate_ledger_paths(project_dir)
     if not json_path.is_file():
-        print(f"[错误] 未找到账本数据源: {json_path}", file=sys.stderr)
+        if not silent:
+            safe_console_print(f"[错误] 未找到账本数据源: {json_path}", file=sys.stderr)
         return 3
 
     try:
@@ -820,10 +849,12 @@ def run_checkpoint(project_dir: Path, volume: Optional[int], force: bool = False
         report_file = reports_stage_dir / f"第{vol_str}卷_期末结账与全卷连续性审计报告.md"
         write_file_safe(report_file, stage_report)
 
-        print(f"分卷封账完成！第 {volume} 卷快照已归档至: {checkpoint_file}")
+        if not silent:
+            safe_console_print(f"分卷封账完成！第 {volume} 卷快照已归档至: {checkpoint_file}")
         return 0
     except Exception as e:
-        print(f"[错误] 分卷封账失败: {e}", file=sys.stderr)
+        if not silent:
+            safe_console_print(f"[错误] 分卷封账失败: {e}", file=sys.stderr)
         return 3
 
 
@@ -1123,22 +1154,29 @@ def run_scope_audit(
     platform: str = "generic",
     use_author_memory: bool = False,
     silent: bool = False,
+    allow_partial: Optional[bool] = None,
 ) -> int:
     """执行批量连审模式，生成大盘汇总报告与紧凑看板输出"""
     try:
         s_min, s_max = parse_scope_range(scope_str)
     except Exception as e:
-        print(f"[错误] {e}", file=sys.stderr)
+        if not silent:
+            safe_console_print(f"[错误] {e}", file=sys.stderr)
         return 3
 
     resolver = ChapterResolver()
     chapters = resolver.discover_chapters(project_dir)
     target_chapters = [c for c in chapters if s_min <= c.index <= s_max]
     if not target_chapters:
-        print(f"[错误] 范围 {scope_str} 内未找到任何章节！", file=sys.stderr)
+        if not silent:
+            safe_console_print(f"[错误] 范围 {scope_str} 内未找到任何章节！", file=sys.stderr)
         return 3
 
     n_total = len(target_chapters)
+    if allow_partial is None:
+        effective_allow_partial = bool(s_min > 1.0)
+    else:
+        effective_allow_partial = allow_partial
     reports_dir = project_dir / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1148,20 +1186,20 @@ def run_scope_audit(
     inherited_items = get_inherited_items(audit_state)
 
     if not silent:
-        print(f"=== story-audit 深度审查报告 ===")
-    print(f"Requested Mode: {mode}")
-    print(f"Effective Mode: {effective_mode}")
-    print(f"Fallback: {fallback_reason}")
-    print(f"Platform Rubric: {platform}")
-    print(f"Genre: {genre}")
-    print(f"Scope: {scope_str}")
-    print(f"========================================================================================")
-    print(f"🚀 开始批量审查 [范围: {scope_str} | 共 {n_total} 章 | 模式: {effective_mode}]")
-    if inherited_items.get("open_defects"):
-        print(f"  [继承开放缺陷]: {len(inherited_items['open_defects'])} 项")
-    if inherited_items.get("foreshadowing_commitments"):
-        print(f"  [监控中伏笔池]: {len(inherited_items['foreshadowing_commitments'])} 个")
-    print(f"========================================================================================")
+        safe_console_print(f"=== story-audit 深度审查报告 ===")
+        safe_console_print(f"Requested Mode: {mode}")
+        safe_console_print(f"Effective Mode: {effective_mode}")
+        safe_console_print(f"Fallback: {fallback_reason}")
+        safe_console_print(f"Platform Rubric: {platform}")
+        safe_console_print(f"Genre: {genre}")
+        safe_console_print(f"Scope: {scope_str}")
+        safe_console_print(f"========================================================================================")
+        safe_console_print(f"🚀 开始批量审查 [范围: {scope_str} | 共 {n_total} 章 | 模式: {effective_mode}]")
+        if inherited_items.get("open_defects"):
+            safe_console_print(f"  [继承开放缺陷]: {len(inherited_items['open_defects'])} 项")
+        if inherited_items.get("foreshadowing_commitments"):
+            safe_console_print(f"  [监控中伏笔池]: {len(inherited_items['foreshadowing_commitments'])} 个")
+        safe_console_print(f"========================================================================================")
 
     chapter_summaries: List[Dict[str, Any]] = []
     has_p0 = False
@@ -1183,6 +1221,7 @@ def run_scope_audit(
             platform=platform,
             use_author_memory=use_author_memory,
             inherited_items=inherited_items,
+            allow_partial=effective_allow_partial,
         )
         chapter_summaries.append(summary)
 
@@ -1193,37 +1232,38 @@ def run_scope_audit(
 
         status_tag = summary.get("status", "完成")
         if not silent:
-            print(f"  [{idx:02d}/{n_total:02d}] 审查 第{chap.index:03g}章 《{chap.title}》 ... [{status_tag}]")
+            safe_console_print(f"  [{idx:02d}/{n_total:02d}] 审查 第{chap.index:03g}章 《{chap.title}》 ... [{status_tag}]")
 
     # 打印终端紧凑汇总看板
-    print(f"========================================================================================")
-    print(f"📊 批量连审汇总看板 [范围: {scope_str} | 覆盖: {n_total} 章]")
-    print(f"========================================================================================")
-    print(f"{'章号':<8} | {'章节标题':<24} | {'字数':>6} | {'段数':>4} | {'P0':>2} | {'P1':>2} | {'P2':>2} | {'P3':>2} | {'状态':<6}")
-    print(f"{'-'*8}-+-{'-'*24}-+-{'-'*6}-+-{'-'*4}-+-{'-'*2}-+-{'-'*2}-+-{'-'*2}-+-{'-'*2}-+-{'-'*8}")
-
-    for s in chapter_summaries:
-        raw_title = s['chapter_title']
-        title_disp = raw_title[:22] + ".." if len(raw_title) > 22 else raw_title
-        p0_num = len(s['p0_list'])
-        p1_num = len(s['p1_list'])
-        p2_num = s['p2_count']
-        p3_num = s['p3_count']
-        print(f"第{s['chapter_index']:03g}章  | {title_disp:<24} | {s['word_count']:>6,} | {s['paragraph_count']:>4} | {p0_num:>2} | {p1_num:>2} | {p2_num:>2} | {p3_num:>2} | {s['status']}")
-
     total_words = sum(s['word_count'] for s in chapter_summaries)
     total_paras = sum(s['paragraph_count'] for s in chapter_summaries)
     tot_p0 = sum(len(s['p0_list']) for s in chapter_summaries)
     tot_p1 = sum(len(s['p1_list']) for s in chapter_summaries)
     tot_p2 = sum(s['p2_count'] for s in chapter_summaries)
     tot_p3 = sum(s['p3_count'] for s in chapter_summaries)
-
     overall_label = "🔴 P0 阻断" if has_p0 else ("🟡 P1 警告" if has_p1 else "🟢 合格通过")
-    print(f"========================================================================================")
-    print(f"【全范围大盘】总章节: {n_total} 章 | 总字数: {total_words:,} 字 | 总段落: {total_paras:,} 段")
-    print(f"【瑕疵汇总】P0 阻断: {tot_p0} | P1 警告: {tot_p1} | P2 拖沓长句/段: {tot_p2} | P3 翻译腔/混杂: {tot_p3}")
-    print(f"【判定结论】{overall_label}")
-    print(f"========================================================================================")
+
+    if not silent:
+        safe_console_print(f"========================================================================================")
+        safe_console_print(f"📊 批量连审汇总看板 [范围: {scope_str} | 覆盖: {n_total} 章]")
+        safe_console_print(f"========================================================================================")
+        safe_console_print(f"{'章号':<8} | {'章节标题':<24} | {'字数':>6} | {'段数':>4} | {'P0':>2} | {'P1':>2} | {'P2':>2} | {'P3':>2} | {'状态':<6}")
+        safe_console_print(f"{'-'*8}-+-{'-'*24}-+-{'-'*6}-+-{'-'*4}-+-{'-'*2}-+-{'-'*2}-+-{'-'*2}-+-{'-'*2}-+-{'-'*8}")
+
+        for s in chapter_summaries:
+            raw_title = s['chapter_title']
+            title_disp = raw_title[:22] + ".." if len(raw_title) > 22 else raw_title
+            p0_num = len(s['p0_list'])
+            p1_num = len(s['p1_list'])
+            p2_num = s['p2_count']
+            p3_num = s['p3_count']
+            safe_console_print(f"第{s['chapter_index']:03g}章  | {title_disp:<24} | {s['word_count']:>6,} | {s['paragraph_count']:>4} | {p0_num:>2} | {p1_num:>2} | {p2_num:>2} | {p3_num:>2} | {s['status']}")
+
+        safe_console_print(f"========================================================================================")
+        safe_console_print(f"【全范围大盘】总章节: {n_total} 章 | 总字数: {total_words:,} 字 | 总段落: {total_paras:,} 段")
+        safe_console_print(f"【瑕疵汇总】P0 阻断: {tot_p0} | P1 警告: {tot_p1} | P2 拖沓长句/段: {tot_p2} | P3 翻译腔/混杂: {tot_p3}")
+        safe_console_print(f"【判定结论】{overall_label}")
+        safe_console_print(f"========================================================================================")
 
     # 生成聚合大盘报告 Markdown 内容
     batch_summary_content = render_scope_batch_summary(
@@ -1302,10 +1342,11 @@ def run_scope_audit(
 
     save_audit_state(audit_state, reports_dir)
 
-    print(f"✅ 批量审查大盘报告已生成：{scope_summary_path}")
-    print(f"✅ 历史归档报告已写入：{batch_report_file}")
-    print(f"✅ 最新审查总览已更新：{latest_report_path}")
-    print(f"✅ 跨批因果状态机已原子更新：{get_audit_state_path(reports_dir)}")
+    if not silent:
+        safe_console_print(f"✅ 批量审查大盘报告已生成：{scope_summary_path}")
+        safe_console_print(f"✅ 历史归档报告已写入：{batch_report_file}")
+        safe_console_print(f"✅ 最新审查总览已更新：{latest_report_path}")
+        safe_console_print(f"✅ 跨批因果状态机已原子更新：{get_audit_state_path(reports_dir)}")
 
     if has_p0:
         return 2
@@ -1323,12 +1364,14 @@ def run_apply_fix(
     context_before: str,
     context_after: str,
     patch_file: Optional[str],
+    silent: bool = False,
 ) -> int:
     """执行 apply_fix 方案采纳回写管线"""
     resolver = ChapterResolver()
     chapters = resolver.discover_chapters(project_dir)
     if not chapters:
-        print(f"[错误] 未发现章节文件！", file=sys.stderr)
+        if not silent:
+            safe_console_print(f"[错误] 未发现章节文件！", file=sys.stderr)
         return 3
 
     target_chapter: Optional[ChapterItem] = None
@@ -1341,7 +1384,8 @@ def run_apply_fix(
         target_chapter = chapters[-1]
 
     if not target_chapter:
-        print(f"[错误] 目标章节不存在: {chapter_idx}", file=sys.stderr)
+        if not silent:
+            safe_console_print(f"[错误] 目标章节不存在: {chapter_idx}", file=sys.stderr)
         return 3
 
     # 构建 PatchSpec
@@ -1357,14 +1401,16 @@ def run_apply_fix(
                 context_after=p_data.get("context_after", ""),
             )
         except Exception as e:
-            print(f"[错误] 读取补丁文件失败: {e}", file=sys.stderr)
+            if not silent:
+                safe_console_print(f"[错误] 读取补丁文件失败: {e}", file=sys.stderr)
             return 3
     else:
         if target_line is None or old_text is None or new_text is None:
-            print(
-                "[错误] apply_fix 必须提供完整补丁参数 (target_line, old_text, new_text) 或 patch_file！",
-                file=sys.stderr,
-            )
+            if not silent:
+                safe_console_print(
+                    "[错误] apply_fix 必须提供完整补丁参数 (target_line, old_text, new_text) 或 patch_file！",
+                    file=sys.stderr,
+                )
             return 3
         patch = PatchSpec(
             target_line=target_line,
@@ -1382,23 +1428,22 @@ def run_apply_fix(
             backup_dir=backup_dir,
         )
         if success:
-            print(f"成功安全回写第 {target_chapter.index} 章，已生成原子备份。")
+            if not silent:
+                safe_console_print(f"成功安全回写第 {target_chapter.index} 章，已生成原子备份。")
             return 0
         else:
-            print(f"[错误] 回写未成功完成。", file=sys.stderr)
+            if not silent:
+                safe_console_print(f"[错误] 回写未成功完成。", file=sys.stderr)
             return 3
     except (PatchAnchorNotFoundError, AmbiguousPatchError, SafeWriterError) as e:
-        print(f"[安全回写拒绝] {e}", file=sys.stderr)
+        if not silent:
+            safe_console_print(f"[安全回写拒绝] {e}", file=sys.stderr)
         return 3
     except Exception as e:
-        print(f"[系统异常] 安全回写失败: {e}", file=sys.stderr)
+        if not silent:
+            safe_console_print(f"[系统异常] 安全回写失败: {e}", file=sys.stderr)
         return 3
 
-
-# ==============================================================================
-# 纯模块化 Python API 导出层 (Pure Python API Layer)
-# 架构铁律：不提供亦不涉及任何 CLI 命令行接口，全功能严格通过 Python API 交付。
-# ==============================================================================
 
 def audit_chapter(
     project_dir: Union[str, Path] = ".",
@@ -1410,6 +1455,7 @@ def audit_chapter(
     force: bool = False,
     author_memory: bool = False,
     silent: bool = False,
+    allow_partial: bool = False,
 ) -> Tuple[int, Path]:
     """单章深度审查纯 Python API
 
@@ -1440,6 +1486,7 @@ def audit_chapter(
         mode=mode,
         platform=platform,
         use_author_memory=author_memory,
+        allow_partial=allow_partial,
     )
     report_path = summary.get("archived_report_path")
     if report_path is None or not Path(report_path).exists():
@@ -1461,6 +1508,7 @@ def audit_scope(
     force: bool = False,
     author_memory: bool = False,
     silent: bool = False,
+    allow_partial: Optional[bool] = None,
 ) -> Tuple[int, Path]:
     """批量多章连审纯 Python API
 
@@ -1487,6 +1535,8 @@ def audit_scope(
         mode=mode,
         platform=platform,
         use_author_memory=author_memory,
+        silent=silent,
+        allow_partial=allow_partial,
     )
     scope_clean = scope_str.replace(" ", "")
     scope_summary_path = p_dir / "reports" / f"BATCH_SUMMARY_SCOPE_{scope_clean}.md"
@@ -1545,7 +1595,7 @@ def checkpoint_volume(
         int: 状态码 (0 成功, 3 失败)
     """
     p_dir = Path(project_dir).resolve()
-    return run_checkpoint(project_dir=p_dir, volume=volume, force=force)
+    return run_checkpoint(project_dir=p_dir, volume=volume, force=force, silent=silent)
 
 
 def sync_ledger_from_md(
@@ -1563,7 +1613,7 @@ def sync_ledger_from_md(
         int: 状态码 (0 成功, 3 失败)
     """
     p_dir = Path(project_dir).resolve()
-    return run_sync_from_md(project_dir=p_dir)
+    return run_sync_from_md(project_dir=p_dir, silent=silent)
 
 
 def apply_fix(
@@ -1619,6 +1669,7 @@ def apply_fix(
         context_before=context_before,
         context_after=context_after,
         patch_file=p_file_str,
+        silent=silent,
     )
 
 
@@ -1646,4 +1697,5 @@ __all__ = [
     "get_report_archive_path",
     "parse_scope_range",
     "detect_violations_in_text",
+    "safe_console_print",
 ]
