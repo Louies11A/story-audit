@@ -34,6 +34,8 @@ from scripts.story_audit import (
     build_pre_audit_bundle,
     run_audit,
     get_report_archive_path,
+    locate_ledger_paths,
+    load_ledger_state,
 )
 
 
@@ -335,6 +337,95 @@ class TestStoryAuditCLI(unittest.TestCase):
         ]
         res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
         self.assertEqual(res.returncode, 0)
+
+
+    def test_init_mode_inherits_existing_assets(self):
+        """测试已有资产的账本运行 --init 验证资产不丢失继承"""
+        json_path, md_path = locate_ledger_paths(self.project_dir)
+        state = LedgerState()
+        item = AssetItem(
+            id="sword_init_001",
+            name="太虚古剑",
+            category="装备道具",
+            quantity=1,
+            unit="柄",
+            owner="主角",
+        )
+        state.assets["sword_init_001"] = item
+        save_ledger_state(state, json_path, md_path, force=True)
+
+        # 运行 --init
+        exit_code = main([
+            "--project", str(self.project_dir),
+            "--init",
+            "--force",
+        ])
+        self.assertEqual(exit_code, 0)
+
+        # 验证资产未丢失，被继承保留
+        reloaded_state = load_ledger_state(json_path)
+        self.assertIn("sword_init_001", reloaded_state.assets)
+        self.assertEqual(reloaded_state.assets["sword_init_001"].name, "太虚古剑")
+
+    def test_locate_ledger_paths_priority_with_empty_settings_dir(self):
+        """测试优先检查真实文件：根目录下存在账本但设定目录为空时，优先命中根目录真实文件"""
+        test_dir = self.project_dir / "test_locate_prio"
+        test_dir.mkdir(parents=True, exist_ok=True)
+        # 根目录创建真实文件
+        root_json = test_dir / "资源账本.json"
+        root_json.write_text("{}", encoding="utf-8")
+        # 仅创建空设定目录
+        empty_settings = test_dir / "设定"
+        empty_settings.mkdir(parents=True, exist_ok=True)
+
+        j_path, m_path = locate_ledger_paths(test_dir)
+        self.assertEqual(j_path, root_json, "必须优先匹配真实存在的根目录账本文件")
+
+    def test_pre_audit_bundle_as_posix_and_history_truncation(self):
+        """测试预审包路径统一 as_posix() 以及 history 流水截断保留最近记录"""
+        from scripts.chapter_resolver import ChapterItem
+        from scripts.types import BoundaryContext
+
+        chap = ChapterItem(index=1.0, title="第一章", raw_name="第1章.txt", path=self.project_dir / "正文" / "第1章.txt")
+        state = LedgerState()
+        long_history = [{"action": f"event_{i}", "step": i} for i in range(10)]
+        item = AssetItem(
+            id="item_history_test",
+            name="天罡戒",
+            category="装备道具",
+            quantity=1,
+            unit="枚",
+            history=long_history,
+        )
+        state.assets["item_history_test"] = item
+
+        bundle = build_pre_audit_bundle(
+            project_dir=self.project_dir,
+            curr_chapter=chap,
+            prev_chapter=None,
+            chapters=[chap],
+            state=state,
+            findings=[],
+            boundary_ctx=BoundaryContext(prev_tail_300="", curr_head_300="", has_prev_chapter=False, is_pov_transition=False),
+            curr_enc="utf-8",
+            curr_eol="\n",
+            gap_warnings=[],
+        )
+
+        # 验证路径无 Windows 反斜杠
+        self.assertNotIn("\\", bundle["meta"]["target_file"])
+        self.assertEqual(bundle["meta"]["target_file"], "正文/第1章.txt")
+
+        # 验证 history 截断为最近 5 条
+        asset_info = bundle["ledger_snapshot"]["active_assets"][0]
+        self.assertEqual(len(asset_info["history"]), 5)
+        self.assertEqual(asset_info["history"][-1]["action"], "event_9")
+
+    def test_float_chapter_matching_tolerance(self):
+        """测试浮点章节匹配使用 abs(c.index - target) < 1e-4 容差"""
+        # 传入带有微小浮点误差的章节号 1.0000001
+        exit_code = run_audit(self.project_dir, target_chapter_index=1.0000001)
+        self.assertEqual(exit_code, 0)
 
 
 if __name__ == "__main__":

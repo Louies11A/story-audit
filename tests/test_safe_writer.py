@@ -446,5 +446,52 @@ class TestSafeWriter(unittest.TestCase):
             apply_patch_with_disambiguation(non_existent, patch)
 
 
+    def test_mixed_anchors_paragraph_head_and_tail(self):
+        """测试段首与段尾混合锚点回写：
+        1. 段首句修改：前置锚点跨行在上一段，后置锚点在同一行本段第二句；
+        2. 段尾句修改：前置锚点在同一行本段前一句，后置锚点跨行在下一段。
+        """
+        chapter_file = self.temp_dir / "mixed_anchors.md"
+        content = (
+            "第一段：山雨欲来风满楼，雷云翻滚。\n"
+            "\n"
+            "第二段段首句。第二段第二句跟随其后。第二段尾句收束。\n"
+            "\n"
+            "第三段：天地重归寂静。\n"
+        )
+        write_file_safe(chapter_file, content, encoding="utf-8", newline="\n")
+
+        # 1. 段首句修改：前置锚点跨行在第一段，后置锚点在同行的第二句
+        patch_head = PatchSpec(
+            target_line=3,
+            context_before="第一段：山雨欲来风满楼，雷云翻滚。",
+            old_text="第二段段首句。",
+            new_text="修改后的段首新句！",
+            context_after="第二段第二句跟随其后。",
+        )
+        res1 = apply_patch_with_disambiguation(chapter_file, patch_head)
+        self.assertTrue(res1)
+
+        c1, _, _ = read_file_safe(chapter_file)
+        self.assertIn("修改后的段首新句！第二段第二句跟随其后。第二段尾句收束。", c1)
+        self.assertNotIn("第二段段首句。", c1)
+
+        # 2. 段尾句修改：前置锚点在同行的第二句，后置锚点跨行在第三段
+        patch_tail = PatchSpec(
+            target_line=3,
+            context_before="第二段第二句跟随其后。",
+            old_text="第二段尾句收束。",
+            new_text="重写后的段尾神来之笔。",
+            context_after="第三段：天地重归寂静。",
+        )
+        res2 = apply_patch_with_disambiguation(chapter_file, patch_tail)
+        self.assertTrue(res2)
+
+        c2, _, _ = read_file_safe(chapter_file)
+        self.assertIn("修改后的段首新句！第二段第二句跟随其后。重写后的段尾神来之笔。", c2)
+        self.assertNotIn("第二段尾句收束。", c2)
+
+
+
 if __name__ == "__main__":
     unittest.main()

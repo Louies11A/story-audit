@@ -36,36 +36,60 @@ __all__ = [
     "SafeIOError",
     "SafeIOReadError",
     "SafeIOWriteError",
+    "MAX_SAFE_FILE_SIZE",
     "read_file_safe",
     "write_file_safe",
     "create_atomic_backup",
 ]
 
 
-def read_file_safe(path: Union[Path, str]) -> Tuple[str, str, str]:
+MAX_SAFE_FILE_SIZE = 20 * 1024 * 1024  # 20MB 上限
+
+
+def read_file_safe(
+    path: Union[Path, str],
+    max_size: int = MAX_SAFE_FILE_SIZE,
+) -> Tuple[str, str, str]:
     """安全读取文件并探测编码与换行符。
 
+    增加文件大小上限（默认 20MB）及二进制空字节 \x00 探测。
     按顺序尝试解码：utf-8-sig -> utf-8 -> gb18030
     换行符识别：若包含 \r\n 则 detected_newline 为 "\r\n"，否则为 "\n"
     内存规整：将读取的内容在内存中把 CRLF 与孤立 CR 统一规整为 \n
 
     Args:
         path: 文件路径（Path 或字符串）
+        max_size: 最大允许读取的文件字节大小，默认 20MB
 
     Returns:
         (normalized_content, detected_encoding, detected_newline)
 
     Raises:
-        SafeIOReadError: 文件不存在、无法读取或所有编码尝试均失败时抛出
+        SafeIOReadError: 文件不存在、超大、包含二进制空字节或所有编码尝试均失败时抛出
     """
     file_path = Path(path)
     if not file_path.is_file():
         raise SafeIOReadError(f"文件不存在或不是普通文件: {file_path}")
 
     try:
+        file_size = file_path.stat().st_size
+    except OSError as e:
+        raise SafeIOReadError(f"获取文件状态失败 {file_path}: {e}") from e
+
+    if file_size > max_size:
+        raise SafeIOReadError(
+            f"文件大小超出上限 ({file_size} 字节 > {max_size} 字节): {file_path}"
+        )
+
+    try:
         raw_bytes = file_path.read_bytes()
     except OSError as e:
         raise SafeIOReadError(f"读取文件失败 {file_path}: {e}") from e
+
+    if b"\x00" in raw_bytes:
+        raise SafeIOReadError(
+            f"文件疑似二进制文件（包含空字节 \\x00），拒绝读取: {file_path}"
+        )
 
     decoded: Union[str, None] = None
     detected_encoding: str = ""

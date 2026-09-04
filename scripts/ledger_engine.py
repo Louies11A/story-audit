@@ -242,16 +242,17 @@ def scan_foreshadowing_tags(text: str) -> List[Dict[str, str]]:
     return results
 
 
-def check_dirty_state(md_path: Path, json_path: Path) -> bool:
+def check_dirty_state(md_path: Path, json_path: Path, tolerance: float = 0.05) -> bool:
     """检查 Markdown 账本是否存在比 JSON 更加新的外部修改冲突
 
-    当且仅当 md_path 与 json_path 均存在且 md_path.stat().st_mtime > json_path.stat().st_mtime 时返回 True。
+    当且仅当 md_path 与 json_path 均存在且 (md_path.stat().st_mtime - json_path.stat().st_mtime) > tolerance 时返回 True。
+    增加 0.05s 时间戳浮点安全容差，避免 Windows NTFS 微秒截断引起误判脏写。
     """
     md = Path(md_path)
     js = Path(json_path)
     if not md.is_file() or not js.is_file():
         return False
-    return md.stat().st_mtime > js.stat().st_mtime
+    return (md.stat().st_mtime - js.stat().st_mtime) > tolerance
 
 
 def _format_constraints(constraints: Dict[str, Any]) -> str:
@@ -445,6 +446,7 @@ def sync_from_markdown(md_path: Path, json_path: Path) -> LedgerState:
     # 解析表格行
     table_lines = [line.strip() for line in md_content.split(chr(10)) if line.strip().startswith("|")]
     col_mapping: Optional[Dict[str, int]] = None
+    valid_asset_ids: Set[str] = set()
 
     for line in table_lines:
         cells = [c.strip() for c in line.split("|")[1:-1]]
@@ -534,8 +536,15 @@ def sync_from_markdown(md_path: Path, json_path: Path) -> LedgerState:
                     history=[{"action": "created_from_markdown_sync", "timestamp": time.time()}],
                 )
                 state.assets[item_id] = new_item
+            valid_asset_ids.add(item_id)
         except (IndexError, ValueError):
             continue
+
+    # 若成功识别到资产表头，对在 Markdown 中物理删除的条目从 state.assets 中同步清理
+    if col_mapping is not None:
+        removed_ids = [aid for aid in list(state.assets.keys()) if aid not in valid_asset_ids]
+        for aid in removed_ids:
+            del state.assets[aid]
 
     # 持久化回 JSON 并消除 dirty 状态
     save_ledger_state(state, json_p, md_p, force=True)

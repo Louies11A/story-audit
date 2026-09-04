@@ -29,6 +29,8 @@ __all__ = [
     "SafeWriterError",
     "AmbiguousPatchError",
     "PatchAnchorNotFoundError",
+    "_verify_anchor_before",
+    "_verify_anchor_after",
     "apply_patch_with_disambiguation",
 ]
 
@@ -57,8 +59,64 @@ class _PatchMatch:
     match_type: str   # "single_line" | "three_line"
 
 
-def _find_single_line_matches(lines: List[str], patch: PatchSpec) -> List[_PatchMatch]:
-    """在单行内部检索包含 context_before, old_text, context_after 的精确匹配"""
+def _verify_anchor_before(
+    lines: List[str],
+    line_idx: int,
+    start_pos: int,
+    cb: Optional[str],
+) -> bool:
+    """验证前置锚点：优先匹配本行对应半区 (start_pos 之前)，其次匹配前一非空行。"""
+    if not cb:
+        return True
+
+    # 1. 优先匹配本行对应半区 (0 到 start_pos)
+    line = lines[line_idx]
+    prefix = line[:start_pos]
+    if cb in prefix or cb.strip() in prefix:
+        return True
+
+    # 2. 其次匹配前一非空行
+    prev_idx = line_idx - 1
+    while prev_idx >= 0 and not lines[prev_idx].strip():
+        prev_idx -= 1
+    if prev_idx >= 0:
+        prev_line = lines[prev_idx]
+        if cb in prev_line or cb.strip() in prev_line:
+            return True
+
+    return False
+
+
+def _verify_anchor_after(
+    lines: List[str],
+    line_idx: int,
+    end_pos: int,
+    ca: Optional[str],
+) -> bool:
+    """验证后置锚点：优先匹配本行对应半区 (end_pos 之后)，其次匹配后一非空行。"""
+    if not ca:
+        return True
+
+    # 1. 优先匹配本行对应半区 (end_pos 之后)
+    line = lines[line_idx]
+    suffix = line[end_pos:]
+    if ca in suffix or ca.strip() in suffix:
+        return True
+
+    # 2. 其次匹配后一非空行
+    next_idx = line_idx + 1
+    while next_idx < len(lines) and not lines[next_idx].strip():
+        next_idx += 1
+    if next_idx < len(lines):
+        next_line = lines[next_idx]
+        if ca in next_line or ca.strip() in next_line:
+            return True
+
+    return False
+
+
+def _find_all_matches(lines: List[str], patch: PatchSpec) -> List[_PatchMatch]:
+    """重构锚点校验：解耦前后锚点，全面支持单行、跨行及段首/段尾混合锚点"""
     matches: List[_PatchMatch] = []
     old_text = patch.old_text
     if not old_text:
@@ -78,107 +136,33 @@ def _find_single_line_matches(lines: List[str], patch: PatchSpec) -> List[_Patch
                 break
             end_pos = pos + len(old_text)
 
-            # 验证前置锚点：如果在同一行，cb 必须出现在 old_text 之前
-            cb_ok = True
-            if cb:
-                if cb not in line[:pos] and cb.strip() not in line[:pos]:
-                    cb_ok = False
+            # 解耦分别判定前后锚点：分别优先匹配本行半区，其次匹配前一/后一非空行
+            if _verify_anchor_before(lines, i, pos, cb) and _verify_anchor_after(lines, i, end_pos, ca):
+                cb_in_line = bool(cb and (cb in line[:pos] or cb.strip() in line[:pos]))
+                ca_in_line = bool(ca and (ca in line[end_pos:] or ca.strip() in line[end_pos:]))
+                if cb_in_line and ca_in_line:
+                    m_type = "single_line"
+                elif not cb_in_line and not ca_in_line and (cb or ca):
+                    m_type = "three_line"
+                elif cb or ca:
+                    m_type = "mixed"
+                else:
+                    m_type = "unanchored"
 
-            # 验证后置锚点：如果在同一行，ca 必须出现在 old_text 之后
-            ca_ok = True
-            if ca:
-                if ca not in line[end_pos:] and ca.strip() not in line[end_pos:]:
-                    ca_ok = False
-
-            if cb_ok and ca_ok:
                 matches.append(
                     _PatchMatch(
                         line_idx=i,
                         start_pos=pos,
                         end_pos=end_pos,
-                        match_type="single_line",
+                        match_type=m_type,
                     )
                 )
 
             start_search = pos + 1
 
-    return matches
-
-
-def _find_three_line_matches(lines: List[str], patch: PatchSpec) -> List[_PatchMatch]:
-    """在顺序邻近行中检索包含 context_before, old_text, context_after 的三行结构（允许段间空行）"""
-    matches: List[_PatchMatch] = []
-    old_text = patch.old_text
-    if not old_text:
-        return matches
-
-    cb = patch.context_before
-    ca = patch.context_after
-
-    for i, line in enumerate(lines):
-        if old_text not in line:
-            continue
-
-        # 1. 检验前置锚点（向前寻找最近的非空行）
-        cb_ok = True
-        if cb:
-            prev_idx = i - 1
-            while prev_idx >= 0 and not lines[prev_idx].strip():
-                prev_idx -= 1
-            if prev_idx < 0:
-                cb_ok = False
-            else:
-                prev_line = lines[prev_idx]
-                if cb not in prev_line and cb.strip() not in prev_line:
-                    cb_ok = False
-
-        if not cb_ok:
-            continue
-
-        # 2. 检验后置锚点（向后寻找最近的非空行）
-        ca_ok = True
-        if ca:
-            next_idx = i + 1
-            while next_idx < len(lines) and not lines[next_idx].strip():
-                next_idx += 1
-            if next_idx >= len(lines):
-                ca_ok = False
-            else:
-                next_line = lines[next_idx]
-                if ca not in next_line and ca.strip() not in next_line:
-                    ca_ok = False
-
-        if not ca_ok:
-            continue
-
-        # 3. 前后锚点均满足，记录该行中所有的 old_text 出现点
-        start_search = 0
-        while True:
-            pos = line.find(old_text, start_search)
-            if pos == -1:
-                break
-            end_pos = pos + len(old_text)
-            matches.append(
-                _PatchMatch(
-                    line_idx=i,
-                    start_pos=pos,
-                    end_pos=end_pos,
-                    match_type="three_line",
-                )
-            )
-            start_search = pos + 1
-
-    return matches
-
-
-def _find_all_matches(lines: List[str], patch: PatchSpec) -> List[_PatchMatch]:
-    """汇总单行与三行匹配项并去重保持物理顺序"""
-    single_matches = _find_single_line_matches(lines, patch)
-    three_matches = _find_three_line_matches(lines, patch)
-
     seen = set()
     unique_matches: List[_PatchMatch] = []
-    for m in single_matches + three_matches:
+    for m in matches:
         key = (m.line_idx, m.start_pos, m.end_pos)
         if key not in seen:
             seen.add(key)

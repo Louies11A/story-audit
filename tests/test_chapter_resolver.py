@@ -445,5 +445,57 @@ class TestChapterResolver(unittest.TestCase):
         )
 
 
+    def test_discover_chapters_parent_has_reports_or_archive(self):
+        """测试上级宿主目录路径包含 reports/archive 时平铺章节不会被误杀"""
+        # 创建结构: temp_dir / "reports" / "archive_sub" / "novel_project"
+        novel_dir = self.test_dir / "reports" / "archive_sub" / "novel_project"
+        novel_dir.mkdir(parents=True, exist_ok=True)
+        (novel_dir / "第001章_启程.md").write_text("正文内容1", encoding="utf-8")
+        (novel_dir / "第002章_惊变.md").write_text("正文内容2", encoding="utf-8")
+
+        chapters = ChapterResolver.discover_chapters(novel_dir)
+        self.assertEqual(len(chapters), 2, "宿主上级路径包含 reports/archive 时不应误杀平铺正文章节")
+        self.assertEqual(chapters[0].index, 1.0)
+        self.assertEqual(chapters[1].index, 2.0)
+
+    def test_discover_chapters_nested_bak_in_content_dir_filtered(self):
+        """测试正文子目录下嵌套的 .bak 等隐藏目录被严格过滤"""
+        content_dir = self.test_dir / "正文"
+        content_dir.mkdir(parents=True, exist_ok=True)
+        (content_dir / "第001章_真实正文.md").write_text("真实内容", encoding="utf-8")
+
+        # 嵌套 .bak 目录
+        bak_dir = content_dir / ".bak"
+        bak_dir.mkdir(parents=True, exist_ok=True)
+        (bak_dir / "第002章_备份残卷.md").write_text("备份内容", encoding="utf-8")
+
+        # 更深层嵌套 .bak
+        nested_bak_dir = content_dir / "volume1" / ".bak"
+        nested_bak_dir.mkdir(parents=True, exist_ok=True)
+        (nested_bak_dir / "第003章_深层备份.md").write_text("深层备份内容", encoding="utf-8")
+
+        chapters = ChapterResolver.discover_chapters(self.test_dir)
+        self.assertEqual(len(chapters), 1)
+        self.assertEqual(chapters[0].index, 1.0)
+        self.assertEqual(chapters[0].raw_name, "第001章_真实正文.md")
+
+    def test_diagnose_sequence_gaps_missing_chapter_one(self):
+        """测试正文首章缺失（main_indices[0] > 1）时的断号体检诊断"""
+        # 1. 缺失单章第 1 章（正文起始于第 2 章）
+        chapters_missing_ch1 = [
+            ChapterItem(index=2.0, title="第二章", raw_name="第2章.txt", path=Path("/tmp/2.txt")),
+            ChapterItem(index=3.0, title="第三章", raw_name="第3章.txt", path=Path("/tmp/3.txt")),
+        ]
+        diag1 = ChapterResolver.diagnose_sequence_gaps(chapters_missing_ch1)
+        self.assertTrue(any("P2" in d and "缺失第 1 章" in d and "第 2 章" in d for d in diag1))
+
+        # 2. 缺失多章（正文起始于第 4 章，缺失第 1, 2, 3 章）
+        chapters_missing_multi = [
+            ChapterItem(index=4.0, title="第四章", raw_name="第4章.txt", path=Path("/tmp/4.txt")),
+            ChapterItem(index=5.0, title="第五章", raw_name="第5章.txt", path=Path("/tmp/5.txt")),
+        ]
+        diag2 = ChapterResolver.diagnose_sequence_gaps(chapters_missing_multi)
+        self.assertTrue(any("P2" in d and "缺失章节 [1, 2, 3]" in d for d in diag2))
+
 if __name__ == "__main__":
     unittest.main()

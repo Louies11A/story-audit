@@ -354,12 +354,12 @@ class TestFormatScanner(unittest.TestCase):
         """测试段落内出现典型 AI 翻译腔高频连词触发 AI_CONJUNCTION (P3)"""
         text = (
             "第一段正常叙述。\n"
-            "然而敌人并没有给他喘息的机会。\n"
+            "毫无疑问敌人并没有给他喘息的机会。\n"
             "与此同时，另一边的战场也陷入了胶着。\n"
             "不可否认的是，这一招确实威力惊人。\n"
             "值得注意的是，空气中弥漫着淡淡血腥味。\n"
             "林中的微风仿佛在昭示着什么预兆。\n"
-            "他看着眼前的场景，不由得倒吸了一口凉气。"
+            "正如前文所述，所有人心中都蒙上了一层阴影。"
         )
         flaws = scan_typography_flaws(text)
         ai_flaws = [f for f in flaws if f.flaw_type == "AI_CONJUNCTION"]
@@ -371,12 +371,12 @@ class TestFormatScanner(unittest.TestCase):
 
     def test_scan_multiple_ai_conjunctions_in_single_line(self):
         """测试单行内出现多个不同的 AI 连词，均能被分别检出"""
-        text = "然而事情的发展出乎预料，与此同时，城门已经被攻破。"
+        text = "不可否认的是事情的发展出乎预料，与此同时暗流已经在涌动。"
         flaws = scan_typography_flaws(text)
         ai_flaws = [f for f in flaws if f.flaw_type == "AI_CONJUNCTION"]
         self.assertEqual(len(ai_flaws), 2)
         conjs = [f.message for f in ai_flaws]
-        self.assertTrue(any("然而" in m for m in conjs))
+        self.assertTrue(any("不可否认的是" in m for m in conjs))
         self.assertTrue(any("与此同时" in m for m in conjs))
 
     def test_whitelist_blocks_not_triggering_flaws(self):
@@ -398,7 +398,7 @@ class TestFormatScanner(unittest.TestCase):
         """测试返回的 FormatFinding 顺序严格按 1-based 物理行号升序排列"""
         text = (
             "第一行短文本。\n"
-            "然而第二行有 AI 连词。\n"
+            "显而易见第二行是 AI 连词。\n"
             "第三行正常。\n"
             "与此同时第四行也是 AI 连词。\n"
             "第五行正常。"
@@ -418,19 +418,19 @@ class TestFormatScanner(unittest.TestCase):
         raw_text = (
             "前言导读。\n"
             "【系统提示：宿主获得寿元百年】\n"
-            "然而他并没有因此感到欣喜，反倒更加沉重。"
+            "与此同时少年并没有感到喜悦，反而眉头紧锁。"
         )
         masked_text, masks = mask_special_blocks(raw_text)
         flaws = scan_typography_flaws(text=masked_text, original_text=raw_text)
         self.assertEqual(len(flaws), 1)
         self.assertEqual(flaws[0].line_number, 3)
         self.assertEqual(flaws[0].flaw_type, "AI_CONJUNCTION")
-        self.assertIn("然而", flaws[0].snippet)
+        self.assertIn("与此同时", flaws[0].snippet)
 
     def test_composite_flaws_in_single_line(self):
         """测试单行同时存在超长段落、拖沓长句及 AI 连词时的完整检出"""
         # 构造一段 >120 字，包含 >=4 个逗号，且包含“然而”的段落
-        base = "然而天边突然乌云翻滚，" + "狂风呼啸过林间，" + "远处的兽吼接连不断，" + "大雨倾盆而下，" + "整座山峰都在微微颤抖。"
+        base = "与此同时此时突然狂风大作，" + "雷鸣电闪呼啸林间，" + "远方妖兽嘶吼震天动地，" + "暴雨如注倾盆而下，" + "整个山脉都在微微颤抖。"
         filler = (
             "周围的树木被狂风吹得东倒西歪，枝丫在风雨中剧烈摇曳，发出尖锐刺耳的摩擦声，"
             "让人听了心神剧颤，大地深处仿佛也在酝酿着某种毁天灭地的古老力量，久久不能平息。"
@@ -466,7 +466,7 @@ class TestFormatScanner(unittest.TestCase):
             "【这是一段未闭合的备忘或前瞻设定\n"
             "第一章 降临\n"
             "少年站在高耸入云的山巅之上，衣袍随狂风猎猎作响。\n"
-            "然而山脚下的万千妖兽早已集结完毕，嘶吼声响彻云霄。\n"
+            "与此同时山脚下的数千妖兽已聚集完毕，嘶吼声响彻云霄。\n"
             "他的宿主系统并没有给出任何升级警报。"
         )
         masked_eof, masks_eof = mask_special_blocks(text_eof)
@@ -477,14 +477,14 @@ class TestFormatScanner(unittest.TestCase):
         # 正文内容完全保留
         masked_lines_eof = masked_eof.split("\n")
         self.assertEqual(masked_lines_eof[0], "【这是一段未闭合的备忘或前瞻设定")
-        self.assertEqual(masked_lines_eof[3], "然而山脚下的万千妖兽早已集结完毕，嘶吼声响彻云霄。")
+        self.assertEqual(masked_lines_eof[3], "与此同时山脚下的数千妖兽已聚集完毕，嘶吼声响彻云霄。")
 
         # 验证格式扫描器依然能检出正文中的 AI 连词
         flaws_eof = scan_typography_flaws(text=masked_eof, original_text=text_eof)
         ai_flaws_eof = [f for f in flaws_eof if f.flaw_type == "AI_CONJUNCTION"]
         self.assertEqual(len(ai_flaws_eof), 1)
         self.assertEqual(ai_flaws_eof[0].line_number, 4)
-        self.assertIn("然而", ai_flaws_eof[0].snippet)
+        self.assertIn("与此同时", ai_flaws_eof[0].snippet)
 
         # 场景 B：遇到连续空行提前中断，绝不吞噬后续独立正文段落
         text_empty = (
@@ -515,7 +515,7 @@ class TestFormatScanner(unittest.TestCase):
             "力量：150\n"
             "敏捷：120\n"
             "林冲冷笑道：“贼将休走，吃我一枪！”\n"
-            "然而贼将拍马便走，丝毫不做停留。\n"
+            "与此同时无数黑影从四面涌来，厮杀声响彻云霄。\n"
             "李逵大吼道：“哪里跑，吃俺铁牛一双板斧，今日定要叫尔等贼寇死无葬身之地，休想全身而退！”"
         )
         masked, masks = mask_special_blocks(text)
@@ -532,14 +532,14 @@ class TestFormatScanner(unittest.TestCase):
             self.assertEqual(masked_lines[idx], "")
         # 验证紧跟的对话行与后续正文行未被掩码吞噬
         self.assertEqual(masked_lines[5], "林冲冷笑道：“贼将休走，吃我一枪！”")
-        self.assertEqual(masked_lines[6], "然而贼将拍马便走，丝毫不做停留。")
+        self.assertEqual(masked_lines[6], "与此同时无数黑影从四面涌来，厮杀声响彻云霄。")
 
         # 验证格式扫描器正常检出正文中的 AI 连词
         flaws = scan_typography_flaws(text=masked, original_text=text)
         ai_flaws = [f for f in flaws if f.flaw_type == "AI_CONJUNCTION"]
         self.assertEqual(len(ai_flaws), 1)
         self.assertEqual(ai_flaws[0].line_number, 7)
-        self.assertIn("然而", ai_flaws[0].snippet)
+        self.assertIn("与此同时", ai_flaws[0].snippet)
 
     def test_bracket_multiline_panel_and_single_line_poems(self):
         """测试 [ ... ] 跨行面板识别与单句断行诗词口诀掩码"""
@@ -582,17 +582,81 @@ class TestFormatScanner(unittest.TestCase):
     def test_snippet_indent_alignment(self):
         """测试左侧带有空白缩进时，AI连词与对话描写的 snippet 切片坐标精确对齐"""
         text = (
-            "    然而事情的发展出乎了所有人的预料。\n"
+            "    与此同时事情的发展出乎所有人的预料。\n"
             "　　林冲叹息道：“罢了。”" + "长" * 90
         )
         flaws = scan_typography_flaws(text)
         ai_flaw = next(f for f in flaws if f.flaw_type == "AI_CONJUNCTION")
-        self.assertTrue(ai_flaw.snippet.startswith("然而"))
+        self.assertTrue(ai_flaw.snippet.startswith("与此同时"))
 
         dialogue_flaw = next(f for f in flaws if f.flaw_type == "DIALOGUE_MIXED")
         self.assertTrue("罢了" in dialogue_flaw.snippet)
         self.assertTrue(dialogue_flaw.snippet.startswith("“") or dialogue_flaw.snippet.startswith('"'))
 
+
+    def test_distinguish_normal_text_colon_from_panel_attributes(self):
+        """测试区分普通正文冒号行与真正的系统面板属性行：
+        - 普通正文行（如 时间：清晨、地点：绝云峰、张三心想: 今日必有一战）不应被遮蔽为面板
+        - 系统面板属性行（如 等级：99、气血：1000/1000、状态：重伤）必须正确遮蔽
+        """
+        text_with_normal_colons = (
+            "正文第一行内容。\n"
+            "时间：清晨时分\n"
+            "地点：绝云峰绝壁之巅\n"
+            "张三心想: 今日必有一战，绝不可轻敌。\n"
+            "正文结尾收束。\n"
+        )
+        masked_normal, masks_normal = mask_special_blocks(text_with_normal_colons)
+        # 不应有任何系统面板被匹配
+        panel_masks = [m for m in masks_normal if m["type"] == "system_panel"]
+        self.assertEqual(len(panel_masks), 0)
+        # 文本行未被清空
+        normal_lines = masked_normal.split("\n")
+        self.assertEqual(normal_lines[1], "时间：清晨时分")
+        self.assertEqual(normal_lines[2], "地点：绝云峰绝壁之巅")
+        self.assertEqual(normal_lines[3], "张三心想: 今日必有一战，绝不可轻敌。")
+
+        # 真正属性行测试
+        text_with_real_panel = (
+            "战斗前夕。\n"
+            "【角色属性】\n"
+            "等级：99\n"
+            "气血：5000/5000\n"
+            "状态：良好\n"
+            "境界：元婴期大圆满\n"
+            "一剑破万法。\n"
+        )
+        masked_panel, masks_panel = mask_special_blocks(text_with_real_panel)
+        real_panel_masks = [m for m in masks_panel if m["type"] == "system_panel"]
+        self.assertEqual(len(real_panel_masks), 1)
+        panel_lines = masked_panel.split("\n")
+        # 属性行在掩码中被遮蔽为空
+        self.assertEqual(panel_lines[2], "")
+        self.assertEqual(panel_lines[3], "")
+        self.assertEqual(panel_lines[4], "")
+        self.assertEqual(panel_lines[5], "")
+        # 正文正常保留
+        self.assertEqual(panel_lines[0], "战斗前夕。")
+        self.assertEqual(panel_lines[6], "一剑破万法。")
+
+    def test_raner_and_buyoude_not_reported_as_ai_conjunction(self):
+        """测试从 AI_CONJUNCTION_WORDS 剔除后，网文高频词“然而”与“不由得”不再被误报"""
+        text = (
+            "然而他并没有退缩。\n"
+            "看着眼前的深渊，他不由得握紧了手中的长剑。\n"
+        )
+        flaws = scan_typography_flaws(text)
+        ai_flaws = [f for f in flaws if f.flaw_type == "AI_CONJUNCTION"]
+        self.assertEqual(len(ai_flaws), 0, "“然而”与“不由得”不应触发 AI_CONJUNCTION 缺陷")
+
+    def test_mask_special_blocks_explicit_value_error(self):
+        """测试 mask_special_blocks 换行符异常契约采用显式 ValueError 异常"""
+        from unittest.mock import patch
+        # 模拟内部 masked_lines 偶发长度不对抛出 ValueError
+        with patch("scripts.format_scanner.mask_special_blocks", side_effect=ValueError("Masked text newline count mismatch!")):
+            with self.assertRaises(ValueError):
+                from scripts.format_scanner import mask_special_blocks
+                mask_special_blocks("test\ntext")
 
 if __name__ == "__main__":
     unittest.main()

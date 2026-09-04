@@ -134,26 +134,32 @@ def build_pre_audit_bundle(
     curr_eol: str,
     gap_warnings: List[str],
 ) -> Dict[str, Any]:
-    """构建符合严格冻结契约的预审包数据字典"""
+    """构造结构严格冻结契约预审包字典"""
     try:
-        target_file_str = str(curr_chapter.path.relative_to(project_dir))
+        target_file_str = curr_chapter.path.relative_to(project_dir).as_posix()
     except Exception:
-        target_file_str = str(curr_chapter.path)
+        target_file_str = curr_chapter.path.as_posix()
 
     prev_file_str: Optional[str] = None
     if prev_chapter:
         try:
-            prev_file_str = str(prev_chapter.path.relative_to(project_dir))
+            prev_file_str = prev_chapter.path.relative_to(project_dir).as_posix()
         except Exception:
-            prev_file_str = str(prev_chapter.path)
+            prev_file_str = prev_chapter.path.as_posix()
 
     active_assets: List[Dict[str, Any]] = []
     if isinstance(state.assets, dict):
         for item in state.assets.values():
             if hasattr(item, "to_dict"):
-                active_assets.append(item.to_dict())
+                asset_dict = item.to_dict()
             elif isinstance(item, dict):
-                active_assets.append(item)
+                asset_dict = dict(item)
+            else:
+                continue
+            # history 截断保留最近记录（最多 5 条流水）
+            if "history" in asset_dict and isinstance(asset_dict["history"], list):
+                asset_dict["history"] = asset_dict["history"][-5:]
+            active_assets.append(asset_dict)
 
     bundle = {
         "meta": {
@@ -304,15 +310,21 @@ def render_audit_report(
 
 
 def locate_ledger_paths(project_dir: Path) -> Tuple[Path, Path]:
-    """寻找项目中的资源账本 JSON 和 MD 路径"""
+    """寻找项目中的资源账本 JSON 与 MD 路径。
+    优先检查 设定/资源账本.json 与根目录下 资源账本.json 真实文件是否存在。
+    """
     settings_dir = project_dir / "设定"
-    if settings_dir.exists():
-        json_path = settings_dir / "资源账本.json"
-        md_path = settings_dir / "资源账本.md"
-    else:
-        json_path = project_dir / "资源账本.json"
-        md_path = project_dir / "资源账本.md"
-    return json_path, md_path
+    settings_json = settings_dir / "资源账本.json"
+    root_json = project_dir / "资源账本.json"
+
+    if settings_json.is_file():
+        return settings_json, settings_dir / "资源账本.md"
+    if root_json.is_file():
+        return root_json, project_dir / "资源账本.md"
+
+    if settings_dir.is_dir():
+        return settings_json, settings_dir / "资源账本.md"
+    return root_json, project_dir / "资源账本.md"
 
 
 def load_ledger_state(json_path: Path) -> LedgerState:
@@ -349,7 +361,7 @@ def run_audit(
     curr_chapter: Optional[ChapterItem] = None
     if target_chapter_index is not None:
         for c in chapters:
-            if c.index == target_chapter_index:
+            if abs(c.index - target_chapter_index) < 1e-4:
                 curr_chapter = c
                 break
         if not curr_chapter:
@@ -555,9 +567,13 @@ def run_init_mode(project_dir: Path, scope_str: Optional[str], force: bool) -> i
             print(f"[防脏写拦截] 账本存在未同步手工编辑，建账被拒绝！", file=sys.stderr)
             return 3
 
-    # 流式过账
-    state = LedgerState()
-    all_tags: List[Dict[str, str]] = []
+    # 优先尝试 load_ledger_state(json_path)，继承既有 assets，仅在账本不存在时初始化新对象
+    if json_path.is_file():
+        state = load_ledger_state(json_path)
+    else:
+        state = LedgerState()
+
+    all_tags: List[Dict[str, str]] = list(state.foreshadowing_stash) if state.foreshadowing_stash else []
     for chap in target_chapters:
         try:
             txt, _, _ = read_file_safe(chap.path)
@@ -664,7 +680,7 @@ def run_apply_fix(
     target_chapter: Optional[ChapterItem] = None
     if chapter_idx is not None:
         for c in chapters:
-            if c.index == chapter_idx:
+            if abs(c.index - chapter_idx) < 1e-4:
                 target_chapter = c
                 break
     else:

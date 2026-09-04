@@ -43,8 +43,6 @@ AI_CONJUNCTION_WORDS = tuple(
             "毋庸置疑",
             "总而言之",
             "换句话说",
-            "不由得",
-            "然而",
         ),
         key=len,
         reverse=True,
@@ -123,7 +121,7 @@ def _is_panel_attr_line(line: str) -> bool:
         or any(kw in right_part for kw in ("无", "正常", "良好", "重伤", "中毒", "濒死", "封印", "满", "未知"))
     )
 
-    return key_len_valid or has_feature
+    return key_len_valid and has_feature
 
 
 def _analyze_couplet_line(line: str) -> Optional[int]:
@@ -392,8 +390,9 @@ def mask_special_blocks(text: str) -> Tuple[str, List[Dict[str, Any]]]:
 
     masked_text = "\n".join(masked_lines)
 
-    # 铁律自检：换行符绝对保持
-    assert masked_text.count("\n") == text.count("\n"), "Masked text newline count mismatch!"
+    # 铁律自检：换行符绝对保持（显式异常代替 assert）
+    if masked_text.count("\n") != text.count("\n"):
+        raise ValueError("Masked text newline count mismatch!")
 
     # 按照起始行号排序 masks_info
     masks_info.sort(key=lambda x: x["start_line"])

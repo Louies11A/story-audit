@@ -628,5 +628,61 @@ class TestSyncFromMarkdown(unittest.TestCase):
         self.assertEqual(state.assets["sword_x"].origin_chapter, 1.0)
 
 
+    def test_sync_from_markdown_removes_physically_deleted_assets(self):
+        """测试在 Markdown 表格中物理删除资产条目后，反向同步能够从 state.assets 和 JSON 中彻底清理"""
+        state = LedgerState()
+        item1 = AssetItem(id="asset_keep", name="龙渊剑", category="装备道具", quantity=1, unit="柄")
+        item2 = AssetItem(id="asset_deleted", name="破损皮甲", category="装备道具", quantity=1, unit="件")
+        state.assets["asset_keep"] = item1
+        state.assets["asset_deleted"] = item2
+
+        # 初始双写保存
+        save_ledger_state(state, self.json_path, self.md_path, force=True)
+        self.assertIn("asset_keep", self.json_path.read_text(encoding="utf-8"))
+        self.assertIn("asset_deleted", self.json_path.read_text(encoding="utf-8"))
+
+        # 模拟外部编辑：在 Markdown 中物理删除 asset_deleted 整行
+        md_text = self.md_path.read_text(encoding="utf-8")
+        lines = [line for line in md_text.splitlines() if "asset_deleted" not in line]
+        self.md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        # 触发从 Markdown 同步
+        synced_state = sync_from_markdown(self.md_path, self.json_path)
+
+        self.assertIn("asset_keep", synced_state.assets)
+        self.assertNotIn("asset_deleted", synced_state.assets, "已物理删除的资产必须从 state.assets 中移除")
+
+        # 验证 JSON 持久化也已清理
+        new_json_text = self.json_path.read_text(encoding="utf-8")
+        self.assertNotIn("asset_deleted", new_json_text)
+        self.assertIn("asset_keep", new_json_text)
+
+    def test_check_dirty_state_timestamp_tolerance(self):
+        """测试 check_dirty_state 增加 0.05s 浮点容差，避免微秒截断误报脏写"""
+        import os
+        import time
+
+        now = time.time()
+        # 初始写入两个文件
+        self.json_path.write_text("{}", encoding="utf-8")
+        self.md_path.write_text("# Title", encoding="utf-8")
+
+        # 让 md 比 json 略大约 0.02 秒（在 0.05 容差范围内）
+        os.utime(self.json_path, (now, now))
+        os.utime(self.md_path, (now + 0.02, now + 0.02))
+
+        self.assertFalse(
+            check_dirty_state(self.md_path, self.json_path),
+            "微秒/毫秒级微小偏差 (0.02s) 在 0.05s 容差内不应判定为脏写"
+        )
+
+        # 当 md 比 json 明显更新（如 0.2 秒）
+        os.utime(self.md_path, (now + 0.2, now + 0.2))
+        self.assertTrue(
+            check_dirty_state(self.md_path, self.json_path),
+            "超过 0.05s 容差的大于判定应准确识别为脏写"
+        )
+
+
 if __name__ == '__main__':
     unittest.main()

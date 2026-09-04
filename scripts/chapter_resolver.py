@@ -395,9 +395,9 @@ class ChapterResolver:
         for file_path in scan_dir.rglob("*"):
             if not file_path.is_file():
                 continue
-            if any(part.startswith(".") or part.lower() in skip_dirs for part in file_path.parent.parts):
-                if not (content_dir.is_dir() and file_path.is_relative_to(content_dir)):
-                    continue
+            rel_parent_parts = file_path.relative_to(scan_dir).parent.parts
+            if any(part.startswith(".") or part.lower() in skip_dirs for part in rel_parent_parts):
+                continue
 
             file_name = file_path.name
             # 过滤隐藏文件与临时文件
@@ -462,7 +462,21 @@ class ChapterResolver:
 
         # 2. 跳号体检（针对整数主章号）
         main_indices = sorted(set(int(item.index) for item in chapters if item.index >= 1.0))
-        if len(main_indices) >= 2:
+        if main_indices:
+            # 检查首章是否缺失（正文章号应从第 1 章起始）
+            if main_indices[0] > 1:
+                missing_first = list(range(1, main_indices[0]))
+                if len(missing_first) == 1:
+                    diagnostics.append(
+                        f"[P2 章节序号异常] 章节序号不连续: 缺失第 {missing_first[0]} 章 (正文首章从第 {main_indices[0]} 章开始)"
+                    )
+                else:
+                    missing_str = ", ".join(str(m) for m in missing_first)
+                    diagnostics.append(
+                        f"[P2 章节序号异常] 章节序号不连续: 缺失章节 [{missing_str}] (正文首章从第 {main_indices[0]} 章开始)"
+                    )
+
+            # 检查后续章节不连续
             for i in range(len(main_indices) - 1):
                 curr = main_indices[i]
                 nxt = main_indices[i + 1]

@@ -283,6 +283,26 @@ class TestSafeIO(unittest.TestCase):
         with self.assertRaises((FileNotFoundError, SafeIOReadError)):
             create_atomic_backup(source_file, backup_dir)
 
+    def test_read_binary_file_with_null_byte_raises_error(self):
+        """测试包含 \x00 空字节的二进制文件被拒绝读取"""
+        binary_file = self.test_dir / "test_binary.bin"
+        # 写入含有空字节的数据（如伪造的图片或可执行头）
+        binary_file.write_bytes(b"PK\x03\x04\x00\x00\x00\x08\x00some_data")
+
+        with self.assertRaises(SafeIOReadError) as ctx:
+            read_file_safe(binary_file)
+        self.assertIn("空字节", str(ctx.exception))
+
+    def test_read_file_exceeding_max_size_raises_error(self):
+        """测试文件大小超过上限时被拒绝读取"""
+        oversized_file = self.test_dir / "oversized.txt"
+        oversized_file.write_text("Hello World\n", encoding="utf-8")
+
+        # 将 max_size 设置为很小的值（如 5 字节）
+        with self.assertRaises(SafeIOReadError) as ctx:
+            read_file_safe(oversized_file, max_size=5)
+        self.assertIn("超出上限", str(ctx.exception))
+
     def test_exception_hierarchy(self):
         """测试异常继承体系"""
         self.assertTrue(issubclass(SafeIOReadError, SafeIOError))
