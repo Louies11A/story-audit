@@ -17,6 +17,7 @@ import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from scripts.types import FormatFinding
+from scripts.ai_patterns_checker import scan_ai_patterns
 
 # 系统流面板核心关键词
 # 全题材系统流面板核心关键词库（覆盖玄幻/仙侠/修真/科幻/末世/高武/文娱/游戏/女频/怪谈）
@@ -827,6 +828,10 @@ def scan_typography_flaws(text: str, original_text: str = "", genre: Optional[st
                 message=f"检测到典型 AI 翻译腔/过度连词「{conj}」",
                 suggestion=f"建议删去生硬连词「{conj}」，直接以人物动作、感官细节或视线转移推进，增强网文沉浸感。"
             ))
+
+    # 5. 检测 AI 套路模式与句式 (ai_patterns_checker)
+    ai_findings = scan_ai_patterns(masked_text)
+    findings.extend(ai_findings)
 
     # 排序：按 1-based 物理行号升序排列
     findings.sort(key=lambda f: f.line_number)

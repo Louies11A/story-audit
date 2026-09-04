@@ -45,7 +45,19 @@ from scripts.safe_writer import (
     SafeWriterError,
     apply_patch_with_disambiguation,
 )
-from scripts.types import BoundaryContext, ChapterItem, FormatFinding, PatchSpec
+from scripts.ai_patterns_checker import scan_ai_patterns
+from scripts.author_memory import AuthorMemory
+from scripts.runtime_detector import detect_runtime, is_subagent_context, resolve_execution_mode
+from scripts.platform_rubrics import evaluate_platform_rubric, VALID_PLATFORMS
+from scripts.audit_state import (
+    AuditState,
+    get_audit_state_path,
+    load_audit_state,
+    save_audit_state,
+    get_inherited_items,
+    render_inherited_items_section,
+)
+from scripts.types import BoundaryContext, ChapterItem, Finding, FormatFinding, PatchSpec, format_factual_fix
 
 __all__ = [
     "main",
@@ -137,6 +149,13 @@ def build_pre_audit_bundle(
     curr_eol: str,
     gap_warnings: List[str],
     genre_profile: Optional[GenreProfile] = None,
+    requested_mode: str = "auto",
+    effective_mode: str = "full",
+    fallback_reason: str = "none",
+    platform: str = "generic",
+    platform_data: Optional[Dict[str, Any]] = None,
+    author_memory_text: Optional[str] = None,
+    inherited_items: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """构造结构严格冻结契约预审包字典"""
     try:
@@ -177,7 +196,27 @@ def build_pre_audit_bundle(
             "encoding": curr_enc,
             "newline": curr_eol,
             "genre": genre_profile.primary_genre,
+            "requested_mode": requested_mode,
+            "effective_mode": effective_mode,
+            "fallback_reason": fallback_reason,
+            "platform": platform,
         },
+        "runtime_dispatch": {
+            "requested_mode": requested_mode,
+            "effective_mode": effective_mode,
+            "fallback_reason": fallback_reason,
+        },
+        "platform_diagnostics": {
+            "platform": platform_data.get("platform", platform),
+            "passed": platform_data.get("passed", True),
+            "metrics": platform_data.get("metrics", {}),
+            "findings": [
+                f.to_dict() if hasattr(f, "to_dict") else f
+                for f in platform_data.get("findings", [])
+            ],
+        } if platform_data else {},
+        "author_memory": author_memory_text or "",
+        "inherited_items": inherited_items or {},
         "genre_diagnostics": {
             "detected_genre": genre_profile.primary_genre,
             "confidence": genre_profile.confidence,
@@ -207,13 +246,18 @@ def build_pre_audit_bundle(
         "format_scan": {
             "total_flaws": len(findings),
             "findings": [
-                {
-                    "line_number": f.line_number,
-                    "flaw_type": f.flaw_type,
-                    "severity": f.severity,
-                    "snippet": f.snippet,
-                    "message": f.message,
-                    "suggestion": f.suggestion,
+                f.to_dict() if hasattr(f, "to_dict") else {
+                    "line_number": getattr(f, "line_number", 0),
+                    "flaw_type": getattr(f, "flaw_type", ""),
+                    "severity": getattr(f, "severity", "P2"),
+                    "snippet": getattr(f, "snippet", ""),
+                    "message": getattr(f, "message", ""),
+                    "suggestion": getattr(f, "suggestion", ""),
+                    "category": getattr(f, "category", "format"),
+                    "location": getattr(f, "location", f"行 {getattr(f, 'line_number', 0)}"),
+                    "evidence": getattr(f, "evidence", getattr(f, "snippet", "")),
+                    "issue": getattr(f, "issue", getattr(f, "message", "")),
+                    "fix": getattr(f, "fix", getattr(f, "suggestion", "")),
                 }
                 for f in findings
             ],
@@ -232,6 +276,13 @@ def render_audit_report(
     state: LedgerState,
     gap_warnings: List[str],
     genre_profile: Optional[GenreProfile] = None,
+    requested_mode: str = "auto",
+    effective_mode: str = "full",
+    fallback_reason: str = "none",
+    platform: str = "generic",
+    author_memory_text: Optional[str] = None,
+    platform_data: Optional[Dict[str, Any]] = None,
+    inherited_items: Optional[Dict[str, Any]] = None,
 ) -> str:
     """渲染符合统一审查报告 Schema (Markdown) 的报告内容"""
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -249,10 +300,18 @@ def render_audit_report(
     kw_str = ", ".join(gp.keywords_matched[:8]) if gp.keywords_matched else "通用特征"
 
     lines = [
+        "=== story-audit 深度审查报告 ===",
+        f"Requested Mode: {requested_mode}",
+        f"Effective Mode: {effective_mode}",
+        f"Fallback: {fallback_reason}",
+        f"Platform Rubric: {platform}",
+        f"Genre: {gp.primary_genre}",
+        f"Scope: 第{curr_chapter.index:03g}章",
+        "",
         f"# 📚 长篇网文深度审查报告：第 {curr_chapter.index} 章",
-        f"> 审查时间：{now_str} | 运行模式：Solo",
+        f"> 审查时间：{now_str} | 运行模式：{effective_mode.capitalize()} (Requested: {requested_mode}, Fallback: {fallback_reason})",
         f"> 审查范围：第 {curr_chapter.index} 章 ({curr_chapter.title}) (对比承接源：{prev_info})",
-        f"> 综合裁决：{verdict}",
+        f"> 平台门禁：{platform} | 综合裁决：{verdict}",
         "",
         "---",
         "",
@@ -266,6 +325,44 @@ def render_audit_report(
     ]
     for rl in gp.red_lines:
         lines.append(f"  * ⚠️ {rl}")
+
+    # 平台专属商业门禁诊断
+    if platform_data and (platform != "generic" or platform_data.get("findings")):
+        p_status = "🟢 合格通过" if platform_data.get("passed", True) else "🔴 触发门禁拦截"
+        lines.extend([
+            "",
+            "---",
+            "",
+            f"## 📱 平台商业门禁诊断 (Platform Diagnostics: {platform})",
+            f"* **平台卡尺**：{platform}",
+            f"* **门禁状态**：{p_status}",
+        ])
+        for k, v in platform_data.get("metrics", {}).items():
+            lines.append(f"* **{k}**：`{v}`")
+        p_findings = platform_data.get("findings", [])
+        if p_findings:
+            lines.append("* **平台门禁发现项**：")
+            for pf in p_findings:
+                lines.append(f"  * ⚠️ [{pf.severity}] {pf.issue} (建议: {pf.fix})")
+
+    # 作者记忆上下文
+    if author_memory_text:
+        lines.extend([
+            "",
+            "---",
+            "",
+            "## 👤 作者画像与偏好联动 (Author Memory)",
+            author_memory_text,
+        ])
+
+    # 跨批因果继承与开放缺陷
+    if inherited_items and (inherited_items.get("open_defects") or inherited_items.get("foreshadowing_commitments")):
+        lines.extend([
+            "",
+            "---",
+            "",
+            render_inherited_items_section(inherited_items),
+        ])
 
     lines.extend([
         "",
@@ -392,11 +489,18 @@ def run_audit(
     silent: bool = False,
     summary_collector: Optional[Dict[str, Any]] = None,
     genre: str = "auto",
+    mode: str = "auto",
+    platform: str = "generic",
+    use_author_memory: bool = False,
+    inherited_items: Optional[Dict[str, Any]] = None,
 ) -> int:
     """执行单章审查管线，生成预审包与归档报告，返回退出码"""
     reports_dir = project_dir / "reports"
     cache_dir = reports_dir / ".cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # 0. 运行时探测与模式降级
+    effective_mode, fallback_reason = resolve_execution_mode(mode)
 
     # 1. 发现章节
     resolver = ChapterResolver()
@@ -451,7 +555,24 @@ def run_audit(
     # 5.5 题材自动探测与画像构建
     genre_profile = detect_genre(curr_text, specified_genre=genre)
 
-    # 7. 排版扫描（动态注入题材白名单规则）
+    # 5.6 平台商业门禁质量卡尺评估
+    platform_data = evaluate_platform_rubric(
+        curr_text,
+        platform=platform,
+        chapter_index=curr_chapter.index,
+        genre=genre_profile.primary_genre,
+    )
+
+    # 5.7 作者偏好记忆联动（受 2048 字节硬上限与铁律约束保护）
+    author_mem_text: Optional[str] = None
+    if use_author_memory:
+        try:
+            mem = AuthorMemory(project_dir)
+            author_mem_text = mem.query()
+        except Exception:
+            author_mem_text = None
+
+    # 7. 排版与 AI 模式扫描（动态注入题材白名单规则与深度 AI 句式检测）
     findings = scan_typography_flaws(curr_text, genre=genre_profile.primary_genre)
 
     # 8. 账本与防脏写检查
@@ -475,6 +596,24 @@ def run_audit(
             if tag not in state.foreshadowing_stash:
                 state.foreshadowing_stash.append(tag)
 
+    # 8.5 汇集平台卡尺违规项
+    p_findings = platform_data.get("findings", [])
+    for pf in p_findings:
+        if pf.severity in ("P2", "P3"):
+            findings.append(FormatFinding(
+                line_number=1,
+                flaw_type=f"PLATFORM_{platform.upper()}",
+                severity=pf.severity,
+                snippet=pf.evidence,
+                message=pf.issue,
+                suggestion=pf.fix,
+                category="platform",
+                location=pf.location,
+                evidence=pf.evidence,
+                issue=pf.issue,
+                fix=pf.fix,
+            ))
+
     # 9. 构建预审包
     bundle = build_pre_audit_bundle(
         project_dir=project_dir,
@@ -488,6 +627,13 @@ def run_audit(
         curr_eol=curr_eol,
         gap_warnings=gap_warnings,
         genre_profile=genre_profile,
+        requested_mode=mode,
+        effective_mode=effective_mode,
+        fallback_reason=fallback_reason,
+        platform=platform,
+        platform_data=platform_data,
+        author_memory_text=author_mem_text,
+        inherited_items=inherited_items,
     )
     bundle_path = cache_dir / "pre_audit_bundle.json"
     write_file_safe(bundle_path, json.dumps(bundle, ensure_ascii=False, indent=2))
@@ -503,6 +649,13 @@ def run_audit(
         elif v["level"] == "P1":
             p1_list.append(v["message"])
 
+    # 平台红线与严重门禁拦截
+    for pf in p_findings:
+        if pf.severity == "P0":
+            p0_list.append(pf.issue)
+        elif pf.severity == "P1":
+            p1_list.append(pf.issue)
+
     # 11. 生成与归档审查报告
     report_content = render_audit_report(
         curr_chapter=curr_chapter,
@@ -514,6 +667,13 @@ def run_audit(
         state=state,
         gap_warnings=gap_warnings,
         genre_profile=genre_profile,
+        requested_mode=mode,
+        effective_mode=effective_mode,
+        fallback_reason=fallback_reason,
+        platform=platform,
+        author_memory_text=author_mem_text,
+        platform_data=platform_data,
+        inherited_items=inherited_items,
     )
 
     latest_report_path = reports_dir / "LATEST_REPORT.md"
@@ -525,6 +685,14 @@ def run_audit(
     write_file_safe(archived_report_path, report_content)
 
     if not silent:
+        print(f"=== story-audit 深度审查报告 ===")
+        print(f"Requested Mode: {mode}")
+        print(f"Effective Mode: {effective_mode}")
+        print(f"Fallback: {fallback_reason}")
+        print(f"Platform Rubric: {platform}")
+        print(f"Genre: {genre_profile.primary_genre}")
+        print(f"Scope: 第{curr_chapter.index:03g}章")
+        print(f"----------------------------------------------------------------------------------------")
         print(f"审查完成：第 {curr_chapter.index} 章 ({curr_chapter.title}) [题材: {genre_profile.primary_genre} | 置信度: {genre_profile.confidence:.0%}]")
         if write_latest_report:
             print(f"最新报告已写入：{latest_report_path}")
@@ -743,6 +911,11 @@ def render_scope_batch_summary(
     s_max: float,
     chapter_summaries: List[Dict[str, Any]],
     strict: bool,
+    requested_mode: str = "auto",
+    effective_mode: str = "full",
+    fallback_reason: str = "none",
+    platform: str = "generic",
+    inherited_items: Optional[Dict[str, Any]] = None,
 ) -> str:
     """渲染批量审查聚合大盘报告 (Markdown)"""
     today = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -764,7 +937,16 @@ def render_scope_batch_summary(
     else:
         overall_status = "🟢 绿灯合格通过"
 
+    primary_genre = chapter_summaries[0]["genre_profile"].primary_genre if chapter_summaries and chapter_summaries[0].get("genre_profile") else "通用网文"
     lines: List[str] = [
+        "=== story-audit 深度审查报告 ===",
+        f"Requested Mode: {requested_mode}",
+        f"Effective Mode: {effective_mode}",
+        f"Fallback: {fallback_reason}",
+        f"Platform Rubric: {platform}",
+        f"Genre: {primary_genre}",
+        f"Scope: {scope_str}",
+        "",
         f"# 批量连审大盘汇总报告 (范围: {scope_str})",
         "",
         f"> 生成时间：{today}  ",
@@ -788,11 +970,18 @@ def render_scope_batch_summary(
         "",
         "---",
         "",
+    ]
+
+    if inherited_items and (inherited_items.get("open_defects") or inherited_items.get("foreshadowing_commitments")):
+        lines.append(render_inherited_items_section(inherited_items))
+        lines.extend(["", "---", ""])
+
+    lines.extend([
         "## 二、字数与段数统计走势",
         "",
         "| 章号 | 章节名称 | 总字数 | 自然段数 | 平均段长 | 走势评估 |",
         "| :--- | :--- | :--- | :--- | :--- | :--- |",
-    ]
+    ])
 
     for c in chapter_summaries:
         wc = c["word_count"]
@@ -893,7 +1082,16 @@ def render_scope_batch_summary(
     return "\n".join(lines)
 
 
-def run_scope_audit(project_dir: Path, scope_str: str, strict: bool, force: bool, genre: str = "auto") -> int:
+def run_scope_audit(
+    project_dir: Path,
+    scope_str: str,
+    strict: bool,
+    force: bool,
+    genre: str = "auto",
+    mode: str = "auto",
+    platform: str = "generic",
+    use_author_memory: bool = False,
+) -> int:
     """执行批量连审模式，生成大盘汇总报告与紧凑看板输出"""
     try:
         s_min, s_max = parse_scope_range(scope_str)
@@ -909,8 +1107,27 @@ def run_scope_audit(project_dir: Path, scope_str: str, strict: bool, force: bool
         return 3
 
     n_total = len(target_chapters)
+    reports_dir = project_dir / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+
+    # 运行时探测与跨批状态机继承
+    effective_mode, fallback_reason = resolve_execution_mode(mode)
+    audit_state = load_audit_state(reports_dir)
+    inherited_items = get_inherited_items(audit_state)
+
+    print(f"=== story-audit 深度审查报告 ===")
+    print(f"Requested Mode: {mode}")
+    print(f"Effective Mode: {effective_mode}")
+    print(f"Fallback: {fallback_reason}")
+    print(f"Platform Rubric: {platform}")
+    print(f"Genre: {genre}")
+    print(f"Scope: {scope_str}")
     print(f"========================================================================================")
-    print(f"🚀 开始批量审查 [范围: {scope_str} | 共 {n_total} 章]")
+    print(f"🚀 开始批量审查 [范围: {scope_str} | 共 {n_total} 章 | 模式: {effective_mode}]")
+    if inherited_items.get("open_defects"):
+        print(f"  [继承开放缺陷]: {len(inherited_items['open_defects'])} 项")
+    if inherited_items.get("foreshadowing_commitments"):
+        print(f"  [监控中伏笔池]: {len(inherited_items['foreshadowing_commitments'])} 个")
     print(f"========================================================================================")
 
     chapter_summaries: List[Dict[str, Any]] = []
@@ -929,6 +1146,10 @@ def run_scope_audit(project_dir: Path, scope_str: str, strict: bool, force: bool
             silent=True,
             summary_collector=summary,
             genre=genre,
+            mode=mode,
+            platform=platform,
+            use_author_memory=use_author_memory,
+            inherited_items=inherited_items,
         )
         chapter_summaries.append(summary)
 
@@ -977,6 +1198,11 @@ def run_scope_audit(project_dir: Path, scope_str: str, strict: bool, force: bool
         s_max=s_max,
         chapter_summaries=chapter_summaries,
         strict=strict,
+        requested_mode=mode,
+        effective_mode=effective_mode,
+        fallback_reason=fallback_reason,
+        platform=platform,
+        inherited_items=inherited_items,
     )
 
     reports_dir = project_dir / "reports"
@@ -1000,9 +1226,39 @@ def run_scope_audit(project_dir: Path, scope_str: str, strict: bool, force: bool
     latest_report_path = reports_dir / "LATEST_REPORT.md"
     write_file_safe(latest_report_path, batch_summary_content)
 
+    # 原子更新跨批长篇因果状态机 (reports/.audit_state.json)
+    audit_state.last_scope = scope_str
+    for chap in target_chapters:
+        if chap.index not in audit_state.completed_chapters:
+            audit_state.completed_chapters.append(chap.index)
+    audit_state.completed_chapters.sort()
+
+    # 累积本批次发现的开放 P0/P1 缺陷
+    for s in chapter_summaries:
+        c_idx = s.get("chapter_index", 0)
+        for p0_item in s.get("p0_list", []):
+            audit_state.open_defects.append({
+                "chapter": c_idx,
+                "severity": "P0",
+                "category": "causal",
+                "issue": p0_item,
+                "fix": "严格依据账本与主线事实对齐，杜绝主观文学发挥",
+            })
+        for p1_item in s.get("p1_list", []):
+            audit_state.open_defects.append({
+                "chapter": c_idx,
+                "severity": "P1",
+                "category": "causal",
+                "issue": p1_item,
+                "fix": "严格依据账本与主线事实对齐，杜绝主观文学发挥",
+            })
+
+    save_audit_state(audit_state, reports_dir)
+
     print(f"✅ 批量审查大盘报告已生成：{scope_summary_path}")
     print(f"✅ 历史归档报告已写入：{batch_report_file}")
     print(f"✅ 最新审查总览已更新：{latest_report_path}")
+    print(f"✅ 跨批因果状态机已原子更新：{get_audit_state_path(reports_dir)}")
 
     if has_p0:
         return 2
@@ -1117,6 +1373,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--force", action="store_true", help="忽略脏写警告强制覆盖 Markdown")
     parser.add_argument("--strict", action="store_true", help="严格模式（发现 P1 违规时返回 Exit Code 1）")
     parser.add_argument("--genre", type=str, default="auto", help="网文题材类型（默认 auto 自动探测，支持手动指定如 '东方仙侠'、'追妻火葬场'）")
+    parser.add_argument("--mode", choices=["auto", "full", "lean", "solo"], default="auto", help="审查运行模式 (full/lean/solo，默认 auto 自适应降级)")
+    parser.add_argument("--platform", choices=list(VALID_PLATFORMS), default="generic", help="目标发布平台质量卡尺 (fanqie/qidian/zhihu/generic，默认 generic)")
+    parser.add_argument("--author-memory", action="store_true", help="联动作者记忆状态机 (设定/_author-memory-state.json)")
 
     # 补丁与辅助参数
     parser.add_argument("--target-line", type=int, default=None, help="补丁目标行号")
@@ -1171,6 +1430,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             strict=args.strict,
             force=args.force,
             genre=args.genre,
+            mode=args.mode,
+            platform=args.platform,
+            use_author_memory=args.author_memory,
         )
 
     # 6. 单章日常审查（默认）
@@ -1180,6 +1442,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         strict=args.strict,
         force=args.force,
         genre=args.genre,
+        mode=args.mode,
+        platform=args.platform,
+        use_author_memory=args.author_memory,
     )
 
 
