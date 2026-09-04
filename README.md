@@ -2,7 +2,7 @@
 
 [![Python Version](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-229%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-252%20passed-brightgreen.svg)]()
 [![Coverage](https://img.shields.io/badge/coverage-93%25-brightgreen.svg)]()
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-zero%20external-orange.svg)]()
 
@@ -308,7 +308,7 @@ pytest --cov=scripts --cov-report=term-missing
 
 ### 测试指标
 
-- **用例总数**：**229 项测试** 全部通过（100% Pass Rate）；
+- **用例总数**：**252 项测试** 全部通过（100% Pass Rate）；
 - **执行时间**：~ 1.6 秒（极速并发执行）；
 - **用例覆盖分布**：
   - `test_story_audit_api.py`：23 项测试（纯 Python API 执行管线、四阶状态码契约、参数消歧与补丁安全回写等）
