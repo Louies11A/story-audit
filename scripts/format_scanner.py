@@ -19,20 +19,93 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from scripts.types import FormatFinding
 
 # 系统流面板核心关键词
-SYSTEM_PANEL_KEYWORDS = {
-    # 传统玄幻 / 仙侠修真
+# 全题材系统流面板核心关键词库（覆盖玄幻/仙侠/修真/科幻/末世/高武/文娱/游戏/女频/怪谈）
+SYSTEM_PANEL_KEYWORDS: Set[str] = {
+    # 1. 传统玄幻 / 仙侠修真
     "力量", "敏捷", "境界", "寿元", "技能点", "宿主", "体质", "生命", "法力",
     "智力", "精神", "根骨", "气血", "功法", "经验", "天赋", "战力", "防御",
     "攻击", "状态", "属性", "等级", "法宝", "耐力", "潜能", "悟性", "幸运",
     "修为", "真元", "神识", "灵力", "元力", "魂力", "战技", "灵根", "系统",
-    "面板", "抽奖", "积分", "金币", "声望", "掉落",
-    # 科幻军工 / 末世造舰 / 硬核数据流专有关键词
-    "载具", "舰体", "结构质量", "能源", "装甲", "动力", "火控", "雷达",
+    "面板", "抽奖", "积分", "金币", "声望", "掉落", "道韵", "本源", "气海",
+    "识海", "丹田", "命格", "天劫", "灵契", "洞府", "法器", "灵宝",
+    # 2. 科幻军工 / 末世造舰 / 硬核数据流 / 机械
+    "载具", "舰体", "结构质量", "能量", "能源", "装甲", "动力", "火控", "雷达",
     "声呐", "重构点", "储备", "弹药", "基数", "航速", "排水量", "垂发",
     "主炮", "导弹", "近防炮", "模块", "蓝图", "进化核心", "工况", "变动",
     "损管", "轴系", "耐久", "功率", "负荷", "载重", "射程", "鱼雷",
-    "推进", "航向", "深弹", "机炮", "吃水", "浮力", "并网", "回波"
+    "推进", "航向", "深弹", "机炮", "吃水", "浮力", "并网", "回波",
+    "跃迁", "智脑", "芯片", "护盾", "机甲", "引擎", "过载", "散热", "辐射度",
+    # 3. 都市 / 高武 / 异能 / 文娱
+    "卡路里", "武道等级", "金钱", "资产", "粉丝值", "好感度", "热搜", "版权",
+    "精神力", "拳力", "战力振幅", "淬骨", "身家", "片酬", "收视率", "票房",
+    "订阅", "打赏", "黑卡", "额度", "准武者", "战法", "品阶",
+    # 4. 游戏 / 网游 / 无限流
+    "生命值", "魔法值", "暴击率", "冷却", "副本", "公会", "神装", "攻速",
+    "移速", "格挡", "穿透", "护甲", "闪避", "仇恨值", "法强", "物攻", "韧性",
+    "段位", "天梯", "击杀", "助攻", "buff", "debuff", "hp", "mp", "exp", "cd",
+    # 5. 女频 / 宅斗 / 宫斗 / 世情 / 年代
+    "月钱", "份例", "嫁妆", "位份", "女红", "体己", "工分", "粮票", "布票",
+    "产值", "地契", "房产", "私房钱", "头面", "首饰", "田产", "铺面", "收益",
+    "工分簿", "口粮", "布匹", "银两", "碎银",
+    # 6. 悬疑 / 怪谈 / 民俗 / 诡异
+    "san值", "污染度", "异化率", "规则", "诡器", "代号", "生路", "寿衣",
+    "灵异等级", "禁忌", "死咒", "侵蚀度", "封印物", "诡物", "杀人规律",
+    "鬼域", "灵异", "阴煞", "死律", "理智", "理智值", "命数",
 }
+
+# 题材专属细粒度面板关键词映射库
+GENRE_PANEL_KEYWORDS_MAP: Dict[str, Set[str]] = {
+    "仙侠玄幻": {
+        "灵根", "境界", "功法", "法宝", "本源", "寿元", "气海", "识海", "道韵",
+        "灵力", "真元", "神识", "天劫", "洞府", "丹田", "命格", "法器", "灵契",
+    },
+    "科幻竞技": {
+        "载具", "舰体", "能量", "装甲", "火控", "雷达", "声呐", "重构点", "跃迁",
+        "智脑", "芯片", "生命值", "暴击率", "技能点", "冷却", "副本", "护盾",
+    },
+    "都市异能": {
+        "气血", "卡路里", "武道等级", "金钱", "资产", "粉丝值", "声望", "好感度",
+        "热搜", "版权", "精神力", "拳力", "准武者", "淬骨", "战力振幅",
+    },
+    "都市现实": {
+        "资产", "片酬", "票房", "收视率", "粉丝值", "热搜", "月薪", "房租", "利润", "估值",
+    },
+    "女频情仇": {
+        "月钱", "份例", "嫁妆", "位份", "女红", "体己", "工分", "粮票", "布票",
+        "地契", "产值", "银两", "碎银", "田契", "首饰", "头面",
+    },
+    "悬疑惊悚": {
+        "san值", "污染度", "异化率", "规则", "诡器", "代号", "生路", "寿衣",
+        "灵异等级", "禁忌", "侵蚀度", "封印物", "死律", "理智", "鬼域",
+    },
+    "历史铁血": {
+        "国库", "军饷", "战损", "粮饷", "赋税", "户部", "兵部", "密电", "代号", "密使", "通报",
+    },
+    "短篇爆发": {
+        "白月光", "资产", "定金", "违约金", "月钱", "录音", "物证", "污染度", "san值", "纸人", "寿衣",
+    },
+}
+
+
+def get_genre_panel_keywords(genre: Optional[str] = None) -> Set[str]:
+    """根据传入的题材名称或大类，动态合并产出全量面板白名单关键词集合"""
+    keywords = set(SYSTEM_PANEL_KEYWORDS)
+    if not genre:
+        return keywords
+    try:
+        from scripts.genre_detector import get_genre_metadata, resolve_canonical_genre
+        canonical = resolve_canonical_genre(genre)
+        if canonical:
+            meta = get_genre_metadata(canonical)
+            group = meta.get("group", "")
+            if group in GENRE_PANEL_KEYWORDS_MAP:
+                keywords.update(GENRE_PANEL_KEYWORDS_MAP[group])
+            for kw in meta.get("high_weight", []) + meta.get("standard", []):
+                if len(kw) <= 6:
+                    keywords.add(kw)
+    except Exception:
+        pass
+    return keywords
 
 # AI 翻译腔高频连词库（按长度降序预排序，确保正则引擎优先匹配最长连词）
 AI_CONJUNCTION_WORDS = tuple(
@@ -71,7 +144,7 @@ def _make_snippet(text: str, max_len: int = 60) -> str:
     return clean[:max_len]
 
 
-def _is_panel_attr_line(line: str) -> bool:
+def _is_panel_attr_line(line: str, genre_keywords: Optional[Set[str]] = None) -> bool:
     """
     判断一行是否为合法的系统面板属性键值行。
 
@@ -121,11 +194,13 @@ def _is_panel_attr_line(line: str) -> bool:
     # 属性名长度受限（<= 8 字）
     key_len_valid = len(key) <= 8
 
-    # 行内包含数值/等级特征
+    # 行内包含数值/等级特征或全题材面板关键词
+    kw_set = genre_keywords if genre_keywords is not None else SYSTEM_PANEL_KEYWORDS
     has_feature = bool(
-        re.search(r'\d+|[a-zA-Z]+|[+%/]|级|阶|层|重|品|星|段|榜', s)
-        or any(kw in key for kw in SYSTEM_PANEL_KEYWORDS)
-        or any(kw in right_part for kw in ("无", "正常", "良好", "重伤", "中毒", "濒死", "封印", "满", "未知"))
+        re.search(r'\d+|[a-zA-Z]+|[+%/]|级|阶|层|重|品|星|段|榜|点|条|张|文|两|元|分|票|值|度|率|位|卡|株|颗|枚', s)
+        or any(kw in key for kw in kw_set)
+        or any(kw in right_part for kw in kw_set)
+        or any(kw in right_part for kw in ("无", "正常", "破损", "封印", "锁定", "激活", "未知", "已解密", "已收录"))
     )
 
     return key_len_valid and has_feature
@@ -175,7 +250,7 @@ def _analyze_single_poem_line(line: str) -> Optional[int]:
     return None
 
 
-def mask_special_blocks(text: str) -> Tuple[str, List[Dict[str, Any]]]:
+def mask_special_blocks(text: str, genre: Optional[str] = None) -> Tuple[str, List[Dict[str, Any]]]:
     """
     白名单区块掩码处理器。
     
@@ -190,6 +265,7 @@ def mask_special_blocks(text: str) -> Tuple[str, List[Dict[str, Any]]]:
     if not text:
         return "", []
 
+    keywords_to_check = get_genre_panel_keywords(genre)
     lines = text.split("\n")
     n_lines = len(lines)
     masked_line_indices: Set[int] = set()
@@ -233,7 +309,7 @@ def mask_special_blocks(text: str) -> Tuple[str, List[Dict[str, Any]]]:
                     i += 1
                 end_idx = i - 1
                 block_content = "\n".join(lines[start_idx:end_idx + 1])
-                if any(kw in block_content for kw in SYSTEM_PANEL_KEYWORDS):
+                if any(kw in block_content for kw in keywords_to_check):
                     for k in range(start_idx, end_idx + 1):
                         masked_line_indices.add(k)
                     masks_info.append({
@@ -277,7 +353,7 @@ def mask_special_blocks(text: str) -> Tuple[str, List[Dict[str, Any]]]:
                 end_idx = close_idx
                 i = close_idx + 1
                 block_content = "\n".join(lines[start_idx:end_idx + 1])
-                if any(kw in block_content for kw in SYSTEM_PANEL_KEYWORDS):
+                if any(kw in block_content for kw in keywords_to_check):
                     for k in range(start_idx, end_idx + 1):
                         masked_line_indices.add(k)
                     masks_info.append({
@@ -303,20 +379,20 @@ def mask_special_blocks(text: str) -> Tuple[str, List[Dict[str, Any]]]:
 
                     if curr_s.startswith(("【", "[", "|", "-", "*")):
                         # 如果是属性行或包含系统关键词的面板行
-                        if _is_panel_attr_line(curr_s) or any(kw in curr_s for kw in SYSTEM_PANEL_KEYWORDS):
+                        if _is_panel_attr_line(curr_s, genre_keywords=keywords_to_check) or any(kw in curr_s for kw in keywords_to_check):
                             i += 1
                         elif curr_s.startswith(("-", "*", "|")) and len(curr_s) <= 40:
                             i += 1
                         else:
                             break
-                    elif _is_panel_attr_line(curr_s):
+                    elif _is_panel_attr_line(curr_s, genre_keywords=keywords_to_check):
                         i += 1
                     else:
                         break
 
                 end_idx = i - 1
                 block_content = "\n".join(lines[start_idx:end_idx + 1])
-                if any(kw in block_content for kw in SYSTEM_PANEL_KEYWORDS):
+                if any(kw in block_content for kw in keywords_to_check):
                     for k in range(start_idx, end_idx + 1):
                         masked_line_indices.add(k)
                     masks_info.append({
@@ -639,7 +715,7 @@ def scan_dragging_sentences(
     return findings
 
 
-def scan_typography_flaws(text: str, original_text: str = "") -> List[FormatFinding]:
+def scan_typography_flaws(text: str, original_text: str = "", genre: Optional[str] = None) -> List[FormatFinding]:
     """
     排版格式缺陷扫描器。
     
@@ -658,9 +734,9 @@ def scan_typography_flaws(text: str, original_text: str = "") -> List[FormatFind
     # 确定原始文本与待扫描文本
     if not original_text:
         original_text = text
-        masked_text, _ = mask_special_blocks(original_text)
+        masked_text, _ = mask_special_blocks(original_text, genre=genre)
     elif text == original_text:
-        masked_text, _ = mask_special_blocks(original_text)
+        masked_text, _ = mask_special_blocks(original_text, genre=genre)
     else:
         masked_text = text
 

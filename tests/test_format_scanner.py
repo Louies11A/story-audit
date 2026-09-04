@@ -748,5 +748,118 @@ class TestFormatScanner(unittest.TestCase):
         self.assertEqual(findings[0].line_number, 2)
         self.assertEqual(findings[0].flaw_type, "DRAGGING_SENTENCE")
 
+
+
+class TestFullGenrePanelMasking(unittest.TestCase):
+    """测试全题材系统面板掩码与动态规则白名单"""
+
+    def test_xianxia_panel_masking(self):
+        """测试仙侠玄幻灵根、道韵、寿元、识海面板掩码"""
+        text = (
+            "开篇序言，风起青萍之末。\n"
+            "【道途命格面板】\n"
+            "- 灵根：水木双灵根\n"
+            "- 境界：筑基期七层\n"
+            "- 本源：纯阳真元\n"
+            "- 寿元：85/240\n"
+            "- 识海：道韵初成\n"
+            "收起玉简，顾渊提剑步出洞府。\n"
+        )
+        masked, masks = mask_special_blocks(text, genre="东方仙侠")
+        self.assertEqual(masked.count("\n"), text.count("\n"), "行数绝对保持契约")
+        self.assertTrue(any(m["type"] == "system_panel" for m in masks))
+        findings = scan_typography_flaws(text, genre="东方仙侠")
+        self.assertEqual(len(findings), 0, "合规面板不应产生任何排版缺陷")
+
+    def test_scifi_starship_panel_masking(self):
+        """测试科幻末世舰体、跃迁、重构点、智脑面板掩码"""
+        text = (
+            "警告红光闪烁，全舰进入战斗工况。\n"
+            "【歼星母舰工况参数】\n"
+            "- 舰体：重装甲巡洋舰\n"
+            "- 能量储备：8200/10000\n"
+            "- 重构点：450点\n"
+            "- 跃迁引擎：冷却完成\n"
+            "- 智脑：初级觉醒状态\n"
+            "舰长深吸一口气，下达开火指令。\n"
+        )
+        masked, masks = mask_special_blocks(text, genre="科幻末世")
+        self.assertEqual(masked.count("\n"), text.count("\n"))
+        self.assertTrue(any(m["type"] == "system_panel" for m in masks))
+        findings = scan_typography_flaws(text, genre="科幻末世")
+        self.assertEqual(len(findings), 0)
+
+    def test_dushi_gaowu_and_wenyu_panel_masking(self):
+        """测试都市高武气血、卡路里及文娱粉丝值、版权面板掩码"""
+        text = (
+            "教室内，检测仪器发出清脆嗡鸣。\n"
+            "【武道体测与艺能评级】\n"
+            "- 气血值：148.5卡\n"
+            "- 卡路里：3200\n"
+            "- 武道等级：准武者二级\n"
+            "- 粉丝值：5200000\n"
+            "- 版权估值：8000万元\n"
+            "全班同学顿时爆发出不可思议的惊呼。\n"
+        )
+        masked, masks = mask_special_blocks(text, genre="都市高武")
+        self.assertEqual(masked.count("\n"), text.count("\n"))
+        self.assertTrue(any(m["type"] == "system_panel" for m in masks))
+        findings = scan_typography_flaws(text, genre="都市高武")
+        self.assertEqual(len(findings), 0)
+
+    def test_game_and_infinite_panel_masking(self):
+        """测试网游电竞与无限流生命值、暴击率、冷却面板掩码"""
+        text = (
+            "Boss轰然倒下，金光洒落一地。\n"
+            "【玩家数据终端】\n"
+            "- 生命值：1850/2000\n"
+            "- 魔法值：650/800\n"
+            "- 暴击率：35.5%\n"
+            "- 冷却缩减：20%\n"
+            "- 副本积分：1200点\n"
+            "队伍频道内传来团长激动的欢呼声。\n"
+        )
+        masked, masks = mask_special_blocks(text, genre="游戏体育")
+        self.assertEqual(masked.count("\n"), text.count("\n"))
+        self.assertTrue(any(m["type"] == "system_panel" for m in masks))
+        findings = scan_typography_flaws(text, genre="游戏体育")
+        self.assertEqual(len(findings), 0)
+
+    def test_female_and_niandai_panel_masking(self):
+        """测试宅斗月钱、嫁妆与年代工分、粮票面板掩码"""
+        text = (
+            "账房嬷嬷翻开厚重的登记簿。\n"
+            "【内库份例与公社工分账册】\n"
+            "- 月钱：十二两碎银\n"
+            "- 份例：江南云锦四匹\n"
+            "- 嫁妆：田契三张，商铺两间\n"
+            "- 工分：48.5分\n"
+            "- 粮票：20市斤\n"
+            "苏晚合上账册，冷冷看着面前心虚的管事。\n"
+        )
+        masked, masks = mask_special_blocks(text, genre="年代")
+        self.assertEqual(masked.count("\n"), text.count("\n"))
+        self.assertTrue(any(m["type"] == "system_panel" for m in masks))
+        findings = scan_typography_flaws(text, genre="年代")
+        self.assertEqual(len(findings), 0)
+
+    def test_suspense_and_guaitan_panel_masking(self):
+        """测试规则怪谈san值、污染度、异化率、规则面板掩码"""
+        text = (
+            "怀表滴答作响，车厢温度骤降。\n"
+            "【异常规则与污染检测】\n"
+            "- san值：72/100\n"
+            "- 污染度：28%\n"
+            "- 异化率：轻微\n"
+            "- 规则：不可在午夜点燃白蜡烛\n"
+            "- 诡器：染血的剪刀\n"
+            "他死死攥住口袋里的生路字条，屏住呼吸。\n"
+        )
+        masked, masks = mask_special_blocks(text, genre="悬疑脑洞")
+        self.assertEqual(masked.count("\n"), text.count("\n"))
+        self.assertTrue(any(m["type"] == "system_panel" for m in masks))
+        findings = scan_typography_flaws(text, genre="悬疑脑洞")
+        self.assertEqual(len(findings), 0)
+
 if __name__ == "__main__":
     unittest.main()

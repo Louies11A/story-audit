@@ -33,7 +33,8 @@ class TestLedgerDataModel(unittest.TestCase):
         """验证七类资产与扩展状态集合"""
         expected_categories = {
             "资金资产", "装备道具", "丹药耗材", "功法神通",
-            "身份权限", "随行战力", "全局状态",
+            "身份权限", "身份特权", "随行战力", "全局状态",
+            "地契房产", "规则诡器",
         }
         expected_statuses = {
             "UNACQUIRED", "ACQUIRED", "EQUIPPED", "CONSUMED",
@@ -789,6 +790,100 @@ class TestHeuristicAssetsAndForeshadowing(unittest.TestCase):
 
         self.assertIn("失踪的海军科考船", tag_dict)
 
+
+
+
+class TestFullGenreAssetExtraction(unittest.TestCase):
+    """测试全题材计量单位与资产分类标准化"""
+
+    def test_xianxia_assets_extraction(self):
+        """测试修真仙侠丹药、灵石、灵草抽取与分类"""
+        text = (
+            "【开启古修洞府，获得：破境丹×3瓶，中品灵石500块】\n"
+            "药园中采摘到五株千年灵芝，还有一把三阶飞剑。\n"
+        )
+        assets = extract_heuristic_assets(text, chapter_index=10.0)
+        names = {a["name"]: a for a in assets}
+
+        self.assertIn("破境丹", names)
+        self.assertEqual(names["破境丹"]["category"], "丹药耗材")
+        self.assertEqual(names["破境丹"]["quantity"], 3)
+        self.assertEqual(names["破境丹"]["unit"], "瓶")
+
+        self.assertIn("中品灵石", names)
+        self.assertEqual(names["中品灵石"]["category"], "资金资产")
+        self.assertEqual(names["中品灵石"]["quantity"], 500)
+        self.assertEqual(names["中品灵石"]["unit"], "块")
+
+        lingzhi = [v for k, v in names.items() if "灵芝" in k]
+        self.assertTrue(len(lingzhi) >= 1)
+        self.assertEqual(lingzhi[0]["category"], "丹药耗材")
+
+    def test_dushi_wenyu_and_business_assets(self):
+        """测试都市文娱版权、股权、股份及大额资金抽取"""
+        text = (
+            "【签约完成，获得：独家版权1份，集团股份10股，现金300万元】\n"
+            "苏晴签下合同，成功买下一座写字楼。\n"
+        )
+        assets = extract_heuristic_assets(text, chapter_index=5.0)
+        names = {a["name"]: a for a in assets}
+
+        self.assertIn("独家版权", names)
+        self.assertEqual(names["独家版权"]["category"], "资金资产")
+
+        self.assertIn("集团股份", names)
+        self.assertEqual(names["集团股份"]["category"], "资金资产")
+
+        self.assertIn("现金", names)
+        self.assertEqual(names["现金"]["category"], "资金资产")
+
+    def test_female_niandai_and_zhaidou_assets(self):
+        """测试年代粮票、工分与宅斗地契、嫁妆、四合院抽取"""
+        text = (
+            "【分家核算：分得京郊田契3张，祖传四合院1座，全国粮票50斤，碎银200两】\n"
+            "苏晚清点库房，清点出五张布票与十袋大米。\n"
+        )
+        assets = extract_heuristic_assets(text, chapter_index=2.0)
+        names = {a["name"]: a for a in assets}
+
+        # 地契房产标准化
+        tianqi = [v for k, v in names.items() if "田契" in k]
+        self.assertTrue(len(tianqi) >= 1)
+        self.assertEqual(tianqi[0]["category"], "地契房产")
+
+        siheyuan = [v for k, v in names.items() if "四合院" in k]
+        self.assertTrue(len(siheyuan) >= 1)
+        self.assertEqual(siheyuan[0]["category"], "地契房产")
+
+        # 粮票耗材与碎银资金
+        liangpiao = [v for k, v in names.items() if "粮票" in k]
+        self.assertTrue(len(liangpiao) >= 1)
+        self.assertEqual(liangpiao[0]["category"], "丹药耗材")
+
+        suiyin = [v for k, v in names.items() if "碎银" in k]
+        self.assertTrue(len(suiyin) >= 1)
+        self.assertEqual(suiyin[0]["category"], "资金资产")
+
+    def test_suspense_guaitan_and_rules_assets(self):
+        """测试悬疑怪谈规则残片、诡器、寿衣、替死娃娃抽取"""
+        text = (
+            "【收容诡异成功：获得诡器1件，规则残片3片，替死娃娃1个】\n"
+            "在血泊中搜刮到一件染血的寿衣和一张羊皮纸。\n"
+        )
+        assets = extract_heuristic_assets(text, chapter_index=8.0)
+        names = {a["name"]: a for a in assets}
+
+        self.assertIn("诡器", names)
+        self.assertEqual(names["诡器"]["category"], "规则诡器")
+
+        self.assertIn("规则残片", names)
+        self.assertEqual(names["规则残片"]["category"], "规则诡器")
+        self.assertEqual(names["规则残片"]["quantity"], 3)
+        self.assertEqual(names["规则残片"]["unit"], "片")
+
+        tisi = [v for k, v in names.items() if "替死娃娃" in k]
+        self.assertTrue(len(tisi) >= 1)
+        self.assertEqual(tisi[0]["category"], "规则诡器")
 
 if __name__ == '__main__':
     unittest.main()

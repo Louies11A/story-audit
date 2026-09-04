@@ -23,12 +23,15 @@ from scripts.safe_io import read_file_safe, write_file_safe
 
 # 七类资产标准分类
 ASSET_CATEGORIES: Set[str] = {
-    "资金资产",
     "装备道具",
     "丹药耗材",
+    "资金资产",
     "功法神通",
-    "身份权限",
     "随行战力",
+    "地契房产",
+    "身份特权",
+    "身份权限",  # 兼容旧分类
+    "规则诡器",
     "全局状态",
 }
 
@@ -217,19 +220,16 @@ class LedgerState:
 
 
 def parse_chinese_or_arabic_number(s: str) -> Union[int, float]:
-    """将阿拉伯数字或中文数字串转换为数值"""
-    s = s.strip()
+    """解析中文或阿拉伯数字字符串为数值（支持万、千、百、亿及小数）"""
     if not s:
         return 1
+
+    s = s.strip()
     try:
-        if "." in s:
-            return float(s)
-        return int(s)
+        return float(s) if "." in s else int(s)
     except ValueError:
         pass
 
-    if s == "半":
-        return 0.5
     if s in ("百", "上百"):
         return 100
     if s in ("千", "上千"):
@@ -238,10 +238,16 @@ def parse_chinese_or_arabic_number(s: str) -> Union[int, float]:
         return 10000
 
     clean_s = s
-    for pfx in ("上", "数", "约", "近"):
+    m_num_unit = re.match(r'^(\d+(?:\.\d+)?)([万千百亿])$', clean_s)
+    if m_num_unit:
+        n_val = float(m_num_unit.group(1)) if "." in m_num_unit.group(1) else int(m_num_unit.group(1))
+        mult = {"百": 100, "千": 1000, "万": 10000, "亿": 100000000}[m_num_unit.group(2)]
+        return n_val * mult
+
+    for pfx in ("共", "约", "近", "超"):
         if clean_s.startswith(pfx) and len(clean_s) > 1:
             clean_s = clean_s[len(pfx):]
-    for sfx in ("余", "来", "个", "只"):
+    for sfx in ("余", "多", "来", "只"):
         if clean_s.endswith(sfx) and len(clean_s) > 1:
             clean_s = clean_s[:-len(sfx)]
 
@@ -249,7 +255,7 @@ def parse_chinese_or_arabic_number(s: str) -> Union[int, float]:
         "零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
         "五": 5, "六": 6, "七": 7, "八": 8, "九": 9,
     }
-    units = {"十": 10, "百": 100, "千": 1000, "万": 10000}
+    units = {"十": 10, "百": 100, "千": 1000, "万": 10000, "亿": 100000000}
 
     if clean_s in cn_digits:
         return cn_digits[clean_s]
@@ -275,27 +281,75 @@ def parse_chinese_or_arabic_number(s: str) -> Union[int, float]:
 
 
 def _categorize_asset(name: str) -> str:
-    """根据资产名称启发式推断七大资产类别"""
-    if any(k in name for k in ("重构点", "点数", "积分", "金币", "银币", "铜币", "灵石", "能量币", "晶石", "贡献点")):
+    """根据资产名称启发式推断全题材标准化资产类别"""
+    # 1. 地契房产
+    if any(k in name for k in (
+        "地契", "房契", "田契", "商铺", "庄园", "宅院", "别院", "四合院",
+        "铺面", "房产", "宅基地", "厂房", "别墅", "山头", "果园", "鱼塘", "祖宅", "写字楼"
+    )):
+        return "地契房产"
+
+    # 2. 规则诡器
+    if any(k in name for k in (
+        "诡器", "诡物", "规则残片", "替死娃娃", "羊皮纸", "寿衣", "绣花鞋",
+        "问米碗", "镇魂铃", "封印物", "骨灰盒", "纸人", "阴阳镜", "判官笔", "生路纸条"
+    )):
+        return "规则诡器"
+
+    # 3. 身份特权 (身份权限)
+    if any(k in name for k in (
+        "令牌", "虎符", "密令", "玉牒", "官印", "铭牌", "通行证", "委任状",
+        "聘书", "介绍信", "户口簿", "会员卡", "协议", "契约", "股权证书", "合同", "证书"
+    )):
+        return "身份特权"
+
+    # 4. 资金资产
+    if any(k in name for k in (
+        "重构点", "点数", "积分", "金币", "银币", "铜币", "灵石", "能量币",
+        "晶石", "贡献点", "碎银", "银两", "金条", "黄金", "文钱", "现金",
+        "存折", "支票", "黑卡", "股份", "股权", "版权", "定金", "彩礼",
+        "嫁妆", "分红", "工分", "两银", "贯钱", "万两"
+    )):
         return "资金资产"
-    if any(k in name for k in ("米", "粮", "面", "罐头", "肉", "水", "油", "柴油", "重油", "汽油", "煤油", "药", "抗生素", "急救包", "绷带", "弹药", "子弹", "炮弹", "深弹", "高爆弹", "穿甲弹", "炸药", "防弹钢", "特种钢", "钛合金", "铝合金", "合金", "口粮", "饼干")):
+
+    # 5. 丹药耗材
+    if any(k in name for k in (
+        "丹", "药", "灵药", "灵草", "灵芝", "人参", "雪莲", "兽核", "妖丹", "晶核",
+        "米", "粮", "面", "罐头", "肉", "水", "油", "柴油", "重油", "汽油", "煤油",
+        "抗生素", "急救包", "绷带", "弹药", "子弹", "炮弹", "深弹", "高爆弹", "穿甲弹",
+        "炸药", "防弹钢", "特种钢", "钛合金", "铝合金", "合金", "口粮", "饼干",
+        "符箓", "符纸", "粮票", "布票", "肉票", "油票", "工业券", "灵液", "灵泉", "灵髓"
+    )):
         return "丹药耗材"
-    if any(k in name for k in ("蓝图", "图纸", "设计图", "功法", "神通", "秘籍", "心法", "技能")):
+
+    # 6. 功法神通
+    if any(k in name for k in (
+        "蓝图", "图纸", "设计图", "功法", "神通", "秘籍", "心法", "技能",
+        "剑诀", "拳谱", "身法", "禁术", "残卷", "阵图", "传承", "战法"
+    )):
         return "功法神通"
-    if any(k in name for k in ("女兵", "幸存者", "工人", "工程师", "水鬼", "战队", "战友", "部下", "亲卫", "随从")):
+
+    # 7. 随行战力
+    if any(k in name for k in (
+        "女兵", "幸存者", "工人", "工程师", "水鬼", "战队", "战友", "部下",
+        "亲卫", "随从", "灵兽", "战宠", "死士", "暗卫", "傀儡", "护院", "丫鬟", "家丁", "掌柜", "门客"
+    )):
         return "随行战力"
+
+    # 8. 默认为装备道具
     return "装备道具"
 
 
 def _clean_asset_name(raw: str) -> str:
     """清洗资产名称中的多余助词与标点"""
-    name = raw.strip("：: ，,、。！？“”\"\'[]【】 ")
+    name = raw.strip("：: ，,、。！？“”\"'[]【】 ")
+    name = re.sub(r'^(?:获得|收录|发现|开启|解锁|掉落|装备|制造|打捞|缴获|入库|分得|继承|买下|采摘|签约|奖励|结算|清点出|清点)[：:\s]*', '', name)
     name = re.sub(r'^(?:未使用的|未经使用的|全新|完好无损的|进口的|德国进口的)', '', name)
     name = re.sub(r'^(?:一枚|一座|一台|一艘|一套|一只|一门|一把|一挺)', '', name)
-    return name.strip()
+    return name.strip("：: ，,、。！？“”\"'[]【】 ")
 
 
-def extract_heuristic_assets(text: str, chapter_index: float) -> List[Dict[str, Any]]:
+def extract_heuristic_assets(text: str, chapter_index: float, genre: Optional[str] = None) -> List[Dict[str, Any]]:
     """
     启发式资产抽取器：在缺乏人工 audit:stash 注释标签时，
     从自然网文中识别物资、装备出装、军工资产与系统收录物品。
@@ -307,15 +361,28 @@ def extract_heuristic_assets(text: str, chapter_index: float) -> List[Dict[str, 
 
     # 1. 扫描系统出装/提示括号块 【获得/收录/解锁/建造/打捞/缴获...】
     bracket_pattern = re.compile(
-        r'【(?P<header>[^】]*?(?:收录|发现|获得|激活|建造|升级|开启|解锁|掉落|装备|制造|打捞|缴获|入库)[^】]*?)[：:\s]*(?P<content>[^】]+)】'
+        r'【(?P<header>[^】]*?(?:收录|发现|获得|激活|建造|升级|开启|解锁|掉落|装备|制造|打捞|缴获|入库|分得|分家|签约|奖励|结算|收获|进账|清点|盘点|核算|收容|继承|采购|购置)[^】]*?)[：:\s]*(?P<content>[^】]+)】'
     )
-    units_regex = "门|座|台|艘|架|挺|只|箱|吨|斤|发|枚|颗|件|套|把|支|组|部|瓶|袋|罐|筒|具|块|根|张|联|卷|桶|批|口|尊|点"
+    units_regex = (
+        "门|座|台|艘|架|挺|只|箱|吨|斤|两|发|枚|颗|件|套|把|支|组|部|瓶|袋|罐|筒|具|"
+        "块|根|张|联|卷|桶|批|口|尊|点|亩|顷|间|栋|处|份|笔|宗|所|文|贯|元|分|角|个|"
+        "株|粒|股|成|页|册|柄|片|节|段|方|条|道|缕|丝|面|盏|贴|尺|寸|升|斗|石|匹|包|捆|扎|提|票|炉|鼎|副"
+    )
 
     for m in bracket_pattern.finditer(text):
-        content = m.group("content").strip()
         full_bracket = m.group(0)
-        clean_content = re.sub(r'^(?:成功[：:]|物资[：:]|获得[：:]|装备[：:]|制造[：:]|缴获[：:]|发现[：:])', '', content).strip()
-        sub_items = [s.strip() for s in re.split(r'[，,、；;\s]+', clean_content) if s.strip()]
+        bracket_inner = full_bracket[1:-1].strip()
+        # 优先以冒号切分标题与正文
+        if "：" in bracket_inner or ":" in bracket_inner:
+            hdr, body = re.split(r'[：:]', bracket_inner, maxsplit=1)
+            if re.match(rf'^\d+(?:\.\d+)?[万千百亿]?\s*(?:{units_regex})$', body.strip()):
+                content = f'{hdr.strip()}：{body.strip()}'
+            else:
+                content = body.strip()
+        else:
+            content = m.group("content").strip()
+        clean_content = re.sub(r'^(?:成功[：:]|物资[：:]|获得[：:]|装备[：:]|制造[：:]|缴获[：:]|发现[：:]|核算[：:]|清点[：:]|奖励[：:]|结算[：:]|分得[：:])', '', content).strip()
+        sub_items = [s.strip() for s in re.split(r'[，,、；;\s与和]+', clean_content) if s.strip()]
         for sub in sub_items:
             m_cross = re.match(r'^(?P<name>[^×*x\d]+?)[×*x]\s*(?P<num>\d+(?:\.\d+)?)(?:\s*(?P<unit>[\u4e00-\u9fa5]+))?$', sub)
             if m_cross:
@@ -326,7 +393,7 @@ def extract_heuristic_assets(text: str, chapter_index: float) -> List[Dict[str, 
                     raw_candidates.append((nm, qty, un, full_bracket))
                 continue
 
-            m_nu = re.match(rf'^(?P<name>.+?)(?P<num>\d+|[一二两三四五六七八九十百千万半]+)\s*(?P<unit>{units_regex})$', sub)
+            m_nu = re.match(rf'^(?P<name>.+?)(?<![\d.])(?P<num>\d+(?:\.\d+)?[万千百亿]?|[一二两三四五六七八九十百千万]+)\s*(?P<unit>{units_regex})$', sub)
             if m_nu:
                 nm = _clean_asset_name(m_nu.group("name"))
                 qty = parse_chinese_or_arabic_number(m_nu.group("num"))
@@ -345,14 +412,19 @@ def extract_heuristic_assets(text: str, chapter_index: float) -> List[Dict[str, 
                 continue
 
             nm = _clean_asset_name(sub)
-            if len(nm) >= 2 and not any(p in nm for p in ("完成", "就位", "确认", "正在", "开始")):
+            if len(nm) >= 2 and not any(p in nm for p in ("完成", "就位", "确认", "正在", "开始", "掩体", "仓库", "基地")):
                 un = "套" if any(u in nm for u in ("声呐", "雷达", "系统", "网络")) else ("门" if "炮" in nm else "个")
                 raw_candidates.append((nm, 1, un, full_bracket))
 
     # 2. 扫描自然文本中的 数量 + 单位 + 军工物资名称
     nums_regex = r"(?:\d+(?:\.\d+)?|[一二两三四五六七八九十百千万半]+|上百|上千|上万|百|千|万)"
     kws_regex = (
-        r"(?:速射炮|主炮|机炮|舰炮|近防炮|火炮|高射炮|迫击炮|加农炮|重炮|防空炮|火箭炮|"
+        # 1. 仙侠玄幻 / 修真
+        r"(?:筑基丹|聚气丹|破境丹|培元丹|还魂丹|洗髓丹|补血丹|灵丹|丹药|灵石|下品灵石|中品灵石|上品灵石|极品灵石|"
+        r"灵草|灵药|灵芝|人参|兽核|妖丹|灵晶|灵液|灵泉|灵髓|龙血|凤羽|玄铁|秘银|"
+        r"飞剑|灵剑|灵器|法宝|灵宝|乾坤袋|储物袋|空间戒指|阵旗|阵盘|功法|秘籍|心法|剑诀|拳谱|残卷|身法|禁术|传承|"
+        # 2. 科幻末世 / 军工装备
+        r"速射炮|主炮|机炮|舰炮|近防炮|火炮|高射炮|迫击炮|加农炮|重炮|防空炮|火箭炮|"
         r"鱼雷|导弹|火箭弹|深弹|穿甲弹|高爆弹|曳光弹|燃烧弹|子弹|炮弹|手雷|地雷|水雷|"
         r"步枪|突击步枪|冲锋枪|狙击步枪|机枪|手枪|猎枪|霰弹枪|火箭筒|发射巢|发射管|发射器|"
         r"防盾|军火箱|弹药箱|弹药|军火|装甲|骨甲|防弹衣|防弹插板|战术背心|夜视仪|消音器|瞄准镜|刺刀|枪塔|"
@@ -364,7 +436,14 @@ def extract_heuristic_assets(text: str, chapter_index: float) -> List[Dict[str, 
         r"大米|白面|面粉|小麦|糙米|粗粮|肉罐头|水果罐头|蔬菜罐头|鱼罐头|罐头|压缩饼干|单兵口粮|军粮|口粮|"
         r"纯净水|矿泉水|纯水|抗生素|消炎药|止痛药|急救包|重油|柴油|汽油|航空煤油|机油|润滑油|防冻液|"
         r"防弹钢|特种防弹钢|特种钢|钛合金|铝合金|钨钢|无缝钢管|钢材|钢板|"
-        r"重构点|进化核心|蓝图|改装蓝图|建造蓝图|设计图|图纸|能量核心|能量晶体|晶核)"
+        r"重构点|进化核心|蓝图|改装蓝图|建造蓝图|设计图|图纸|能量核心|能量晶体|晶核|"
+        # 3. 都市高武 / 资产商战 / 文娱
+        r"气血丹|气血仪|淬骨膏|精神药剂|凶兽肉|版权|独家版权|股权|股份|定金|违约金|现金|支票|存折|黑卡|豪车|别墅|写字楼|"
+        # 4. 女频年代 / 宅斗宫斗 / 世情
+        r"粮票|全国粮票|布票|肉票|工业券|油票|工分|地契|房契|田契|铺面|商铺|庄园|宅院|四合院|嫁妆|聘礼|份例|月钱|体己|"
+        r"银票|碎银|白银|黄金|银两|铜钱|文钱|云锦|绸缎|首饰|头面|珍珠|金条|"
+        # 5. 悬疑怪谈 / 民俗规则
+        r"诡器|诡物|规则残片|羊皮纸|蜡烛|寿衣|替死娃娃|镇魂铃|判官笔|绣花鞋|问米碗|封印物|染血的剪刀|阴阳镜|纸人|骨灰盒)"
     )
 
     natural_pattern = re.compile(
@@ -376,7 +455,7 @@ def extract_heuristic_assets(text: str, chapter_index: float) -> List[Dict[str, 
         "打捞", "缴获", "入库", "找到", "运回", "搜刮", "收获", "起出", "搬出", "运送", "加装",
         "清点出", "清点", "囤积", "储备", "开出", "封存着", "拥有", "配备", "装载", "采购",
         "进账", "得到", "采掘", "提炼", "生产", "改装完成", "捕获", "存有", "堆放着", "物资",
-        "战利品", "战备", "军械库", "仓库", "掩体", "车间", "补给", "起步", "亮剑", "上线", "改装完成", "完成改装", "总装"
+        "战利品", "战备", "军械库", "仓库", "掩体", "车间", "补给", "起步", "亮剑", "上线", "改装完成", "完成改装", "总装", "买下", "购置", "兑换", "继承", "分得", "受封", "受赏", "赐予", "赏赐", "炼制", "采摘", "签约", "过户", "划归", "私藏", "缴存", "变现", "到账"
     }
     enemy_verbs = {"击毁", "击沉", "打烂", "摧毁", "炸沉", "包抄", "呼啸而来", "截击", "逼近", "海盗船", "敌方"}
 

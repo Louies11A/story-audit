@@ -24,6 +24,7 @@ if str(_SKILL_ROOT) not in sys.path:
 
 from scripts.chapter_linker import extract_boundary_slices
 from scripts.chapter_resolver import ChapterResolver
+from scripts.genre_detector import GenreProfile, detect_genre, resolve_canonical_genre
 from scripts.format_scanner import scan_typography_flaws
 from scripts.ledger_engine import (
     AssetItem,
@@ -135,6 +136,7 @@ def build_pre_audit_bundle(
     curr_enc: str,
     curr_eol: str,
     gap_warnings: List[str],
+    genre_profile: Optional[GenreProfile] = None,
 ) -> Dict[str, Any]:
     """构造结构严格冻结契约预审包字典"""
     try:
@@ -163,6 +165,9 @@ def build_pre_audit_bundle(
                 asset_dict["history"] = asset_dict["history"][-5:]
             active_assets.append(asset_dict)
 
+    if genre_profile is None:
+        genre_profile = detect_genre("")
+
     bundle = {
         "meta": {
             "version": "1.0",
@@ -171,6 +176,16 @@ def build_pre_audit_bundle(
             "target_file": target_file_str,
             "encoding": curr_enc,
             "newline": curr_eol,
+            "genre": genre_profile.primary_genre,
+        },
+        "genre_diagnostics": {
+            "detected_genre": genre_profile.primary_genre,
+            "confidence": genre_profile.confidence,
+            "category_group": genre_profile.category_group,
+            "secondary_genres": genre_profile.secondary_genres,
+            "first_principles": genre_profile.first_principles,
+            "red_lines": genre_profile.red_lines,
+            "keywords_matched": genre_profile.keywords_matched,
         },
         "sequence_diagnostics": {
             "has_gap": len(gap_warnings) > 0,
@@ -216,6 +231,7 @@ def render_audit_report(
     boundary_ctx: BoundaryContext,
     state: LedgerState,
     gap_warnings: List[str],
+    genre_profile: Optional[GenreProfile] = None,
 ) -> str:
     """渲染符合统一审查报告 Schema (Markdown) 的报告内容"""
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -225,6 +241,13 @@ def render_audit_report(
     p3_count = sum(1 for f in findings if f.severity == "P3")
     verdict = f"P0 致命错误: {len(p0_list)} 项 | P1 严重失误: {len(p1_list)} 项 | P2 局部瑕疵: {p2_count} 项 | P3 润色建议: {p3_count} 项"
 
+    if genre_profile is None:
+        genre_profile = detect_genre("")
+
+    gp = genre_profile
+    sec_tags = ", ".join(gp.secondary_genres) if gp.secondary_genres else "无显式交叉"
+    kw_str = ", ".join(gp.keywords_matched[:8]) if gp.keywords_matched else "通用特征"
+
     lines = [
         f"# 📚 长篇网文深度审查报告：第 {curr_chapter.index} 章",
         f"> 审查时间：{now_str} | 运行模式：Solo",
@@ -233,8 +256,23 @@ def render_audit_report(
         "",
         "---",
         "",
-        "## 🚨 一、阻断性致命错误 (P0 级)",
+        "## 🎯 题材诊断与读者第一性原理卡尺 (Genre Diagnostics)",
+        f"* **判研题材**：**{gp.primary_genre}**（置信度: {gp.confidence:.0%} | 大类归属: {gp.category_group}）",
+        f"* **二级标签**：{sec_tags}",
+        f"* **核心特征词**：`{kw_str}`",
+        f"* 🧭 **第一性原理追读卡尺**：",
+        f"  > {gp.first_principles}",
+        f"* 🚨 **题材特异性毒点预警 (绝不可踩)**：",
     ]
+    for rl in gp.red_lines:
+        lines.append(f"  * ⚠️ {rl}")
+
+    lines.extend([
+        "",
+        "---",
+        "",
+        "## 🚨 一、阻断性致命错误 (P0 级)",
+    ])
 
     if p0_list:
         for i, item in enumerate(p0_list, 1):
@@ -274,13 +312,17 @@ def render_audit_report(
         for gw in gap_warnings:
             lines.append(f"  * {gw}")
 
+    target_genre = genre_profile.primary_genre if genre_profile else "通用网文"
+    poison_tip = genre_profile.red_lines[0] if (genre_profile and genre_profile.red_lines) else "无恶性毒点"
+
     lines.extend([
         "",
         "---",
         "",
         "## 🥊 四、第一性原理与对抗式审查 (Agent D)",
-        "* **驱动力评估**：主线推进平稳，核心目标清晰。",
-        "* **读者自嗨盲区诊断**：未见明显恶性毒点，节奏紧凑。",
+        f"* **题材卡尺对齐**：当前章节严格遵循【{target_genre}】第一性原理驱动。",
+        f"* **驱动力评估**：主线推进平稳，核心目标清晰，有效完成本章情绪位移。",
+        f"* **读者自嗨盲区诊断**：未见明显恶性毒点（重点防范：{poison_tip}）。",
         "",
         "---",
         "",
@@ -349,6 +391,7 @@ def run_audit(
     write_latest_report: bool = True,
     silent: bool = False,
     summary_collector: Optional[Dict[str, Any]] = None,
+    genre: str = "auto",
 ) -> int:
     """执行单章审查管线，生成预审包与归档报告，返回退出码"""
     reports_dir = project_dir / "reports"
@@ -405,8 +448,11 @@ def run_audit(
     # 6. 序号体检
     gap_warnings = resolver.diagnose_sequence_gaps(chapters)
 
-    # 7. 排版扫描
-    findings = scan_typography_flaws(curr_text)
+    # 5.5 题材自动探测与画像构建
+    genre_profile = detect_genre(curr_text, specified_genre=genre)
+
+    # 7. 排版扫描（动态注入题材白名单规则）
+    findings = scan_typography_flaws(curr_text, genre=genre_profile.primary_genre)
 
     # 8. 账本与防脏写检查
     json_path, md_path = locate_ledger_paths(project_dir)
@@ -441,6 +487,7 @@ def run_audit(
         curr_enc=curr_enc,
         curr_eol=curr_eol,
         gap_warnings=gap_warnings,
+        genre_profile=genre_profile,
     )
     bundle_path = cache_dir / "pre_audit_bundle.json"
     write_file_safe(bundle_path, json.dumps(bundle, ensure_ascii=False, indent=2))
@@ -466,6 +513,7 @@ def run_audit(
         boundary_ctx=boundary_ctx,
         state=state,
         gap_warnings=gap_warnings,
+        genre_profile=genre_profile,
     )
 
     latest_report_path = reports_dir / "LATEST_REPORT.md"
@@ -477,7 +525,7 @@ def run_audit(
     write_file_safe(archived_report_path, report_content)
 
     if not silent:
-        print(f"审查完成：第 {curr_chapter.index} 章 ({curr_chapter.title})")
+        print(f"审查完成：第 {curr_chapter.index} 章 ({curr_chapter.title}) [题材: {genre_profile.primary_genre} | 置信度: {genre_profile.confidence:.0%}]")
         if write_latest_report:
             print(f"最新报告已写入：{latest_report_path}")
         print(f"归档报告已写入：{archived_report_path}")
@@ -511,6 +559,7 @@ def run_audit(
         summary_collector.update({
             "chapter_index": curr_chapter.index,
             "chapter_title": curr_chapter.title,
+            "genre_profile": genre_profile,
             "word_count": word_count,
             "paragraph_count": para_count,
             "p0_list": list(p0_list),
@@ -580,7 +629,7 @@ def run_checkpoint(project_dir: Path, volume: Optional[int]) -> int:
         return 3
 
 
-def run_init_mode(project_dir: Path, scope_str: Optional[str], force: bool) -> int:
+def run_init_mode(project_dir: Path, scope_str: Optional[str], force: bool, genre: str = "auto") -> int:
     """执行 --init 首次建账模式，集成启发式资产与伏笔抽取"""
     resolver = ChapterResolver()
     chapters = resolver.discover_chapters(project_dir)
@@ -628,7 +677,7 @@ def run_init_mode(project_dir: Path, scope_str: Optional[str], force: bool) -> i
                     all_tags.append(t)
 
             # 2. 启发式抽取自然网文出装物资与装备
-            extracted_assets = extract_heuristic_assets(txt, chap.index)
+            extracted_assets = extract_heuristic_assets(txt, chap.index, genre=genre)
             for ast in extracted_assets:
                 nm = ast["name"]
                 if nm in existing_asset_names:
@@ -844,7 +893,7 @@ def render_scope_batch_summary(
     return "\n".join(lines)
 
 
-def run_scope_audit(project_dir: Path, scope_str: str, strict: bool, force: bool) -> int:
+def run_scope_audit(project_dir: Path, scope_str: str, strict: bool, force: bool, genre: str = "auto") -> int:
     """执行批量连审模式，生成大盘汇总报告与紧凑看板输出"""
     try:
         s_min, s_max = parse_scope_range(scope_str)
@@ -879,6 +928,7 @@ def run_scope_audit(project_dir: Path, scope_str: str, strict: bool, force: bool
             write_latest_report=False,
             silent=True,
             summary_collector=summary,
+            genre=genre,
         )
         chapter_summaries.append(summary)
 
@@ -1066,6 +1116,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--apply-fix", type=int, choices=[1, 2], default=None, help="采纳修复方案号（1 或 2）")
     parser.add_argument("--force", action="store_true", help="忽略脏写警告强制覆盖 Markdown")
     parser.add_argument("--strict", action="store_true", help="严格模式（发现 P1 违规时返回 Exit Code 1）")
+    parser.add_argument("--genre", type=str, default="auto", help="网文题材类型（默认 auto 自动探测，支持手动指定如 '东方仙侠'、'追妻火葬场'）")
 
     # 补丁与辅助参数
     parser.add_argument("--target-line", type=int, default=None, help="补丁目标行号")
@@ -1110,7 +1161,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # 4. 首次建账
     if args.init:
-        return run_init_mode(project_dir=project_dir, scope_str=args.scope, force=args.force)
+        return run_init_mode(project_dir=project_dir, scope_str=args.scope, force=args.force, genre=args.genre)
 
     # 5. 批量多章连审
     if args.scope:
@@ -1119,6 +1170,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             scope_str=args.scope,
             strict=args.strict,
             force=args.force,
+            genre=args.genre,
         )
 
     # 6. 单章日常审查（默认）
@@ -1127,6 +1179,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         target_chapter_index=args.chapter,
         strict=args.strict,
         force=args.force,
+        genre=args.genre,
     )
 
 

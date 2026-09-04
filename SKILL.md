@@ -159,7 +159,7 @@ triggers:
 
 ### Step 1: 解析指令与路由判断
 根据用户自然语言或命令行参数，确定执行模式：
-- **单章深度审查**（默认最新章或指定章）：`python scripts/story_audit.py --chapter N`
+- **单章深度审查**（默认最新章或指定章）：`python scripts/story_audit.py --chapter N [--genre auto|题材名]`
 - **批量多章连审**：`python scripts/story_audit.py --scope N-M`
 - **首次全书建账**：`python scripts/story_audit.py --init --scope 1-N`
 - **人工账本反向同步**：`python scripts/story_audit.py --sync-from-md`
@@ -204,6 +204,7 @@ triggers:
 | `references/short-sentence-style.md` | 移动端大黑块判定、行数保持白名单掩码契约、AI 连词禁词表、网文短句美学重构三部曲 | Agent C |
 | `references/first-principles.md` | 读者追读第一性原理、4 维量化判定卡尺（危机/信息差/钩子/反应）、毒舌老书虫对抗式审查指南 | Agent D |
 | `references/report-template.md` | P0~P3 分级报告统一 Markdown Schema、双方案短句修复 PatchSpec 契约、归档目录树 | 主协调器 |
+| `references/genre-catalog.md` | 42 题材全景矩阵（长篇 32 + 短篇 10）、第一性原理追读卡尺、核心爽点机制与绝不可触碰毒点红线 | 主协调器 / 全专员 |
 
 ---
 
@@ -218,4 +219,6 @@ triggers:
 5. `scripts/format_scanner.py`：行数保持白名单掩码、大黑块与长难句检测、AI 连词扫描；
 6. `scripts/chapter_linker.py`：跨章前后 300 字提取、显式 POV 转场识别与闪回隔离标注；
 7. `scripts/safe_writer.py`：三行锚点匹配、局部邻域消歧与安全原子回写；
-8. `scripts/types.py`：强类型数据模型定义（ChapterItem, FormatFinding, BoundaryContext, PatchSpec）。
+8. `scripts/types.py`：强类型数据模型定义（ChapterItem, FormatFinding, BoundaryContext, PatchSpec）；
+9. `scripts/genre_detector.py`：全题材多维度自动探测与画像引擎（42 题材特征指纹、置信度打分算法、二级标签归属与第一性原理卡尺装配）；
+10. `scripts/genre_data.json`：42 题材结构化特征指纹与毒点卡尺数据源。

@@ -497,5 +497,77 @@ class TestStoryAuditCLI(unittest.TestCase):
         self.assertTrue(arch_2.exists(), "单章归档报告第002章必须保留")
 
 
+
+
+class TestStoryAuditCliGenreIntegration(unittest.TestCase):
+    """测试 CLI --genre 参数传递、题材诊断画像与报告渲染集成"""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.project_dir = Path(self.tmp_dir.name)
+
+        # 写入包含都市高武特征的章节
+        chap_file = self.project_dir / "第001章_气血初显.txt"
+        content = (
+            "武道高考体测室内，高三学生排队走上气血仪。\n"
+            "陈默拳力测试轰然爆发，气血值飙升突破准武者门槛，班主任震惊地瞪大了眼睛！\n"
+            "【武道体测属性】\n"
+            "- 气血值：145卡\n"
+            "- 卡路里：3100\n"
+            "- 武道等级：准武者一级\n"
+            "他收回拳头，平静地走出训练馆。\n"
+        )
+        write_file_safe(chap_file, content)
+
+    def tearDown(self):
+        self.tmp_dir.cleanup()
+
+    def test_cli_genre_auto_detection_and_diagnostics(self):
+        """测试 CLI 默认 auto 模式下自动识别题材并嵌入预审包和审查报告"""
+        ret = main(["--project", str(self.project_dir), "--chapter", "1"])
+        self.assertEqual(ret, 0)
+
+        # 1. 验证 pre_audit_bundle.json 中的题材诊断
+        bundle_path = self.project_dir / "reports" / ".cache" / "pre_audit_bundle.json"
+        self.assertTrue(bundle_path.exists())
+        with open(bundle_path, "r", encoding="utf-8") as f:
+            bundle = json.load(f)
+
+        self.assertIn("genre_diagnostics", bundle)
+        g_diag = bundle["genre_diagnostics"]
+        self.assertEqual(g_diag["detected_genre"], "都市高武")
+        self.assertGreater(g_diag["confidence"], 0.2)
+        self.assertEqual(g_diag["category_group"], "都市异能")
+        self.assertTrue(len(g_diag["first_principles"]) > 0)
+        self.assertTrue(len(g_diag["red_lines"]) > 0)
+        self.assertEqual(bundle["meta"]["genre"], "都市高武")
+
+        # 2. 验证 LATEST_REPORT.md 中的题材诊断卡尺渲染
+        report_path = self.project_dir / "reports" / "LATEST_REPORT.md"
+        self.assertTrue(report_path.exists())
+        rep_txt, _, _ = read_file_safe(report_path)
+        self.assertIn("🎯 题材诊断与读者第一性原理卡尺", rep_txt)
+        self.assertIn("都市高武", rep_txt)
+        self.assertIn("第一性原理追读卡尺", rep_txt)
+        self.assertIn("绝不可踩", rep_txt)
+        self.assertIn("Agent D", rep_txt)
+
+    def test_cli_genre_manual_override(self):
+        """测试 CLI 显式传递 --genre 手动指定题材并装配专属卡尺"""
+        ret = main(["--project", str(self.project_dir), "--chapter", "1", "--genre", "追妻火葬场"])
+        self.assertEqual(ret, 0)
+
+        bundle_path = self.project_dir / "reports" / ".cache" / "pre_audit_bundle.json"
+        with open(bundle_path, "r", encoding="utf-8") as f:
+            bundle = json.load(f)
+
+        self.assertEqual(bundle["genre_diagnostics"]["detected_genre"], "追妻火葬场")
+        self.assertEqual(bundle["genre_diagnostics"]["confidence"], 1.0)
+        self.assertEqual(bundle["genre_diagnostics"]["category_group"], "短篇爆发")
+
+        report_path = self.project_dir / "reports" / "LATEST_REPORT.md"
+        rep_txt, _, _ = read_file_safe(report_path)
+        self.assertIn("追妻火葬场", rep_txt)
+
 if __name__ == "__main__":
     unittest.main()
