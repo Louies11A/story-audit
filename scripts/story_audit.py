@@ -1,19 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-story_audit.py: 长篇网文深度审查 CLI 总入口、预审包构建与退出码管线
+story_audit.py: 长篇网文深度审查核心调度管线与纯模块化 Python API
+
+架构铁律：本项目采用纯模块化 Python API 驱动设计，不提供亦不涉及任何 CLI 命令行接口。
+后续所有功能开发与生态扩展均严格围绕 Python API、强类型数据契约与 Agent 工具函数展开，坚决不涉及 CLI。
 
 串联安全 I/O、智能章节匹配器、排版扫描器、双轨账本状态机、跨章接缝器与安全回写器。
 严格遵循 Python 3.8+ 标准库与零外部依赖约定。
 """
 
-import argparse
 import json
 import os
 import re
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 # 确保技能根目录在 sys.path 中，支持 python scripts/story_audit.py 直接独立调用
 import sys
@@ -761,7 +763,7 @@ def run_sync_from_md(project_dir: Path) -> int:
         return 3
 
 
-def run_checkpoint(project_dir: Path, volume: Optional[int]) -> int:
+def run_checkpoint(project_dir: Path, volume: Optional[int], force: bool = False) -> int:
     """执行 --checkpoint --volume 分卷封账结转管线"""
     if volume is None:
         print("[错误] --checkpoint 模式必须配对指定 --volume <卷号>！", file=sys.stderr)
@@ -1348,105 +1350,268 @@ def run_apply_fix(
         return 3
 
 
-def main(argv: Optional[List[str]] = None) -> int:
-    if sys.platform == 'win32':
+# ==============================================================================
+# 纯模块化 Python API 导出层 (Pure Python API Layer)
+# 架构铁律：不提供亦不涉及任何 CLI 命令行接口，全功能严格通过 Python API 交付。
+# ==============================================================================
+
+def audit_chapter(
+    project_dir: Union[str, Path] = ".",
+    chapter_index: Optional[float] = None,
+    platform: str = "generic",
+    genre: str = "auto",
+    mode: str = "auto",
+    strict: bool = False,
+    force: bool = False,
+    author_memory: bool = False,
+) -> Tuple[int, Path]:
+    """单章深度审查纯 Python API
+
+    Args:
+        project_dir: 小说项目根目录（Path 或 str，默认当前目录）
+        chapter_index: 审查目标章号（浮点或整数，默认 None 表示最新章）
+        platform: 目标发布平台卡尺 (fanqie/qidian/zhihu/generic，默认 generic)
+        genre: 网文题材类型（默认 auto 自动探测）
+        mode: 审查执行模式 (auto/full/lean/solo，默认 auto)
+        strict: 严格模式（发现 P1 违规时返回状态码 1）
+        force: 忽略脏写警告强制覆盖
+        author_memory: 是否联动作者记忆状态机
+
+    Returns:
+        Tuple[int, Path]: (状态码, 报告路径)。成功或发现缺陷时返回具体归档报告路径，失败未生成报告时返回空路径 Path("")
+    """
+    p_dir = Path(project_dir).resolve()
+    summary: Dict[str, Any] = {}
+    exit_code = run_audit(
+        project_dir=p_dir,
+        target_chapter_index=chapter_index,
+        strict=strict,
+        force=force,
+        write_latest_report=True,
+        silent=False,
+        summary_collector=summary,
+        genre=genre,
+        mode=mode,
+        platform=platform,
+        use_author_memory=author_memory,
+    )
+    report_path = summary.get("archived_report_path")
+    if report_path is None or not Path(report_path).exists():
+        latest = p_dir / "reports" / "LATEST_REPORT.md"
+        if latest.exists() and exit_code in (0, 1, 2):
+            report_path = latest
+        else:
+            report_path = report_path or Path("")
+    return exit_code, Path(report_path)
+
+
+def audit_scope(
+    project_dir: Union[str, Path] = ".",
+    scope_str: str = "",
+    platform: str = "generic",
+    genre: str = "auto",
+    mode: str = "auto",
+    strict: bool = False,
+    force: bool = False,
+    author_memory: bool = False,
+) -> Tuple[int, Path]:
+    """批量多章连审纯 Python API
+
+    Args:
+        project_dir: 小说项目根目录（Path 或 str，默认当前目录）
+        scope_str: 批量范围（如 "1-2"、"31-35"）
+        platform: 目标发布平台卡尺 (fanqie/qidian/zhihu/generic，默认 generic)
+        genre: 网文题材类型（默认 auto 自动探测）
+        mode: 审查执行模式 (auto/full/lean/solo，默认 auto)
+        strict: 严格模式（发现 P1 违规时返回状态码 1）
+        force: 忽略脏写警告强制覆盖
+        author_memory: 是否联动作者记忆状态机
+
+    Returns:
+        Tuple[int, Path]: (状态码, 大盘汇总报告路径)
+    """
+    p_dir = Path(project_dir).resolve()
+    exit_code = run_scope_audit(
+        project_dir=p_dir,
+        scope_str=scope_str,
+        strict=strict,
+        force=force,
+        genre=genre,
+        mode=mode,
+        platform=platform,
+        use_author_memory=author_memory,
+    )
+    scope_clean = scope_str.replace(" ", "")
+    scope_summary_path = p_dir / "reports" / f"BATCH_SUMMARY_SCOPE_{scope_clean}.md"
+    if not scope_summary_path.exists():
+        latest = p_dir / "reports" / "LATEST_REPORT.md"
+        if latest.exists() and exit_code in (0, 1, 2):
+            scope_summary_path = latest
+        else:
+            scope_summary_path = Path("")
+    return exit_code, scope_summary_path
+
+
+def init_ledger(
+    project_dir: Union[str, Path] = ".",
+    scope_str: Optional[str] = None,
+    force: bool = False,
+    genre: str = "auto",
+) -> Tuple[int, Path]:
+    """首次全书/分卷建账纯 Python API
+
+    Args:
+        project_dir: 小说项目根目录（Path 或 str，默认当前目录）
+        scope_str: 扫描章节范围（如 "1-30"，可选）
+        force: 忽略脏写拦截强制覆盖
+        genre: 网文题材类型（默认 auto 自动探测）
+
+    Returns:
+        Tuple[int, Path]: (状态码, 建账盘点报告路径)
+    """
+    p_dir = Path(project_dir).resolve()
+    exit_code = run_init_mode(
+        project_dir=p_dir,
+        scope_str=scope_str,
+        force=force,
+        genre=genre,
+    )
+    if exit_code != 0:
+        return exit_code, Path("")
+
+    resolver = ChapterResolver()
+    chapters = resolver.discover_chapters(p_dir)
+    if scope_str:
         try:
-            if hasattr(sys.stdout, 'reconfigure') and sys.stdout.encoding and sys.stdout.encoding.lower() not in ('utf-8', 'utf8'):
-                sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-            if hasattr(sys.stderr, 'reconfigure') and sys.stderr.encoding and sys.stderr.encoding.lower() not in ('utf-8', 'utf8'):
-                sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+            s_min, s_max = parse_scope_range(scope_str)
+            target_chapters = [c for c in chapters if s_min <= c.index <= s_max]
         except Exception:
-            pass
-    """CLI 主入口函数"""
-    parser = argparse.ArgumentParser(
-        prog="story_audit",
-        description="长篇网文深度审查工具箱与流水线管线",
+            target_chapters = chapters
+    else:
+        target_chapters = chapters
+
+    if target_chapters:
+        s_fmt = str(int(target_chapters[0].index)).zfill(3)
+        e_fmt = str(int(target_chapters[-1].index)).zfill(3)
+        report_file = p_dir / "reports" / "阶段封账与里程碑" / f"初始建账盘点报告_第{s_fmt}-{e_fmt}章.md"
+        return exit_code, report_file
+
+    return exit_code, p_dir / "reports"
+
+
+def checkpoint_volume(
+    project_dir: Union[str, Path] = ".",
+    volume: Optional[int] = None,
+    force: bool = False,
+) -> int:
+    """分卷封账结转纯 Python API
+
+    Args:
+        project_dir: 小说项目根目录（Path 或 str，默认当前目录）
+        volume: 卷号（整数，必填）
+        force: 强制标志（保留兼容）
+
+    Returns:
+        int: 状态码 (0 成功, 3 失败)
+    """
+    p_dir = Path(project_dir).resolve()
+    return run_checkpoint(project_dir=p_dir, volume=volume, force=force)
+
+
+def sync_ledger_from_md(
+    project_dir: Union[str, Path] = ".",
+    force: bool = False,
+) -> int:
+    """从 Markdown 账本反向同步增量回 JSON 纯 Python API
+
+    Args:
+        project_dir: 小说项目根目录（Path 或 str，默认当前目录）
+        force: 强制标志（保留兼容）
+
+    Returns:
+        int: 状态码 (0 成功, 3 失败)
+    """
+    p_dir = Path(project_dir).resolve()
+    return run_sync_from_md(project_dir=p_dir)
+
+
+def apply_fix(
+    project_dir: Union[str, Path] = ".",
+    chapter_index: Optional[float] = None,
+    patch: Optional[Union[PatchSpec, Dict[str, Any]]] = None,
+    patch_file: Optional[Union[str, Path]] = None,
+    target_line: Optional[int] = None,
+    old_text: Optional[str] = None,
+    new_text: Optional[str] = None,
+    context_before: str = "",
+    context_after: str = "",
+) -> int:
+    """采纳修复方案并安全回写正文纯 Python API
+
+    Args:
+        project_dir: 小说项目根目录（Path 或 str，默认当前目录）
+        chapter_index: 目标章节号
+        patch: PatchSpec 实例或 dict 补丁对象
+        patch_file: 补丁 JSON 文件路径
+        target_line: 目标行号
+        old_text: 待替换旧句
+        new_text: 替换后新句
+        context_before: 前一句上下文锚点
+        context_after: 后一句上下文锚点
+
+    Returns:
+        int: 状态码 (0 成功, 3 失败)
+    """
+    p_dir = Path(project_dir).resolve()
+    if patch is not None:
+        if isinstance(patch, PatchSpec):
+            target_line = patch.target_line
+            old_text = patch.old_text
+            new_text = patch.new_text
+            context_before = patch.context_before
+            context_after = patch.context_after
+        elif isinstance(patch, dict):
+            target_line = int(patch.get("target_line", 0))
+            old_text = str(patch.get("old_text", ""))
+            new_text = str(patch.get("new_text", ""))
+            context_before = str(patch.get("context_before", ""))
+            context_after = str(patch.get("context_after", ""))
+
+    p_file_str = str(patch_file) if patch_file is not None else None
+    return run_apply_fix(
+        project_dir=p_dir,
+        chapter_idx=chapter_index,
+        target_line=target_line,
+        old_text=old_text,
+        new_text=new_text,
+        context_before=context_before,
+        context_after=context_after,
+        patch_file=p_file_str,
     )
-    parser.add_argument("--project", default=".", help="小说项目根目录（默认 .）")
-    parser.add_argument("--chapter", type=float, default=None, help="审查目标章号（浮点或整数，默认最新章）")
-    parser.add_argument("--scope", type=str, default=None, help="批量范围（如 31-35 或 1-30）")
-    parser.add_argument("--init", action="store_true", help="首次建账模式（流式过账）")
-    parser.add_argument("--checkpoint", action="store_true", help="分卷封账模式")
-    parser.add_argument("--volume", type=int, default=None, help="卷号（配对 --checkpoint）")
-    parser.add_argument("--sync-from-md", action="store_true", help="从 设定/资源账本.md 反向同步增量回 JSON")
-    parser.add_argument("--apply-fix", type=int, choices=[1, 2], default=None, help="采纳修复方案号（1 或 2）")
-    parser.add_argument("--force", action="store_true", help="忽略脏写警告强制覆盖 Markdown")
-    parser.add_argument("--strict", action="store_true", help="严格模式（发现 P1 违规时返回 Exit Code 1）")
-    parser.add_argument("--genre", type=str, default="auto", help="网文题材类型（默认 auto 自动探测，支持手动指定如 '东方仙侠'、'追妻火葬场'）")
-    parser.add_argument("--mode", choices=["auto", "full", "lean", "solo"], default="auto", help="审查运行模式 (full/lean/solo，默认 auto 自适应降级)")
-    parser.add_argument("--platform", choices=list(VALID_PLATFORMS), default="generic", help="目标发布平台质量卡尺 (fanqie/qidian/zhihu/generic，默认 generic)")
-    parser.add_argument("--author-memory", action="store_true", help="联动作者记忆状态机 (设定/_author-memory-state.json)")
-
-    # 补丁与辅助参数
-    parser.add_argument("--target-line", type=int, default=None, help="补丁目标行号")
-    parser.add_argument("--old-text", type=str, default=None, help="待替换原句")
-    parser.add_argument("--new-text", type=str, default=None, help="替换后新句")
-    parser.add_argument("--context-before", type=str, default="", help="前一句上下文锚点")
-    parser.add_argument("--context-after", type=str, default="", help="后一句上下文锚点")
-    parser.add_argument("--patch-file", type=str, default=None, help="补丁 JSON 文件路径")
-
-    try:
-        args = parser.parse_args(argv)
-    except SystemExit as e:
-        # argparse 解析失败通常触发 SystemExit(2)，转换为系统错误 3
-        return 3 if e.code != 0 else 0
-
-    project_dir = Path(args.project).resolve()
-    if not project_dir.exists():
-        print(f"[错误] 项目根目录不存在: {project_dir}", file=sys.stderr)
-        return 3
-
-    # 分发执行管线
-    # 1. 采纳修复回写
-    if args.apply_fix is not None:
-        return run_apply_fix(
-            project_dir=project_dir,
-            chapter_idx=args.chapter,
-            target_line=args.target_line,
-            old_text=args.old_text,
-            new_text=args.new_text,
-            context_before=args.context_before,
-            context_after=args.context_after,
-            patch_file=args.patch_file,
-        )
-
-    # 2. 反向同步
-    if args.sync_from_md:
-        return run_sync_from_md(project_dir=project_dir)
-
-    # 3. 分卷封账
-    if args.checkpoint:
-        return run_checkpoint(project_dir=project_dir, volume=args.volume)
-
-    # 4. 首次建账
-    if args.init:
-        return run_init_mode(project_dir=project_dir, scope_str=args.scope, force=args.force, genre=args.genre)
-
-    # 5. 批量多章连审
-    if args.scope:
-        return run_scope_audit(
-            project_dir=project_dir,
-            scope_str=args.scope,
-            strict=args.strict,
-            force=args.force,
-            genre=args.genre,
-            mode=args.mode,
-            platform=args.platform,
-            use_author_memory=args.author_memory,
-        )
-
-    # 6. 单章日常审查（默认）
-    return run_audit(
-        project_dir=project_dir,
-        target_chapter_index=args.chapter,
-        strict=args.strict,
-        force=args.force,
-        genre=args.genre,
-        mode=args.mode,
-        platform=args.platform,
-        use_author_memory=args.author_memory,
-    )
 
 
-if __name__ == "__main__":
-    sys.exit(main())
+__all__ = [
+    # 核心纯 Python API
+    "audit_chapter",
+    "audit_scope",
+    "init_ledger",
+    "checkpoint_volume",
+    "sync_ledger_from_md",
+    "apply_fix",
+    # 底层执行管线与别名兼容
+    "run_audit",
+    "run_scope_audit",
+    "run_checkpoint",
+    "run_sync_from_md",
+    "run_init_mode",
+    "run_apply_fix",
+    # 预审包与报告生成
+    "build_pre_audit_bundle",
+    "render_audit_report",
+    "render_scope_batch_summary",
+    "locate_ledger_paths",
+    "load_ledger_state",
+    "get_report_archive_path",
+    "parse_scope_range",
+    "detect_violations_in_text",
+]

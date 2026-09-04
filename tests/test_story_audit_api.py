@@ -1,26 +1,28 @@
 # -*- coding: utf-8 -*-
 """
-tests/test_story_audit_cli.py: CLI 总入口、预审包构建与退出码管线单元测试
+tests/test_story_audit_api.py: 纯模块化 Python API 调度管线、预审包构建与状态码契约单元测试
+
+架构铁律：本项目采用纯模块化 Python API 驱动设计，不提供亦不涉及任何 CLI 命令行接口。
+后续所有功能开发与生态扩展均严格围绕 Python API、强类型数据契约与 Agent 工具函数展开，坚决不涉及 CLI。
 
 测试覆盖：
-1. 参数解析契约 (--project, --chapter, --scope, --init, --checkpoint, --volume, --sync-from-md, --apply-fix, --force, --strict)
+1. Python API 参数契约 (project_dir, chapter_index, scope_str, force, strict, genre, mode, platform)
 2. 预审包标准结构生成 (reports/.cache/pre_audit_bundle.json 冻结字段与类型契约)
 3. 报告归档与生成 (reports/LATEST_REPORT.md 与 reports/单章审查/001-100章/第XXX章_审查报告.md)
-4. 标准退出状态码映射：
-   - Exit Code 0: 绿灯（全通或仅 P2/P3，或有 P1 但未开 --strict）
-   - Exit Code 1: 警告（发现 P1 且开启 --strict）
-   - Exit Code 2: 阻断（发现 P0 致命断裂）
-   - Exit Code 3: 系统错误（参数不合法、文件找不到、防脏写未加 --force、回写消歧失败等）
+4. 标准状态码映射：
+   - Status Code 0: 绿灯（全通或仅 P2/P3，或有 P1 但未开 strict）
+   - Status Code 1: 警告（发现 P1 且开启 strict）
+   - Status Code 2: 阻断（发现 P0 致命断裂）
+   - Status Code 3: 系统错误（参数不合法、文件找不到、防脏写未加 force、回写消歧失败等）
 5. 辅助模式与安全回写管线：
-   - --sync-from-md 反向增量同步
-   - --checkpoint --volume 分卷封账结转
-   - --init 首次建账模式
-   - --apply-fix 安全回写与消歧防护
+   - sync_ledger_from_md 反向增量同步
+   - checkpoint_volume 分卷封账结转
+   - init_ledger 首次建账模式
+   - apply_fix 安全回写与消歧防护
 """
 
 import json
 import os
-import subprocess
 import sys
 import tempfile
 import time
@@ -30,7 +32,12 @@ from pathlib import Path
 from scripts.safe_io import write_file_safe, read_file_safe
 from scripts.ledger_engine import LedgerState, AssetItem, save_ledger_state
 from scripts.story_audit import (
-    main,
+    audit_chapter,
+    audit_scope,
+    init_ledger,
+    checkpoint_volume,
+    sync_ledger_from_md,
+    apply_fix,
     build_pre_audit_bundle,
     run_audit,
     get_report_archive_path,
@@ -39,8 +46,8 @@ from scripts.story_audit import (
 )
 
 
-class TestStoryAuditCLI(unittest.TestCase):
-    """CLI 执行管线与退出码测试套件"""
+class TestStoryAuditAPI(unittest.TestCase):
+    """纯 Python API 执行管线与状态码测试套件"""
 
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -97,7 +104,7 @@ class TestStoryAuditCLI(unittest.TestCase):
 
     def test_default_audit_latest_chapter_success(self):
         """默认模式：审查最新章节（第2章），无严重违规返回 0，生成预审包与报告"""
-        exit_code = main(["--project", str(self.project_dir)])
+        exit_code, report_path = audit_chapter(self.project_dir)
         self.assertEqual(exit_code, 0)
 
         # 检查预审包
@@ -145,7 +152,7 @@ class TestStoryAuditCLI(unittest.TestCase):
 
     def test_audit_specific_chapter(self):
         """指定 --chapter 参数审查第 1 章"""
-        exit_code = main(["--project", str(self.project_dir), "--chapter", "1"])
+        exit_code, report_path = audit_chapter(self.project_dir, chapter_index=1)
         self.assertEqual(exit_code, 0)
 
         bundle_path = self.project_dir / "reports" / ".cache" / "pre_audit_bundle.json"
@@ -164,7 +171,7 @@ class TestStoryAuditCLI(unittest.TestCase):
         chap3_path = self.drafts_dir / "第003章_登高感慨.md"
         write_file_safe(chap3_path, p2_content)
 
-        exit_code = main(["--project", str(self.project_dir), "--chapter", "3"])
+        exit_code, report_path = audit_chapter(self.project_dir, chapter_index=3)
         self.assertEqual(exit_code, 0)
 
         bundle_path = self.project_dir / "reports" / ".cache" / "pre_audit_bundle.json"
@@ -183,11 +190,11 @@ class TestStoryAuditCLI(unittest.TestCase):
         write_file_safe(chap4_path, p1_content)
 
         # 未开启 --strict -> 0
-        code_loose = main(["--project", str(self.project_dir), "--chapter", "4"])
+        code_loose, _ = audit_chapter(self.project_dir, chapter_index=4, strict=False)
         self.assertEqual(code_loose, 0)
 
         # 开启 --strict -> 1
-        code_strict = main(["--project", str(self.project_dir), "--chapter", "4", "--strict"])
+        code_strict, _ = audit_chapter(self.project_dir, chapter_index=4, strict=True)
         self.assertEqual(code_strict, 1)
 
     def test_exit_code_p0_blocked_returns_2(self):
@@ -201,17 +208,17 @@ class TestStoryAuditCLI(unittest.TestCase):
         write_file_safe(chap5_path, p0_content)
 
         # 即使未加 --strict，P0 必须阻断并返回 2
-        exit_code = main(["--project", str(self.project_dir), "--chapter", "5"])
+        exit_code, _ = audit_chapter(self.project_dir, chapter_index=5)
         self.assertEqual(exit_code, 2)
 
     def test_exit_code_file_not_found_returns_3(self):
         """请求不存在的章节号，返回 Exit Code 3"""
-        exit_code = main(["--project", str(self.project_dir), "--chapter", "999"])
+        exit_code, _ = audit_chapter(self.project_dir, chapter_index=999)
         self.assertEqual(exit_code, 3)
 
     def test_exit_code_invalid_params_returns_3(self):
         """非法参数（如 checkpoint 缺少 volume）返回 Exit Code 3"""
-        exit_code = main(["--project", str(self.project_dir), "--checkpoint"])
+        exit_code = checkpoint_volume(self.project_dir, volume=None)
         self.assertEqual(exit_code, 3)
 
     def test_dirty_state_blocking_and_force_override(self):
@@ -224,11 +231,11 @@ class TestStoryAuditCLI(unittest.TestCase):
         os.utime(self.ledger_md, (new_mtime, new_mtime))
 
         # 未加 --force：触发防脏写阻断，Exit Code 3
-        exit_code = main(["--project", str(self.project_dir), "--chapter", "2"])
+        exit_code, _ = audit_chapter(self.project_dir, chapter_index=2, force=False)
         self.assertEqual(exit_code, 3)
 
         # 加上 --force：忽略警告，Exit Code 0
-        exit_code_force = main(["--project", str(self.project_dir), "--chapter", "2", "--force"])
+        exit_code_force, _ = audit_chapter(self.project_dir, chapter_index=2, force=True)
         self.assertEqual(exit_code_force, 0)
 
     def test_sync_from_md_pipeline(self):
@@ -242,7 +249,7 @@ class TestStoryAuditCLI(unittest.TestCase):
         )
         write_file_safe(self.ledger_md, extra_md)
 
-        exit_code = main(["--project", str(self.project_dir), "--sync-from-md"])
+        exit_code = sync_ledger_from_md(self.project_dir)
         self.assertEqual(exit_code, 0)
 
         state_dict = json.loads(self.ledger_json.read_text(encoding="utf-8"))
@@ -251,7 +258,7 @@ class TestStoryAuditCLI(unittest.TestCase):
 
     def test_checkpoint_volume_pipeline(self):
         """--checkpoint --volume 分卷封账结转测试"""
-        exit_code = main(["--project", str(self.project_dir), "--checkpoint", "--volume", "1"])
+        exit_code = checkpoint_volume(self.project_dir, volume=1)
         self.assertEqual(exit_code, 0)
 
         archive_path = self.project_dir / "设定" / "archive" / "volume_01_ledger.json"
@@ -262,7 +269,7 @@ class TestStoryAuditCLI(unittest.TestCase):
         if self.ledger_json.exists(): self.ledger_json.unlink()
         if self.ledger_md.exists(): self.ledger_md.unlink()
 
-        exit_code = main(["--project", str(self.project_dir), "--init", "--scope", "1-2"])
+        exit_code, _ = init_ledger(self.project_dir, scope_str="1-2")
         self.assertEqual(exit_code, 0)
         self.assertTrue(self.ledger_json.exists())
         self.assertTrue(self.ledger_md.exists())
@@ -272,7 +279,7 @@ class TestStoryAuditCLI(unittest.TestCase):
 
     def test_scope_batch_audit_pipeline(self):
         """--scope 31-35 批量连审模式"""
-        exit_code = main(["--project", str(self.project_dir), "--scope", "1-2"])
+        exit_code, _ = audit_scope(self.project_dir, scope_str="1-2")
         self.assertEqual(exit_code, 0)
 
         batch_reports = list((self.project_dir / "reports" / "批量审查").glob("*_批量审查_第001-002章.md"))
@@ -280,16 +287,15 @@ class TestStoryAuditCLI(unittest.TestCase):
 
     def test_apply_fix_pipeline_success(self):
         """--apply-fix 采纳修复方案号回写成功"""
-        exit_code = main([
-            "--project", str(self.project_dir),
-            "--chapter", "2",
-            "--apply-fix", "1",
-            "--target-line", "5",
-            "--old-text", "黑暗中有猩红的眼眸亮起，杀机骤现。",
-            "--new-text", "黑暗中有猩红的眼眸亮起，杀意如潮。",
-            "--context-before", "深渊之中，雾气弥漫。陆离拔出佩剑，警惕着四周。",
-            "--context-after", "",
-        ])
+        exit_code = apply_fix(
+            project_dir=self.project_dir,
+            chapter_index=2,
+            target_line=5,
+            old_text="黑暗中有猩红的眼眸亮起，杀机骤现。",
+            new_text="黑暗中有猩红的眼眸亮起，杀意如潮。",
+            context_before="深渊之中，雾气弥漫。陆离拔出佩剑，警惕着四周。",
+            context_after="",
+        )
         self.assertEqual(exit_code, 0)
 
         new_content, _, _ = read_file_safe(self.chap2_path)
@@ -301,43 +307,37 @@ class TestStoryAuditCLI(unittest.TestCase):
 
     def test_apply_fix_pipeline_ambiguous_fails(self):
         """--apply-fix 遭遇消歧失败或锚点未找到时返回 Exit Code 3"""
-        exit_code = main([
-            "--project", str(self.project_dir),
-            "--chapter", "2",
-            "--apply-fix", "1",
-            "--target-line", "5",
-            "--old-text", "不存在的旧文本",
-            "--new-text", "新文本",
-        ])
+        exit_code = apply_fix(
+            project_dir=self.project_dir,
+            chapter_index=2,
+            target_line=5,
+            old_text="不存在的旧文本",
+            new_text="新文本",
+        )
         self.assertEqual(exit_code, 3)
 
-    def test_direct_script_file_execution(self):
-        """验证通过脚本物理文件直接执行 python scripts/story_audit.py 的正常运作"""
-        script_path = Path(__file__).resolve().parent.parent / "scripts" / "story_audit.py"
-        res = subprocess.run(
-            [sys.executable, str(script_path), "--project", str(self.project_dir), "--chapter", "1"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
+    def test_pure_python_api_contracts_and_exports(self):
+        """验证纯 Python API 的规范导出、可调用性与参数契约"""
+        self.assertTrue(callable(audit_chapter))
+        self.assertTrue(callable(audit_scope))
+        self.assertTrue(callable(init_ledger))
+        self.assertTrue(callable(checkpoint_volume))
+        self.assertTrue(callable(sync_ledger_from_md))
+        self.assertTrue(callable(apply_fix))
+
+        # 测试 apply_fix 通过 dict 补丁对象调用
+        fix_code = apply_fix(
+            project_dir=self.project_dir,
+            chapter_index=2,
+            patch={
+                "target_line": 5,
+                "old_text": "黑暗中有猩红的眼眸亮起，杀机骤现。",
+                "new_text": "黑暗中有猩红的眼眸亮起，杀意如潮。",
+                "context_before": "深渊之中，雾气弥漫。陆离拔出佩剑，警惕着四周。",
+                "context_after": "",
+            },
         )
-        self.assertEqual(res.returncode, 0)
-        self.assertIn("审查完成", res.stdout)
-
-    def test_subprocess_real_execution(self):
-        """验证通过 CLI 真实子进程调用的退出码与行为"""
-        cmd = [
-            sys.executable,
-            "-m",
-            "scripts.story_audit",
-            "--project",
-            str(self.project_dir),
-            "--chapter",
-            "1",
-        ]
-        res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
-        self.assertEqual(res.returncode, 0)
-
+        self.assertEqual(fix_code, 0)
 
     def test_init_mode_inherits_existing_assets(self):
         """测试已有资产的账本运行 --init 验证资产不丢失继承"""
@@ -355,11 +355,7 @@ class TestStoryAuditCLI(unittest.TestCase):
         save_ledger_state(state, json_path, md_path, force=True)
 
         # 运行 --init
-        exit_code = main([
-            "--project", str(self.project_dir),
-            "--init",
-            "--force",
-        ])
+        exit_code, _ = init_ledger(self.project_dir, force=True)
         self.assertEqual(exit_code, 0)
 
         # 验证资产未丢失，被继承保留
@@ -444,7 +440,7 @@ class TestStoryAuditCLI(unittest.TestCase):
         if self.ledger_json.exists(): self.ledger_json.unlink()
         if self.ledger_md.exists(): self.ledger_md.unlink()
 
-        exit_code = main(["--project", str(self.project_dir), "--init", "--force"])
+        exit_code, _ = init_ledger(self.project_dir, force=True)
         self.assertEqual(exit_code, 0)
         self.assertTrue(self.ledger_json.exists())
         self.assertTrue(self.ledger_md.exists())
@@ -470,7 +466,7 @@ class TestStoryAuditCLI(unittest.TestCase):
 
     def test_scope_batch_summary_report_and_latest_report(self):
         """测试 --scope 批量连审模式自动聚合输出 BATCH_SUMMARY_SCOPE_{scope}.md 且避免无脑覆盖 LATEST_REPORT.md"""
-        exit_code = main(["--project", str(self.project_dir), "--scope", "1-2"])
+        exit_code, _ = audit_scope(self.project_dir, scope_str="1-2")
         self.assertEqual(exit_code, 0)
 
         # 1. 验证输出指定报告 reports/BATCH_SUMMARY_SCOPE_1-2.md
@@ -499,8 +495,8 @@ class TestStoryAuditCLI(unittest.TestCase):
 
 
 
-class TestStoryAuditCliGenreIntegration(unittest.TestCase):
-    """测试 CLI --genre 参数传递、题材诊断画像与报告渲染集成"""
+class TestStoryAuditApiGenreIntegration(unittest.TestCase):
+    """测试 API genre 参数传递、题材诊断画像与报告渲染集成"""
 
     def setUp(self):
         self.tmp_dir = tempfile.TemporaryDirectory()
@@ -522,9 +518,9 @@ class TestStoryAuditCliGenreIntegration(unittest.TestCase):
     def tearDown(self):
         self.tmp_dir.cleanup()
 
-    def test_cli_genre_auto_detection_and_diagnostics(self):
+    def test_api_genre_auto_detection_and_diagnostics(self):
         """测试 CLI 默认 auto 模式下自动识别题材并嵌入预审包和审查报告"""
-        ret = main(["--project", str(self.project_dir), "--chapter", "1"])
+        ret, _ = audit_chapter(self.project_dir, chapter_index=1)
         self.assertEqual(ret, 0)
 
         # 1. 验证 pre_audit_bundle.json 中的题材诊断
@@ -552,9 +548,9 @@ class TestStoryAuditCliGenreIntegration(unittest.TestCase):
         self.assertIn("绝不可踩", rep_txt)
         self.assertIn("Agent D", rep_txt)
 
-    def test_cli_genre_manual_override(self):
+    def test_api_genre_manual_override(self):
         """测试 CLI 显式传递 --genre 手动指定题材并装配专属卡尺"""
-        ret = main(["--project", str(self.project_dir), "--chapter", "1", "--genre", "追妻火葬场"])
+        ret, _ = audit_chapter(self.project_dir, chapter_index=1, genre="追妻火葬场")
         self.assertEqual(ret, 0)
 
         bundle_path = self.project_dir / "reports" / ".cache" / "pre_audit_bundle.json"

@@ -4,7 +4,7 @@ runtime_detector.py: 宿主运行时环境探测与子代理递归防爆哨兵
 
 功能职责：
 1. 宿主运行时探测：
-   - 探测 Codex, Claude, OpenCode, Antigravity, Generic (Shell/CLI)；
+   - 探测 Codex, Claude, OpenCode, Antigravity, Generic (标准 Python 运行时)；
 2. 子代理递归防爆哨兵 (Subagent Recursion Guard)：
    - 探测当前执行流是否已处于子代理上下文中；
    - 铁律：若已处于子代理上下文，严禁再次嵌套 spawn 多代理，强制平稳降级为 solo；
@@ -13,10 +13,8 @@ runtime_detector.py: 宿主运行时环境探测与子代理递归防爆哨兵
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
-import sys
 from typing import Optional, Tuple
 
 VALID_RUNTIMES = ("codex", "claude", "opencode", "antigravity", "generic")
@@ -119,47 +117,3 @@ def resolve_execution_mode(
     else:
         # generic 单机命令行运行时
         return "solo", "unsupported_multiagent_runtime"
-
-
-def main() -> int:
-    if sys.platform == 'win32':
-        try:
-            if hasattr(sys.stdout, 'reconfigure'):
-                sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-            if hasattr(sys.stderr, 'reconfigure'):
-                sys.stderr.reconfigure(encoding='utf-8', errors='replace')
-        except Exception:
-            pass
-
-    parser = argparse.ArgumentParser(description="宿主运行时与模式降级探测工具")
-    parser.add_argument("--requested-mode", default="auto", choices=list(VALID_MODES), help="请求的执行模式")
-    parser.add_argument("--json", action="store_true", help="以 JSON 格式输出结果")
-
-    args = parser.parse_args()
-
-    rt = detect_runtime()
-    sub_ctx = is_subagent_context()
-    eff_mode, reason = resolve_execution_mode(args.requested_mode, runtime=rt)
-
-    data = {
-        "runtime": rt,
-        "is_subagent_context": sub_ctx,
-        "requested_mode": args.requested_mode,
-        "effective_mode": eff_mode,
-        "fallback_reason": reason,
-    }
-
-    if args.json:
-        print(json.dumps(data, ensure_ascii=False, indent=2))
-    else:
-        print(f"Runtime: {rt}")
-        print(f"Subagent Context: {sub_ctx}")
-        print(f"Requested Mode: {args.requested_mode}")
-        print(f"Effective Mode: {eff_mode}")
-        print(f"Fallback Reason: {reason}")
-
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())

@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 from scripts.audit_state import load_audit_state
 from scripts.author_memory import AuthorMemory
-from scripts.story_audit import main, run_audit, run_scope_audit
+from scripts.story_audit import audit_chapter, audit_scope, run_audit, run_scope_audit
 
 
 class TestStoryAuditUpgrades(unittest.TestCase):

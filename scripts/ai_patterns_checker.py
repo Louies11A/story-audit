@@ -16,10 +16,7 @@ ai_patterns_checker.py: 毫秒级深度 AI 模式与套路句式扫描器
 
 from __future__ import annotations
 
-import argparse
 import re
-import sys
-from pathlib import Path
 from typing import List, Optional, Set, Tuple
 
 from scripts.types import FormatFinding
@@ -370,45 +367,3 @@ def scan_ai_patterns(text: str) -> List[FormatFinding]:
 
     findings.sort(key=lambda f: f.line_number)
     return findings
-
-
-def main() -> int:
-    if sys.platform == 'win32':
-        try:
-            if hasattr(sys.stdout, 'reconfigure'):
-                sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-            if hasattr(sys.stderr, 'reconfigure'):
-                sys.stderr.reconfigure(encoding='utf-8', errors='replace')
-        except Exception:
-            pass
-
-    parser = argparse.ArgumentParser(description="AI 模式与套路句式扫描器")
-    parser.add_argument("file", help="待扫描的文本或章节文件")
-    parser.add_argument("--fail-on-p2", action="store_true", help="发现 P2 缺陷时退出码为 1")
-    args = parser.parse_args()
-
-    target_path = Path(args.file)
-    if not target_path.is_file():
-        print(f"错误: 文件不存在: {target_path}", file=sys.stderr)
-        return 2
-
-    text = target_path.read_text(encoding="utf-8", errors="replace")
-    findings = scan_ai_patterns(text)
-
-    if not findings:
-        print(f"✅ {target_path.name}: 未检出高危 AI 套路句式。")
-        return 0
-
-    print(f"🚨 {target_path.name}: 发现 {len(findings)} 处 AI 套路模式：")
-    for f in findings:
-        print(f"  - [{f.severity}] 行 {f.line_number} ({f.flaw_type}): {f.message}")
-        print(f"    原文: `{f.snippet}`")
-        print(f"    建议: {f.suggestion}")
-
-    if args.fail_on_p2 and any(f.severity in ("P0", "P1", "P2") for f in findings):
-        return 1
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())

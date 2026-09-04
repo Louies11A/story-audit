@@ -13,12 +13,10 @@ author_memory.py: 纯 Python 单文件作者偏好状态机
 
 from __future__ import annotations
 
-import argparse
 import hashlib
 import json
 import os
 import re
-import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -359,16 +357,19 @@ class AuthorMemory:
             "",
             "---",
             "",
-            "## 🛠️ CLI 常用指令",
-            "```bash",
+            "## 🛠️ Python API 常用操作",
+            "```python",
+            "from scripts.author_memory import AuthorMemory",
+            "",
+            "mem = AuthorMemory(project_dir=\".\")",
             "# 录入偏好",
-            "python scripts/author_memory.py record --key '主角性格' --value '果决冷静，不圣母不多话' --category story_design",
+            "mem.record(key=\"主角性格\", value=\"果决冷静，不圣母不多话\", category=\"story_design\")",
             "",
             "# 查询偏好 (受 2048 字节硬上限保护)",
-            "python scripts/author_memory.py query",
+            "prompt_text = mem.query()",
             "",
             "# 状态完整性校验",
-            "python scripts/author_memory.py check",
+            "is_valid = mem.check()",
             "```",
             "",
         ])
@@ -376,89 +377,3 @@ class AuthorMemory:
         content = "\n".join(lines)
         _atomic_write_text(self.profile_file, content)
         return content
-
-
-def main() -> int:
-    if sys.platform == 'win32':
-        try:
-            if hasattr(sys.stdout, 'reconfigure'):
-                sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-            if hasattr(sys.stderr, 'reconfigure'):
-                sys.stderr.reconfigure(encoding='utf-8', errors='replace')
-        except Exception:
-            pass
-
-    parser = argparse.ArgumentParser(description="作者偏好状态机 CLI")
-    parser.add_argument("--project", default=".", help="项目根目录 (默认 .)")
-
-    subparsers = parser.add_subparsers(dest="command")
-
-    # init
-    subparsers.add_parser("init", help="初始化作者记忆状态")
-
-    # record
-    record_p = subparsers.add_parser("record", help="录入或更新作者偏好")
-    record_p.add_argument("--key", required=True, help="偏好主题名称")
-    record_p.add_argument("--value", required=True, help="具体偏好内容")
-    record_p.add_argument("--category", default="prose_style", choices=list(VALID_CATEGORIES.keys()), help="偏好分类")
-    record_p.add_argument("--source", default="explicit_user", choices=list(VALID_SOURCES), help="信息来源")
-    record_p.add_argument("--confidence", default="high", choices=list(CONFIDENCE_LEVELS), help="置信度")
-
-    # query
-    query_p = subparsers.add_parser("query", help="查询作者偏好")
-    query_p.add_argument("--categories", help="逗号分隔的分类筛选列表")
-    query_p.add_argument("--limit-bytes", type=int, default=QUERY_HARD_LIMIT_BYTES, help="最大字节限制 (硬上限 2048)")
-
-    # check
-    subparsers.add_parser("check", help="校验状态完整性与反近亲繁殖合规")
-
-    args = parser.parse_args()
-
-    mem = AuthorMemory(Path(args.project))
-
-    try:
-        if args.command == "init":
-            f = mem.init()
-            print(f"✅ 作者记忆状态已初始化：{f}")
-            print(f"✅ 已生成只读视图：{mem.profile_file}")
-            return 0
-
-        elif args.command == "record":
-            item = mem.record(
-                key=args.key,
-                value=args.value,
-                category=args.category,
-                source=args.source,
-                confidence=args.confidence,
-            )
-            print(f"✅ 成功记录作者偏好 [{item['category']}] {item['key']}: {item['value']}")
-            print(f"已更新只读视图: {mem.profile_file}")
-            return 0
-
-        elif args.command == "query":
-            cats = [c.strip() for c in args.categories.split(",")] if args.categories else None
-            out = mem.query(categories=cats, limit_bytes=args.limit_bytes)
-            print(out)
-            return 0
-
-        elif args.command == "check":
-            valid = mem.check()
-            if valid:
-                print("✅ 作者记忆状态健康，未发现损坏或近亲繁殖违规。")
-                return 0
-            else:
-                print("❌ 状态文件不存在或校验未通过。", file=sys.stderr)
-                return 1
-        else:
-            parser.print_help()
-            return 0
-    except AntiInbreedingViolation as e:
-        print(f"🚨 [反近亲繁殖拦截] {e}", file=sys.stderr)
-        return 2
-    except Exception as e:
-        print(f"❌ 错误: {e}", file=sys.stderr)
-        return 3
-
-
-if __name__ == "__main__":
-    sys.exit(main())

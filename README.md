@@ -2,7 +2,7 @@
 
 [![Python Version](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-230%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-229%20passed-brightgreen.svg)]()
 [![Coverage](https://img.shields.io/badge/coverage-93%25-brightgreen.svg)]()
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-zero%20external-orange.svg)]()
 
@@ -26,19 +26,21 @@
   - [4. 平台专属商业门禁卡尺 (platform_rubrics)](#4-平台专属商业门禁卡尺-platform_rubrics)
   - [5. 跨批长篇因果状态机 (audit_state)](#5-跨批长篇因果状态机-audit_state)
 - [四、标准化报告契约 (Report Contract)](#四标准化报告契约-report-contract)
-- [五、快速上手与 CLI 指南](#五快速上手与-cli-指南)
-  - [1. 基础单章审查与平台门禁](#1-基础单章审查与平台门禁)
-  - [2. 批量范围连审与因果继承](#2-批量范围连审与因果继承)
-  - [3. 作者画像与偏好联动](#3-作者画像与偏好联动)
-  - [4. 资源账本生命周期管理](#4-资源账本生命周期管理)
-  - [5. 短句化补丁安全回写](#5-短句化补丁安全回写)
-- [六、CLI 退出码 (Exit Codes) 规范](#六cli-退出码-exit-codes-规范)
+- [五、快速上手与 Python API 指南](#五快速上手与-python-api-指南)
+  - [1. 基础单章审查与平台门禁 (`audit_chapter`)](#1-基础单章审查与平台门禁-audit_chapter)
+  - [2. 批量范围连审与因果继承 (`audit_scope`)](#2-批量范围连审与因果继承-audit_scope)
+  - [3. 作者画像与偏好联动 (`AuthorMemory`)](#3-作者画像与偏好联动-authormemory)
+  - [4. 资源账本生命周期管理 (`init_ledger`, `checkpoint_volume`, `sync_ledger_from_md`)](#4-资源账本生命周期管理-init_ledger-checkpoint_volume-sync_ledger_from_md)
+  - [5. 短句化补丁安全回写 (`apply_fix`)](#5-短句化补丁安全回写-apply_fix)
+- [六、状态码 (Status Codes) 规范](#六状态码-status-codes-规范)
 - [七、缺陷分级体系 (P0 ~ P3)](#七缺陷分级体系-p0--p3)
 - [八、测试套件与工程验证](#八测试套件与工程验证)
 
 ---
 
 ## 一、核心架构理念
+
+> **架构铁律：本项目采用纯模块化 Python API 驱动设计，不提供亦不涉及任何 CLI 命令行接口。后续所有功能开发与生态扩展均严格围绕 Python API、强类型数据契约与 Agent 工具函数展开，坚决不涉及 CLI。**
 
 长篇网络小说创作动辄数百万字，单靠大语言模型（LLM）的模糊记忆极易产生“越写越崩、幻觉频发”的灾难。
 
@@ -56,7 +58,7 @@
 
 ```
                        ┌──────────────────────────────────────────────┐
-                       │     用户触发指令（/story-audit 或 CLI 启动）    │
+                       │     用户触发指令（/story-audit 或 Python API 驱动）    │
                        └──────────────────────┬───────────────────────┘
                                               │
                                               ▼
@@ -152,83 +154,117 @@ Scope: 第001章
 
 ---
 
-## 五、快速上手与 CLI 指南
+## 五、快速上手与 Python API 指南
 
-所有操作均可通过 `python scripts/story_audit.py` 命令执行：
+本项目全量功能由纯模块化 Python API 交付，支持无缝嵌入各类 Agent 框架、自动化批处理脚本与上层写作工具箱：
 
-### 1. 基础单章审查与平台门禁
+### 1. 基础单章审查与平台门禁 (`audit_chapter`)
 
-```bash
-# 默认定位最新章审查
-python scripts/story_audit.py
+```python
+from pathlib import Path
+from scripts.story_audit import audit_chapter
+
+project_dir = Path(".")
+
+# 默认定位最新章审查（返回状态码与归档报告路径）
+status_code, report_path = audit_chapter(project_dir)
 
 # 指定章节与目标发布平台（支持 fanqie, qidian, zhihu, generic）
-python scripts/story_audit.py --chapter 1 --platform fanqie
+status_code, report_path = audit_chapter(project_dir, chapter_index=1, platform="fanqie")
 
 # 指定执行模式（full 多代理协同 / lean 精简 / solo 单机，默认 auto 自动探测降级）
-python scripts/story_audit.py --chapter 1 --mode full
+status_code, report_path = audit_chapter(project_dir, chapter_index=1, mode="full")
 
-# 严格模式：发现 P1 级严重问题时直接返回非零退出码（适用于 CI/CD 门禁）
-python scripts/story_audit.py --chapter 1 --strict
+# 严格模式：发现 P1 级严重问题时返回状态码 1（适用于 CI/CD 质量门禁拦截）
+status_code, report_path = audit_chapter(project_dir, chapter_index=1, strict=True)
 ```
 
-### 2. 批量范围连审与因果继承
+### 2. 批量范围连审与因果继承 (`audit_scope`)
 
-```bash
+```python
+from scripts.story_audit import audit_scope
+
 # 连审第 1 章至第 5 章，生成大盘汇总并原子更新跨批因果状态机
-python scripts/story_audit.py --scope 1-5 --platform qidian
+status_code, summary_path = audit_scope(project_dir, scope_str="1-5", platform="qidian")
 
 # 连审第 6 章至第 10 章，自动装载上一批未解决的开放缺陷与伏笔承诺作为 Inherited Items
-python scripts/story_audit.py --scope 6-10 --platform qidian
+status_code, summary_path = audit_scope(project_dir, scope_str="6-10", platform="qidian")
 ```
 
-### 3. 作者画像与偏好联动
+### 3. 作者画像与偏好联动 (`AuthorMemory`)
 
-```bash
+```python
+from scripts.author_memory import AuthorMemory
+from scripts.story_audit import audit_chapter
+
 # 初始化作者记忆状态机
-python scripts/author_memory.py init
+mem = AuthorMemory(project_dir)
+mem.init()
 
 # 录入作者风格偏好
-python scripts/author_memory.py record --key "主角性格" --value "果决冷静，杀伐果断，不圣母不多话" --category story_design
+mem.record(
+    key="主角性格",
+    value="果决冷静，杀伐果断，不圣母不多话",
+    category="story_design",
+)
 
-# 审查时联动作者记忆（作为意图解释辅助）
-python scripts/story_audit.py --chapter 1 --author-memory
+# 审查时联动作者记忆（作为意图解释辅助，受 2048 字节硬上限保护）
+status_code, report_path = audit_chapter(project_dir, chapter_index=1, author_memory=True)
 ```
 
-### 4. 资源账本生命周期管理
+### 4. 资源账本生命周期管理 (`init_ledger`, `checkpoint_volume`, `sync_ledger_from_md`)
 
-```bash
+```python
+from scripts.story_audit import init_ledger, checkpoint_volume, sync_ledger_from_md
+
 # 首次建账模式（继承已有资产设定，流式扫描前 30 章建立基线）
-python scripts/story_audit.py --init --scope 1-30
+status_code, report_path = init_ledger(project_dir, scope_str="1-30")
 
 # 分卷封账（锁定第一卷，归档当前卷快照）
-python scripts/story_audit.py --checkpoint --volume 1
+status_code = checkpoint_volume(project_dir, volume=1)
 
 # 从用户修改过的 Markdown 账本反向同步回 JSON 状态机
-python scripts/story_audit.py --sync-from-md
+status_code = sync_ledger_from_md(project_dir)
 ```
 
-### 5. 短句化补丁安全回写
+### 5. 短句化补丁安全回写 (`apply_fix`)
 
-```bash
-# 通过参数传入精确的消歧三行锚点实施无损回写
-python scripts/story_audit.py \
-  --chapter 1 \
-  --target-line 42 \
-  --old-text "林凡心中大惊，急忙运转功法，然而体内灵力却如泥牛入海一般毫无反应。" \
-  --new-text "林凡心中一沉。\n周天功法骤然空转。\n体内灵力如泥牛入海，死寂无声。" \
-  --context-before "四周黑雾骤然升腾。" \
-  --context-after "黑影已悄然欺身至三步之内。"
+```python
+from scripts.story_audit import apply_fix
+
+# 通过 Python API 传入精确的消歧三行锚点实施无损回写
+status_code = apply_fix(
+    project_dir=project_dir,
+    chapter_index=1,
+    target_line=42,
+    old_text="林凡心中大惊，急忙运转功法，然而体内灵力却如泥牛入海一般毫无反应。",
+    new_text="林凡心中一沉。\n周天功法骤然空转。\n体内灵力如泥牛入海，死寂无声。",
+    context_before="四周黑雾骤然升腾。",
+    context_after="黑影已悄然欺身至三步之内。",
+)
+
+# 亦支持直接传入 dict 补丁对象
+status_code = apply_fix(
+    project_dir=project_dir,
+    chapter_index=1,
+    patch={
+        "target_line": 42,
+        "old_text": "林凡心中大惊，急忙运转功法，然而体内灵力却如泥牛入海一般毫无反应。",
+        "new_text": "林凡心中一沉。\n周天功法骤然空转。\n体内灵力如泥牛入海，死寂无声。",
+        "context_before": "四周黑雾骤然升腾。",
+        "context_after": "黑影已悄然欺身至三步之内。",
+    },
+)
 ```
 
 ---
 
-## 六、CLI 退出码 (Exit Codes) 规范
+## 六、状态码 (Status Codes) 规范
 
-| 退出码 | 状态说明 | 触发场景 |
+| 状态码 | 状态说明 | 触发场景 |
 | :---: | :--- | :--- |
 | **`0`** | **审查通过 / 仅轻微瑕疵** | 全书无 P0 缺陷；或存在 P2/P3 问题但在常规模式下运行。 |
-| **`1`** | **严重阻断 (P1 违规)** | 在开启 `--strict` 严格模式下，检测到 P1 级违规（资产断裂、时空错位、平台门禁严重不符等）。 |
+| **`1`** | **严重阻断 (P1 违规)** | 在开启 `strict=True` 严格模式下，检测到 P1 级违规（资产断裂、时空错位、平台门禁严重不符等）。 |
 | **`2`** | **致命阻塞 (P0 阻断)** | 发现死亡复活、主线硬伤或账本脏写冲突。 |
 | **`3`** | **运行异常 / 参数错误** | 指定章节不存在、目录找不到正文、参数缺失或格式非法。 |
 
@@ -272,16 +308,17 @@ pytest --cov=scripts --cov-report=term-missing
 
 ### 测试指标
 
-- **用例总数**：**230 项测试** 全部通过（100% Pass Rate）；
-- **执行时间**：~ 2.1 秒（极速并发执行）；
+- **用例总数**：**229 项测试** 全部通过（100% Pass Rate）；
+- **执行时间**：~ 1.6 秒（极速并发执行）；
 - **用例覆盖分布**：
+  - `test_story_audit_api.py`：23 项测试（纯 Python API 执行管线、四阶状态码契约、参数消歧与补丁安全回写等）
+  - `test_story_audit_upgrades.py`：4 项测试（端到端固定英文元数据键头部、模式自适应降级等）
   - `test_ai_patterns_checker.py`：7 项测试（深度 AI 句式指纹、反序对比、掩码排除等）
   - `test_author_memory.py`：5 项测试（初始化、反近亲繁殖过滤、2048 字节硬上限等）
   - `test_runtime_detector.py`：3 项测试（宿主环境探测、子代理递归防爆哨兵等）
   - `test_platform_rubrics.py`：3 项测试（番茄、起点、知乎专属门禁卡尺）
   - `test_audit_state.py`：2 项测试（跨批状态机原子持久化与 Inherited Items 继承）
-  - `test_story_audit_upgrades.py`：4 项测试（端到端固定英文元数据键头部、模式自适应降级等）
-  - 原生套件（`test_format_scanner`, `test_ledger_engine`, `test_safe_writer`, 等）：206 项测试全部通过。
+  - 原生套件（`test_format_scanner`, `test_ledger_engine`, `test_safe_writer` 等）：182 项测试全部通过。
 
 ---
 

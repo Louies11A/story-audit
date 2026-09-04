@@ -30,6 +30,8 @@ triggers:
 
 # 长篇网文深度审查技能 (story-audit)
 
+> **架构铁律：本项目采用纯模块化 Python API 驱动设计，不提供亦不涉及任何 CLI 命令行接口。后续所有功能开发与生态扩展均严格围绕 Python API、强类型数据契约与 Agent 工具函数展开，坚决不涉及 CLI。**
+
 长篇网络小说连载跨越数十万至数百万字。作者极易陷入“资产失忆、因果断裂、手机端排版大黑块窒息、典型 AI 对仗套路腔、作者自嗨作者自我感动”等创作陷阱。
 
 本技能依托**“底层零依赖 Python 确定性引擎锁死资产与排版，深度 AI 模式毫秒级扫描，四大平台商业门禁卡尺，宿主运行时探测与子代理递归防爆哨兵，单文件作者偏好状态机，顶层 4 专家多 Agent 矩阵对抗审判，第一性原理严把读者追读驱动力，网文短句重塑阅读美学”**，为长篇网文提供全维度的防崩盘质量护城河。
@@ -149,16 +151,16 @@ Scope: 第001章
 
 ## 四、标准化审查作业管线 (SOP)
 
-### Step 1: 判定审查场景与参数准备
-- **日常单章审查**：`python scripts/story_audit.py --chapter N [--mode auto|full|lean|solo] [--platform fanqie|qidian|zhihu|generic] [--author-memory]`
-- **批量多章连审**：`python scripts/story_audit.py --scope N-M [--platform fanqie|qidian|zhihu|generic]`
-- **首次全书建账**：`python scripts/story_audit.py --init --scope 1-N`
-- **人工账本反向同步**：`python scripts/story_audit.py --sync-from-md`
-- **分卷封账结转**：`python scripts/story_audit.py --checkpoint --volume N`
-- **采纳修复方案回写**：`python scripts/story_audit.py --chapter N --apply-fix 1`
+### Step 1: 判定审查场景与参数准备（Python API）
+- **日常单章审查**：`audit_chapter(project_dir, chapter_index=N, mode="auto", platform="generic", author_memory=True)`
+- **批量多章连审**：`audit_scope(project_dir, scope_str="N-M", platform="generic")`
+- **首次全书建账**：`init_ledger(project_dir, scope_str="1-N")`
+- **人工账本反向同步**：`sync_ledger_from_md(project_dir)`
+- **分卷封账结转**：`checkpoint_volume(project_dir, volume=N)`
+- **采纳修复方案回写**：`apply_fix(project_dir, chapter_index=N, patch=...)`
 
 ### Step 2: 驱动底层引擎生成预审包
-协调器执行底层 CLI，生成 `reports/.cache/pre_audit_bundle.json`，提取行号绝对保真的清洗切片、跨章缝合文本、账本快照、平台诊断与作者画像。
+协调器调用底层 Python API（如 `audit_chapter` 或 `build_pre_audit_bundle`），生成 `reports/.cache/pre_audit_bundle.json`，提取行号绝对保真的清洗切片、跨章缝合文本、账本快照、平台诊断与作者画像。
 
 ### Step 3: 聚合报告与目录归档收口
 严格对照统一 Schema 生成规范 Markdown：
@@ -167,11 +169,11 @@ Scope: 第001章
 3. 批量审查输出：`reports/BATCH_SUMMARY_SCOPE_{scope}.md` 与历史归档；
 4. 原子更新跨批因果状态机：`reports/.audit_state.json`。
 
-### Step 4: 退出码映射与质量把关
-- **Exit Code 0 (绿灯通过)**：无缺陷，或仅存在 P2/P3 建议项；
-- **Exit Code 1 (黄灯警告)**：存在 P1 级严重失误（若带 `--strict` 则阻断）；
-- **Exit Code 2 (红灯阻断)**：存在 P0 级致命断裂（世界观吃书、死人复活），**坚决阻断**；
-- **Exit Code 3 (系统异常)**：文件缺失、乱码或防脏写拦截。
+### Step 4: 状态码映射与质量把关
+- **Status Code 0 (绿灯通过)**：无缺陷，或仅存在 P2/P3 建议项；
+- **Status Code 1 (黄灯警告)**：存在 P1 级严重失误（若 `strict=True` 则阻断）；
+- **Status Code 2 (红灯阻断)**：存在 P0 级致命断裂（世界观吃书、死人复活），**坚决阻断**；
+- **Status Code 3 (系统异常)**：文件缺失、乱码或防脏写拦截。
 
 ---
 
@@ -179,7 +181,7 @@ Scope: 第001章
 
 遵循**零第三方依赖**承诺（仅依赖 Python 3.8+ 标准库）：
 
-1. `scripts/story_audit.py`：CLI 主入口管线、多模式参数解析、流程串联与标准退出码；
+1. `scripts/story_audit.py`：纯模块化 Python API 核心调度管线、流程串联与标准状态码；
 2. `scripts/ai_patterns_checker.py`：毫秒级深度 AI 套路句式与模式扫描器；
 3. `scripts/platform_rubrics.py`：四大平台（番茄/起点/知乎/通用）商业门禁卡尺评估；
 4. `scripts/runtime_detector.py`：宿主运行时探测与子代理递归防爆哨兵；
