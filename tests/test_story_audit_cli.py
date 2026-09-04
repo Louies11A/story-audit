@@ -428,5 +428,74 @@ class TestStoryAuditCLI(unittest.TestCase):
         self.assertEqual(exit_code, 0)
 
 
+    def test_init_mode_heuristic_assets_integration(self):
+        """测试 --init 首次建账模式将启发式抽取资产与伏笔自动并入账本"""
+        # 在正文章节中写入包含出装、军工物资与自然伏笔的内容
+        chap_extra_path = self.drafts_dir / "第003章_物资大丰收.md"
+        chap_extra_content = (
+            "第003章 物资大丰收\n\n"
+            "在水下掩体中，清点战利品，清点出四台德国进口的五轴数控机床与上百吨特种防弹钢！\n"
+            "搜刮到了80只重型军用防水弹药箱，还有1门76毫米速射炮与百吨大米。\n"
+            "【获得：二阶双体炮艇改装蓝图×1】\n"
+            "【伏笔:深海第三层异动】\n"
+        )
+        write_file_safe(chap_extra_path, chap_extra_content)
+
+        if self.ledger_json.exists(): self.ledger_json.unlink()
+        if self.ledger_md.exists(): self.ledger_md.unlink()
+
+        exit_code = main(["--project", str(self.project_dir), "--init", "--force"])
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(self.ledger_json.exists())
+        self.assertTrue(self.ledger_md.exists())
+
+        state = load_ledger_state(self.ledger_json)
+        # 验证账本中不再是空账本，已安全并入候选资产
+        self.assertTrue(len(state.assets) >= 4, "自然网文首次建账必须安全并入候选资产，杜绝空账本")
+
+        asset_names = {item.name: item for item in state.assets.values()}
+        self.assertTrue(any("五轴数控机床" in k for k in asset_names.keys()))
+        self.assertTrue(any("大米" in k for k in asset_names.keys()))
+        self.assertTrue(any("弹药箱" in k for k in asset_names.keys()))
+
+        # 验证伏笔池自动提取
+        f_names = [f["name"] for f in state.foreshadowing_stash]
+        self.assertIn("深海第三层异动", f_names)
+
+        # 验证盘点报告生成且内容丰富
+        stage_reports = list((self.project_dir / "reports" / "阶段封账与里程碑").glob("初始建账盘点报告_*.md"))
+        self.assertTrue(len(stage_reports) >= 1)
+        report_txt, _, _ = read_file_safe(stage_reports[0])
+        self.assertIn("核心资产清册预览", report_txt)
+
+    def test_scope_batch_summary_report_and_latest_report(self):
+        """测试 --scope 批量连审模式自动聚合输出 BATCH_SUMMARY_SCOPE_{scope}.md 且避免无脑覆盖 LATEST_REPORT.md"""
+        exit_code = main(["--project", str(self.project_dir), "--scope", "1-2"])
+        self.assertEqual(exit_code, 0)
+
+        # 1. 验证输出指定报告 reports/BATCH_SUMMARY_SCOPE_1-2.md
+        batch_summary_path = self.project_dir / "reports" / "BATCH_SUMMARY_SCOPE_1-2.md"
+        self.assertTrue(batch_summary_path.exists(), "必须自动生成 reports/BATCH_SUMMARY_SCOPE_{scope}.md")
+
+        summary_txt, _, _ = read_file_safe(batch_summary_path)
+        # 验证四大核心版块
+        self.assertIn("## 一、全范围总览大盘", summary_txt)
+        self.assertIn("## 二、字数与段数统计走势", summary_txt)
+        self.assertIn("## 三、各章 P0/P1/P2/P3 瑕疵汇总列表", summary_txt)
+        self.assertIn("## 四、跨章接缝与 POV 视点一览表", summary_txt)
+
+        # 2. 验证 LATEST_REPORT.md 保存的是批量汇总报告，而不是单章被循环无脑覆盖
+        latest_report = self.project_dir / "reports" / "LATEST_REPORT.md"
+        self.assertTrue(latest_report.exists())
+        latest_txt, _, _ = read_file_safe(latest_report)
+        self.assertIn("批量连审大盘汇总报告", latest_txt)
+
+        # 3. 验证单章归档报告依然完好归档保留
+        arch_1 = self.project_dir / "reports" / "单章审查" / "001-100章" / "第001章_审查报告.md"
+        arch_2 = self.project_dir / "reports" / "单章审查" / "001-100章" / "第002章_审查报告.md"
+        self.assertTrue(arch_1.exists(), "单章归档报告第001章必须保留")
+        self.assertTrue(arch_2.exists(), "单章归档报告第002章必须保留")
+
+
 if __name__ == "__main__":
     unittest.main()

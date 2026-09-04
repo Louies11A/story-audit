@@ -26,10 +26,12 @@ from scripts.chapter_linker import extract_boundary_slices
 from scripts.chapter_resolver import ChapterResolver
 from scripts.format_scanner import scan_typography_flaws
 from scripts.ledger_engine import (
+    AssetItem,
     LedgerDirtyError,
     LedgerState,
     check_dirty_state,
     create_volume_checkpoint,
+    extract_heuristic_assets,
     read_file_safe,
     save_ledger_state,
     scan_foreshadowing_tags,
@@ -344,6 +346,9 @@ def run_audit(
     target_chapter_index: Optional[float] = None,
     strict: bool = False,
     force: bool = False,
+    write_latest_report: bool = True,
+    silent: bool = False,
+    summary_collector: Optional[Dict[str, Any]] = None,
 ) -> int:
     """执行单章审查管线，生成预审包与归档报告，返回退出码"""
     reports_dir = project_dir / "reports"
@@ -354,7 +359,8 @@ def run_audit(
     resolver = ChapterResolver()
     chapters = resolver.discover_chapters(project_dir)
     if not chapters:
-        print(f"[错误] 在目录 {project_dir} 中未发现任何小说章节文件！", file=sys.stderr)
+        if not silent:
+            print(f"[错误] 在目录 {project_dir} 中未发现任何小说章节文件！", file=sys.stderr)
         return 3
 
     # 2. 定位目标章节
@@ -365,7 +371,8 @@ def run_audit(
                 curr_chapter = c
                 break
         if not curr_chapter:
-            print(f"[错误] 未找到指定章号: {target_chapter_index}", file=sys.stderr)
+            if not silent:
+                print(f"[错误] 未找到指定章号: {target_chapter_index}", file=sys.stderr)
             return 3
     else:
         # 默认定位最新章节
@@ -379,7 +386,8 @@ def run_audit(
     try:
         curr_text, curr_enc, curr_eol = read_file_safe(curr_chapter.path)
     except Exception as e:
-        print(f"[错误] 读取目标章节失败: {curr_chapter.path}, {e}", file=sys.stderr)
+        if not silent:
+            print(f"[错误] 读取目标章节失败: {curr_chapter.path}, {e}", file=sys.stderr)
         return 3
 
     prev_text: Optional[str] = None
@@ -387,7 +395,8 @@ def run_audit(
         try:
             prev_text, _, _ = read_file_safe(prev_chapter.path)
         except Exception as e:
-            print(f"[警告] 读取上一章节失败: {prev_chapter.path}, {e}", file=sys.stderr)
+            if not silent:
+                print(f"[警告] 读取上一章节失败: {prev_chapter.path}, {e}", file=sys.stderr)
             prev_text = None
 
     # 5. 跨章缝合与 POV/闪回隔离
@@ -403,11 +412,12 @@ def run_audit(
     json_path, md_path = locate_ledger_paths(project_dir)
     if md_path.is_file() and json_path.is_file() and not force:
         if check_dirty_state(md_path, json_path):
-            print(
-                f"[防脏写拦截] Markdown 账本 ({md_path}) 修改时间晚于 JSON 数据源 ({json_path})！\n"
-                f"存在未同步的手工编辑。请先执行 --sync-from-md 同步，或追加 --force 强制覆盖。",
-                file=sys.stderr,
-            )
+            if not silent:
+                print(
+                    f"[防脏写拦截] Markdown 账本 ({md_path}) 修改时间晚于 JSON 数据源 ({json_path})！\n"
+                    f"存在未同步的手工编辑。请先执行 --sync-from-md 同步，或追加 --force 强制覆盖。",
+                    file=sys.stderr,
+                )
             return 3
 
     state = load_ledger_state(json_path)
@@ -459,31 +469,62 @@ def run_audit(
     )
 
     latest_report_path = reports_dir / "LATEST_REPORT.md"
-    write_file_safe(latest_report_path, report_content)
+    if write_latest_report:
+        write_file_safe(latest_report_path, report_content)
 
     archived_report_path = get_report_archive_path(reports_dir, curr_chapter.index)
     archived_report_path.parent.mkdir(parents=True, exist_ok=True)
     write_file_safe(archived_report_path, report_content)
 
-    print(f"审查完成：第 {curr_chapter.index} 章 ({curr_chapter.title})")
-    print(f"最新报告已写入：{latest_report_path}")
-    print(f"归档报告已写入：{archived_report_path}")
+    if not silent:
+        print(f"审查完成：第 {curr_chapter.index} 章 ({curr_chapter.title})")
+        if write_latest_report:
+            print(f"最新报告已写入：{latest_report_path}")
+        print(f"归档报告已写入：{archived_report_path}")
 
     # 12. 退出码映射
+    exit_code = 0
     if p0_list:
-        print(f"[红灯阻断] 发现 {len(p0_list)} 个 P0 级致命断裂，流程中断！", file=sys.stderr)
-        return 2
-
-    if p1_list:
+        if not silent:
+            print(f"[红灯阻断] 发现 {len(p0_list)} 个 P0 级致命断裂，流程中断！", file=sys.stderr)
+        exit_code = 2
+    elif p1_list:
         if strict:
-            print(f"[黄灯严格中断] 发现 {len(p1_list)} 个 P1 级严重失误，已开启 --strict 中断！", file=sys.stderr)
-            return 1
+            if not silent:
+                print(f"[黄灯严格中断] 发现 {len(p1_list)} 个 P1 级严重失误，已开启 --strict 中断！", file=sys.stderr)
+            exit_code = 1
         else:
-            print(f"[黄灯放行] 发现 {len(p1_list)} 个 P1 级严重失误（未开启 --strict，允许通过）。")
-            return 0
+            if not silent:
+                print(f"[黄灯放行] 发现 {len(p1_list)} 个 P1 级严重失误（未开启 --strict，允许通过）。")
+            exit_code = 0
+    else:
+        if not silent:
+            print("[绿灯通过] 未发现严重违规。")
+        exit_code = 0
 
-    print("[绿灯通过] 未发现严重违规。")
-    return 0
+    if summary_collector is not None:
+        p2_flaws = [f for f in findings if f.severity == "P2"]
+        p3_flaws = [f for f in findings if f.severity == "P3"]
+        word_count = len(re.findall(r'[一-龥\w]', curr_text))
+        para_count = len([line.strip() for line in curr_text.splitlines() if line.strip()])
+        status_str = "P0 阻断" if p0_list else ("P1 警告" if p1_list else "合格")
+        summary_collector.update({
+            "chapter_index": curr_chapter.index,
+            "chapter_title": curr_chapter.title,
+            "word_count": word_count,
+            "paragraph_count": para_count,
+            "p0_list": list(p0_list),
+            "p1_list": list(p1_list),
+            "p2_count": len(p2_flaws),
+            "p3_count": len(p3_flaws),
+            "findings": list(findings),
+            "boundary_ctx": boundary_ctx,
+            "exit_code": exit_code,
+            "status": status_str,
+            "archived_report_path": archived_report_path,
+        })
+
+    return exit_code
 
 
 def run_sync_from_md(project_dir: Path) -> int:
@@ -540,7 +581,7 @@ def run_checkpoint(project_dir: Path, volume: Optional[int]) -> int:
 
 
 def run_init_mode(project_dir: Path, scope_str: Optional[str], force: bool) -> int:
-    """执行 --init 首次建账模式"""
+    """执行 --init 首次建账模式，集成启发式资产与伏笔抽取"""
     resolver = ChapterResolver()
     chapters = resolver.discover_chapters(project_dir)
     if not chapters:
@@ -574,13 +615,34 @@ def run_init_mode(project_dir: Path, scope_str: Optional[str], force: bool) -> i
         state = LedgerState()
 
     all_tags: List[Dict[str, str]] = list(state.foreshadowing_stash) if state.foreshadowing_stash else []
+    existing_asset_names: Dict[str, AssetItem] = {item.name: item for item in state.assets.values()}
+
+    total_extracted_assets = 0
     for chap in target_chapters:
         try:
             txt, _, _ = read_file_safe(chap.path)
+            # 1. 扫描伏笔标签
             tags = scan_foreshadowing_tags(txt)
             for t in tags:
                 if t not in all_tags:
                     all_tags.append(t)
+
+            # 2. 启发式抽取自然网文出装物资与装备
+            extracted_assets = extract_heuristic_assets(txt, chap.index)
+            for ast in extracted_assets:
+                nm = ast["name"]
+                if nm in existing_asset_names:
+                    # 去重并保留最早来源章节
+                    exist_item = existing_asset_names[nm]
+                    if chap.index < exist_item.origin_chapter:
+                        exist_item.origin_chapter = chap.index
+                else:
+                    item = AssetItem.from_dict(ast)
+                    if item.id in state.assets:
+                        item.id = f"{item.id}_{len(state.assets)+1}"
+                    state.assets[item.id] = item
+                    existing_asset_names[nm] = item
+                    total_extracted_assets += 1
         except Exception:
             pass
 
@@ -601,20 +663,189 @@ def run_init_mode(project_dir: Path, scope_str: Optional[str], force: bool) -> i
     s_fmt = str(start_idx).zfill(3)
     e_fmt = str(end_idx).zfill(3)
     report_file = reports_stage_dir / f"初始建账盘点报告_第{s_fmt}-{e_fmt}章.md"
+
+    category_counts: Dict[str, int] = {}
+    for it in state.assets.values():
+        category_counts[it.category] = category_counts.get(it.category, 0) + 1
+    cat_summary = ", ".join(f"{k}: {v} 项" for k, v in sorted(category_counts.items())) if category_counts else "无"
+
     content = (
         f"# 初始建账盘点报告 (第{s_fmt}-{e_fmt}章)\n\n"
         f"> 建账时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
         f"> 扫描章节数：{len(target_chapters)}\n"
-        f"> 提取伏笔标记数：{len(all_tags)}\n"
+        f"> 候选资产总数：{len(state.assets)} 项（{cat_summary}）\n"
+        f"> 提取伏笔标记数：{len(all_tags)}\n\n"
+        f"## 核心资产清册预览\n\n"
+        f"| 资产名称 | 类别 | 数量 | 单位 | 获取章节 |\n"
+        f"| :--- | :--- | :--- | :--- | :--- |\n"
     )
+    for it in sorted(state.assets.values(), key=lambda x: (x.origin_chapter, x.name)):
+        content += f"| {it.name} | {it.category} | {it.quantity} | {it.unit} | 第{it.origin_chapter:g}章 |\n"
+
     write_file_safe(report_file, content)
 
-    print(f"首次建账完成！已过账 {len(target_chapters)} 章，生成双轨账本与盘点报告。")
+    print(f"首次建账完成！已过账 {len(target_chapters)} 章，提取候选资产 {len(state.assets)} 项，生成双轨账本与盘点报告。")
     return 0
 
 
+def render_scope_batch_summary(
+    scope_str: str,
+    s_min: float,
+    s_max: float,
+    chapter_summaries: List[Dict[str, Any]],
+    strict: bool,
+) -> str:
+    """渲染批量审查聚合大盘报告 (Markdown)"""
+    today = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    n_chaps = len(chapter_summaries)
+    total_words = sum(c["word_count"] for c in chapter_summaries)
+    total_paras = sum(c["paragraph_count"] for c in chapter_summaries)
+    avg_words = int(total_words / max(n_chaps, 1))
+    avg_paras = int(total_paras / max(n_chaps, 1))
+
+    total_p0 = sum(len(c["p0_list"]) for c in chapter_summaries)
+    total_p1 = sum(len(c["p1_list"]) for c in chapter_summaries)
+    total_p2 = sum(c["p2_count"] for c in chapter_summaries)
+    total_p3 = sum(c["p3_count"] for c in chapter_summaries)
+
+    if total_p0 > 0:
+        overall_status = "🔴 P0 致命断裂阻断"
+    elif total_p1 > 0:
+        overall_status = "🟡 P1 严重失误警告 (严格模式中断)" if strict else "🟡 P1 严重失误警告 (放行)"
+    else:
+        overall_status = "🟢 绿灯合格通过"
+
+    lines: List[str] = [
+        f"# 批量连审大盘汇总报告 (范围: {scope_str})",
+        "",
+        f"> 生成时间：{today}  ",
+        f"> 审查范围：第 {s_min:03g} 章 至 第 {s_max:03g} 章  ",
+        f"> 覆盖章节：共 {n_chaps} 章  ",
+        f"> 综合判定：{overall_status}  ",
+        "",
+        "---",
+        "",
+        "## 一、全范围总览大盘",
+        "",
+        "| 指标项 | 统计数值 | 评估说明 |",
+        "| :--- | :--- | :--- |",
+        f"| 覆盖章节总数 | {n_chaps} 章 | 设定审查连续范围 |",
+        f"| 全篇总字数 | {total_words:,} 字 | 平均单章 {avg_words:,} 字 |",
+        f"| 全篇总段数 | {total_paras:,} 段 | 平均单章 {avg_paras} 段 |",
+        f"| P0 致命断裂 | {total_p0} 处 | 包含死亡复活、降智崩坏等红灯项 |",
+        f"| P1 严重失误 | {total_p1} 处 | 包含未记录战力、凭空出装等黄灯项 |",
+        f"| P2 排版长句/长段 | {total_p2} 处 | 单句逗号过多或单段超 120 字 |",
+        f"| P3 翻译腔/描写混杂 | {total_p3} 处 | AI 连词或对话后堆砌长动作 |",
+        "",
+        "---",
+        "",
+        "## 二、字数与段数统计走势",
+        "",
+        "| 章号 | 章节名称 | 总字数 | 自然段数 | 平均段长 | 走势评估 |",
+        "| :--- | :--- | :--- | :--- | :--- | :--- |",
+    ]
+
+    for c in chapter_summaries:
+        wc = c["word_count"]
+        pc = c["paragraph_count"]
+        avg_plen = round(wc / max(pc, 1), 1)
+        assess_parts = []
+        if wc < 2000:
+            assess_parts.append("篇幅偏薄(<2000字)")
+        elif wc > 4500:
+            assess_parts.append("长篇饱满(>4500字)")
+        else:
+            assess_parts.append("标准篇幅")
+
+        if avg_plen > 70:
+            assess_parts.append("段落偏密")
+        elif avg_plen < 35:
+            assess_parts.append("短句快节奏")
+        else:
+            assess_parts.append("节奏平稳")
+
+        lines.append(f"| 第{c['chapter_index']:03g}章 | {c['chapter_title']} | {wc:,} | {pc} | {avg_plen} 字/段 | {'；'.join(assess_parts)} |")
+
+    lines.extend([
+        "",
+        "---",
+        "",
+        "## 三、各章 P0/P1/P2/P3 瑕疵汇总列表",
+        "",
+        "| 章号 | 章节名称 | P0 阻断 | P1 警告 | P2 拖沓长句/长段 | P3 连词/台词混杂 | 单章判定 | 归档报告链接 |",
+        "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+    ])
+
+    for c in chapter_summaries:
+        p0_c = len(c["p0_list"])
+        p1_c = len(c["p1_list"])
+        p2_c = c["p2_count"]
+        p3_c = c["p3_count"]
+        status = c["status"]
+        rep_rel = c["archived_report_path"].as_posix()
+        lines.append(f"| 第{c['chapter_index']:03g}章 | {c['chapter_title']} | {p0_c} | {p1_c} | {p2_c} | {p3_c} | {status} | [查看归档]({rep_rel}) |")
+
+    lines.extend(["", "### 重点瑕疵条目清单", ""])
+    has_any_flaw = False
+    for c in chapter_summaries:
+        flaws: List[FormatFinding] = c.get("findings", [])
+        p0_l = c.get("p0_list", [])
+        p1_l = c.get("p1_list", [])
+        if p0_l or p1_l or flaws:
+            has_any_flaw = True
+            lines.append(f"#### 第 {c['chapter_index']:03g} 章 《{c['chapter_title']}》")
+            for p0_msg in p0_l:
+                lines.append(f"- **[P0 阻断]** {p0_msg}")
+            for p1_msg in p1_l:
+                lines.append(f"- **[P1 警告]** {p1_msg}")
+            for f in flaws:
+                lines.append(f"- **[{f.severity} {f.flaw_type}]** 行号 {f.line_number}: {f.message} (片段: `{f.snippet}`)")
+            lines.append("")
+
+    if not has_any_flaw:
+        lines.append("（全范围章节未发现任何严重违规或排版缺陷，全绿灯通过！）\n")
+
+    lines.extend([
+        "---",
+        "",
+        "## 四、跨章接缝与 POV 视点一览表",
+        "",
+        "| 章号 | 章节名称 | POV 视点/开篇叙事 | 接缝转场线索 | 承接前章状态 | 接缝质量评估 |",
+        "| :--- | :--- | :--- | :--- | :--- | :--- |",
+    ])
+
+    for c in chapter_summaries:
+        b_ctx: BoundaryContext = c["boundary_ctx"]
+        idx_str = f"第{c['chapter_index']:03g}章"
+        if not b_ctx.has_prev_chapter:
+            pov_info = "首章开篇"
+            clue = "-"
+            prev_status = "首章无前置上下文"
+            seam_rating = "🟢 初始开篇"
+        else:
+            if b_ctx.is_pov_transition:
+                pov_info = "多线 POV 转场"
+                clue = b_ctx.transition_clue or "视角切换"
+                seam_rating = "🔵 视点切换"
+            elif b_ctx.isolation_zones:
+                pov_info = "叙事时空切片"
+                clue = "含回忆/闪回"
+                seam_rating = "🟣 时空隔离"
+            else:
+                pov_info = "主角主视点顺承"
+                clue = "-"
+                seam_rating = "🟢 无缝顺承"
+
+            prev_status = "紧密相承" if b_ctx.has_prev_chapter else "-"
+
+        lines.append(f"| {idx_str} | {c['chapter_title']} | {pov_info} | {clue} | {prev_status} | {seam_rating} |")
+
+    lines.append("")
+    return "\n".join(lines)
+
+
 def run_scope_audit(project_dir: Path, scope_str: str, strict: bool, force: bool) -> int:
-    """执行批量连审模式"""
+    """执行批量连审模式，生成大盘汇总报告与紧凑看板输出"""
     try:
         s_min, s_max = parse_scope_range(scope_str)
     except Exception as e:
@@ -628,30 +859,100 @@ def run_scope_audit(project_dir: Path, scope_str: str, strict: bool, force: bool
         print(f"[错误] 范围 {scope_str} 内未找到任何章节！", file=sys.stderr)
         return 3
 
+    n_total = len(target_chapters)
+    print(f"========================================================================================")
+    print(f"🚀 开始批量审查 [范围: {scope_str} | 共 {n_total} 章]")
+    print(f"========================================================================================")
+
+    chapter_summaries: List[Dict[str, Any]] = []
     has_p0 = False
     has_p1 = False
 
-    for chap in target_chapters:
-        code = run_audit(project_dir, target_chapter_index=chap.index, strict=strict, force=force)
+    for idx, chap in enumerate(target_chapters, 1):
+        summary: Dict[str, Any] = {}
+        # 保持各章单章归档报告写入，但禁用单章覆盖 LATEST_REPORT.md 并静默单章冗余输出
+        code = run_audit(
+            project_dir,
+            target_chapter_index=chap.index,
+            strict=strict,
+            force=force,
+            write_latest_report=False,
+            silent=True,
+            summary_collector=summary,
+        )
+        chapter_summaries.append(summary)
+
         if code == 2:
             has_p0 = True
         elif code == 1:
             has_p1 = True
 
-    # 归档批量审查报告
-    batch_dir = project_dir / "reports" / "批量审查"
+        status_tag = summary.get("status", "完成")
+        print(f"  [{idx:02d}/{n_total:02d}] 审查 第{chap.index:03g}章 《{chap.title}》 ... [{status_tag}]")
+
+    # 打印终端紧凑汇总看板
+    print(f"========================================================================================")
+    print(f"📊 批量连审汇总看板 [范围: {scope_str} | 覆盖: {n_total} 章]")
+    print(f"========================================================================================")
+    print(f"{'章号':<8} | {'章节标题':<24} | {'字数':>6} | {'段数':>4} | {'P0':>2} | {'P1':>2} | {'P2':>2} | {'P3':>2} | {'状态':<6}")
+    print(f"{'-'*8}-+-{'-'*24}-+-{'-'*6}-+-{'-'*4}-+-{'-'*2}-+-{'-'*2}-+-{'-'*2}-+-{'-'*2}-+-{'-'*8}")
+
+    for s in chapter_summaries:
+        raw_title = s['chapter_title']
+        title_disp = raw_title[:22] + ".." if len(raw_title) > 22 else raw_title
+        p0_num = len(s['p0_list'])
+        p1_num = len(s['p1_list'])
+        p2_num = s['p2_count']
+        p3_num = s['p3_count']
+        print(f"第{s['chapter_index']:03g}章  | {title_disp:<24} | {s['word_count']:>6,} | {s['paragraph_count']:>4} | {p0_num:>2} | {p1_num:>2} | {p2_num:>2} | {p3_num:>2} | {s['status']}")
+
+    total_words = sum(s['word_count'] for s in chapter_summaries)
+    total_paras = sum(s['paragraph_count'] for s in chapter_summaries)
+    tot_p0 = sum(len(s['p0_list']) for s in chapter_summaries)
+    tot_p1 = sum(len(s['p1_list']) for s in chapter_summaries)
+    tot_p2 = sum(s['p2_count'] for s in chapter_summaries)
+    tot_p3 = sum(s['p3_count'] for s in chapter_summaries)
+
+    overall_label = "🔴 P0 阻断" if has_p0 else ("🟡 P1 警告" if has_p1 else "🟢 合格通过")
+    print(f"========================================================================================")
+    print(f"【全范围大盘】总章节: {n_total} 章 | 总字数: {total_words:,} 字 | 总段落: {total_paras:,} 段")
+    print(f"【瑕疵汇总】P0 阻断: {tot_p0} | P1 警告: {tot_p1} | P2 拖沓长句/段: {tot_p2} | P3 翻译腔/混杂: {tot_p3}")
+    print(f"【判定结论】{overall_label}")
+    print(f"========================================================================================")
+
+    # 生成聚合大盘报告 Markdown 内容
+    batch_summary_content = render_scope_batch_summary(
+        scope_str=scope_str,
+        s_min=s_min,
+        s_max=s_max,
+        chapter_summaries=chapter_summaries,
+        strict=strict,
+    )
+
+    reports_dir = project_dir / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. 输出指定命名大盘报告：reports/BATCH_SUMMARY_SCOPE_{scope}.md
+    scope_clean = scope_str.replace(" ", "")
+    scope_summary_path = reports_dir / f"BATCH_SUMMARY_SCOPE_{scope_clean}.md"
+    write_file_safe(scope_summary_path, batch_summary_content)
+
+    # 2. 输出历史归档批量报告：reports/批量审查/{today}_批量审查_第{s_fmt}-{e_fmt}章.md
+    batch_dir = reports_dir / "批量审查"
     batch_dir.mkdir(parents=True, exist_ok=True)
     today = datetime.now().strftime("%Y-%m-%d")
     s_fmt = str(int(s_min)).zfill(3)
     e_fmt = str(int(s_max)).zfill(3)
     batch_report_file = batch_dir / f"{today}_批量审查_第{s_fmt}-{e_fmt}章.md"
-    batch_content = (
-        f"# 批量审查报告：第 {s_fmt}-{e_fmt} 章\n\n"
-        f"> 审查日期：{today}\n"
-        f"> 覆盖章节数：{len(target_chapters)}\n"
-        f"> 状态：{'P0 阻断' if has_p0 else ('P1 警告' if has_p1 else '合格通过')}\n"
-    )
-    write_file_safe(batch_report_file, batch_content)
+    write_file_safe(batch_report_file, batch_summary_content)
+
+    # 3. 统一将最新报告更新为本次批量审查大盘报告
+    latest_report_path = reports_dir / "LATEST_REPORT.md"
+    write_file_safe(latest_report_path, batch_summary_content)
+
+    print(f"✅ 批量审查大盘报告已生成：{scope_summary_path}")
+    print(f"✅ 历史归档报告已写入：{batch_report_file}")
+    print(f"✅ 最新审查总览已更新：{latest_report_path}")
 
     if has_p0:
         return 2

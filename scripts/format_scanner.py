@@ -20,11 +20,18 @@ from scripts.types import FormatFinding
 
 # 系统流面板核心关键词
 SYSTEM_PANEL_KEYWORDS = {
+    # 传统玄幻 / 仙侠修真
     "力量", "敏捷", "境界", "寿元", "技能点", "宿主", "体质", "生命", "法力",
     "智力", "精神", "根骨", "气血", "功法", "经验", "天赋", "战力", "防御",
     "攻击", "状态", "属性", "等级", "法宝", "耐力", "潜能", "悟性", "幸运",
     "修为", "真元", "神识", "灵力", "元力", "魂力", "战技", "灵根", "系统",
-    "面板", "抽奖", "积分", "金币", "声望", "掉落"
+    "面板", "抽奖", "积分", "金币", "声望", "掉落",
+    # 科幻军工 / 末世造舰 / 硬核数据流专有关键词
+    "载具", "舰体", "结构质量", "能源", "装甲", "动力", "火控", "雷达",
+    "声呐", "重构点", "储备", "弹药", "基数", "航速", "排水量", "垂发",
+    "主炮", "导弹", "近防炮", "模块", "蓝图", "进化核心", "工况", "变动",
+    "损管", "轴系", "耐久", "功率", "负荷", "载重", "射程", "鱼雷",
+    "推进", "航向", "深弹", "机炮", "吃水", "浮力", "并网", "回波"
 }
 
 # AI 翻译腔高频连词库（按长度降序预排序，确保正则引擎优先匹配最长连词）
@@ -427,6 +434,211 @@ def _extract_sentences(line: str) -> List[Tuple[int, int, str]]:
     return sentences
 
 
+# 军事战术/遥测/数据流报文关键词集合
+MILITARY_DATA_KEYWORDS = {
+    "目标", "判定", "火控", "雷达", "声呐", "航向", "航速", "坐标", "指令",
+    "警报", "警告", "参数", "工况", "状态", "排水量", "载重", "装甲", "垂发",
+    "主炮", "近防炮", "射角", "扇面", "报文", "通信", "信道", "频段", "拦截",
+    "损管", "遥测", "回波", "敌方", "战损", "并网", "轴系", "水听器", "推进器",
+    "蓄电池", "结构完好", "校射", "链路", "机炮", "速射炮", "阵位", "鱼雷"
+}
+
+
+def _is_military_data_report(sentence: str) -> bool:
+    """
+    判断句子是否属于军事通信、战术数据流或系统遥测报文。
+    这类报文常以逗号分隔各战术参数与技术指标，属于文体特例，放宽逗号限制避免误判。
+    """
+    s = sentence.strip()
+    if not s:
+        return False
+
+    # 特征 1：方括号/【】包裹或带前缀的战术数据报文
+    if (s.startswith("【") and "】" in s) or (s.startswith("[") and "]" in s) or (s.startswith("【") and s.endswith("。")):
+        inner = s.strip("【】[] ")
+        if any(kw in inner for kw in MILITARY_DATA_KEYWORDS) or any(kw in inner for kw in SYSTEM_PANEL_KEYWORDS):
+            return True
+        if re.search(r'(?:识别|状态|参数|报告|提示|方案|指令|告警|意图)[：:]', inner):
+            return True
+
+    # 特征 2：以战术/系统指令或通信为核心的报文
+    if re.match(r'^[“"【\[]?(?:报告(?:长官|舰长|总师|指挥官|司令)?|呼叫|数据流|战损统计|火控方案|指令确认|敌方意图|目标识别)', s):
+        if any(kw in s for kw in MILITARY_DATA_KEYWORDS) or any(kw in s for kw in SYSTEM_PANEL_KEYWORDS):
+            return True
+
+    return False
+
+
+def _find_quote_intervals(line: str) -> List[Tuple[int, int]]:
+    """查找单行文本内所有中英文对话引号的 (start, end) 左闭右开区间"""
+    intervals: List[Tuple[int, int]] = []
+    i = 0
+    n = len(line)
+    while i < n:
+        if line[i] == '“':
+            q_start = i
+            q_end = line.find('”', q_start + 1)
+            if q_end != -1:
+                intervals.append((q_start, q_end + 1))
+                i = q_end + 1
+            else:
+                intervals.append((q_start, n))
+                break
+        elif line[i] == '"':
+            q_start = i
+            q_end = line.find('"', q_start + 1)
+            if q_end != -1:
+                intervals.append((q_start, q_end + 1))
+                i = q_end + 1
+            else:
+                intervals.append((q_start, n))
+                break
+        else:
+            i += 1
+    return intervals
+
+
+def scan_dragging_sentences(
+    text_or_line: str,
+    line_number: Optional[int] = None,
+    orig_line: Optional[str] = None,
+) -> List[FormatFinding]:
+    """
+    拖沓长句专用扫描器（支持单行或多行文本输入）。
+
+    规则与降噪：
+    1. 军事战术/通信数据流报文降噪：识别参数报文与指令数据流，避免误判为拖沓长句；
+    2. 对话台词降噪：拆分句内的叙述部分与对话台词，避免机械将台词逗号累加到叙述导致误报；
+    3. 口语对话放宽：角色精彩台词、激昂语流或短语排比允许自然呼吸，单句逗号门槛放宽；
+    4. 纯叙述句严格判定：单个完整句子内逗号 >= 4 个视为 P2 拖沓长句；
+    5. 窒息感单分句判定：单个无标点分句连续字数 >= 45 字触发 P2 窒息长句。
+    """
+    if not text_or_line:
+        return []
+
+    # 多行文本扫描模式
+    if line_number is None:
+        findings: List[FormatFinding] = []
+        lines = text_or_line.split("\n")
+        for idx, l_str in enumerate(lines):
+            clean = l_str.rstrip("\r").strip()
+            if not clean:
+                continue
+            findings.extend(scan_dragging_sentences(clean, line_number=idx + 1, orig_line=l_str))
+        return findings
+
+    # 单行文本扫描模式
+    clean_line = text_or_line.rstrip("\r").strip()
+    if not clean_line:
+        return []
+
+    quote_intervals = _find_quote_intervals(clean_line)
+    sentences = _extract_sentences(clean_line)
+    findings: List[FormatFinding] = []
+
+    for s_start, s_end, s_text in sentences:
+        # 1. 军事通信与战术数据流报文：放宽降噪
+        if _is_military_data_report(s_text):
+            continue
+
+        # 2. 条件 B：单分句无标点连续字数 >= 45 字（窒息长句硬性检测）
+        clauses = PUNCTUATION_SPLIT_PATTERN.split(s_text)
+        has_breathless = False
+        for clause in clauses:
+            if len(clause) >= 45:
+                findings.append(FormatFinding(
+                    line_number=line_number,
+                    flaw_type="DRAGGING_SENTENCE",
+                    severity="P2",
+                    snippet=_make_snippet(clause),
+                    message=f"单个分句连续 {len(clause)} 字无停顿标点，阅读易产生窒息感",
+                    suggestion="建议在分句中适当增加逗号或句号断句，避免长句窒息感。"
+                ))
+                has_breathless = True
+                break
+
+        if has_breathless:
+            continue
+
+        # 3. 条件 A：逗号数量检测（结合引号区间精准切分叙述与台词）
+        s_len = s_end - s_start
+        in_quote = [False] * s_len
+        for q_start, q_end in quote_intervals:
+            ov_start = max(s_start, q_start)
+            ov_end = min(s_end, q_end)
+            if ov_start < ov_end:
+                for k in range(ov_start - s_start, ov_end - s_start):
+                    in_quote[k] = True
+
+        has_dialogue = any(in_quote)
+
+        if not has_dialogue:
+            # 纯叙述句子：严格执行逗号 >= 4 个判定
+            comma_count = s_text.count("，") + s_text.count(",")
+            if comma_count >= 4:
+                findings.append(FormatFinding(
+                    line_number=line_number,
+                    flaw_type="DRAGGING_SENTENCE",
+                    severity="P2",
+                    snippet=_make_snippet(s_text),
+                    message=f"单句内逗号过多（含 {comma_count} 个逗号），存在拖沓长句现象",
+                    suggestion="建议在动作转换或语义停顿处使用句号断句，拆为2-3个独立短句。"
+                ))
+        else:
+            # 混合或纯台词句子：叙述与台词分别判定，绝不机械相加
+            narrative_chars = [s_text[k] for k in range(s_len) if not in_quote[k]]
+            narrative_text = "".join(narrative_chars).strip()
+            narrative_commas = narrative_text.count("，") + narrative_text.count(",")
+
+            # 叙述部分若自身逗号 >= 4 个，判定为拖沓
+            if narrative_commas >= 4:
+                findings.append(FormatFinding(
+                    line_number=line_number,
+                    flaw_type="DRAGGING_SENTENCE",
+                    severity="P2",
+                    snippet=_make_snippet(s_text),
+                    message=f"句子叙述部分逗号过多（含 {narrative_commas} 个逗号），存在拖沓长句现象",
+                    suggestion="建议在叙述部分的动作转换或语义停顿处使用句号断句，拆为独立短句。"
+                ))
+                continue
+
+            # 对话台词部分提取
+            diag_segments: List[str] = []
+            curr_seg: List[str] = []
+            for k in range(s_len):
+                if in_quote[k]:
+                    curr_seg.append(s_text[k])
+                else:
+                    if curr_seg:
+                        diag_segments.append("".join(curr_seg))
+                        curr_seg = []
+            if curr_seg:
+                diag_segments.append("".join(curr_seg))
+
+            for d_seg in diag_segments:
+                clean_d = d_seg.strip('“”"\'’ ')
+                if not clean_d or _is_military_data_report(clean_d):
+                    continue
+
+                d_commas = clean_d.count("，") + clean_d.count(",")
+                # 口语台词放宽：如果逗号 >= 8 个且分句平均字数较长 (> 18 字)，才判定为长台词拖沓
+                if d_commas >= 8:
+                    d_clauses = [c for c in PUNCTUATION_SPLIT_PATTERN.split(clean_d) if c]
+                    avg_clause_len = sum(len(c) for c in d_clauses) / max(len(d_clauses), 1)
+                    if avg_clause_len > 18:
+                        findings.append(FormatFinding(
+                            line_number=line_number,
+                            flaw_type="DRAGGING_SENTENCE",
+                            severity="P2",
+                            snippet=_make_snippet(d_seg),
+                            message=f"角色台词单句过长且逗号过多（含 {d_commas} 个逗号），建议拆解为多句台词或穿插动作",
+                            suggestion="建议在台词激烈处使用感叹号断句，或在台词间插入人物动作、神态描写。"
+                        ))
+                        break
+
+    return findings
+
+
 def scan_typography_flaws(text: str, original_text: str = "") -> List[FormatFinding]:
     """
     排版格式缺陷扫描器。
@@ -493,34 +705,8 @@ def scan_typography_flaws(text: str, original_text: str = "") -> List[FormatFind
         # -------------------------------------------------------------
         # 2. 检测 DRAGGING_SENTENCE (P2)
         # -------------------------------------------------------------
-        sentences = _extract_sentences(clean_masked)
-        for _, _, s_text in sentences:
-            # 条件 A：句内包含逗号 >= 4 个
-            comma_count = s_text.count("，") + s_text.count(",")
-            if comma_count >= 4:
-                findings.append(FormatFinding(
-                    line_number=line_number,
-                    flaw_type="DRAGGING_SENTENCE",
-                    severity="P2",
-                    snippet=_make_snippet(s_text),
-                    message=f"单句内逗号过多（含 {comma_count} 个逗号），存在拖沓长句现象",
-                    suggestion="建议在动作转换或语义停顿处使用句号断句，拆为2-3个独立短句。"
-                ))
-                continue
-
-            # 条件 B：单分句无标点连续字数 >= 45 字
-            clauses = PUNCTUATION_SPLIT_PATTERN.split(s_text)
-            for clause in clauses:
-                if len(clause) >= 45:
-                    findings.append(FormatFinding(
-                        line_number=line_number,
-                        flaw_type="DRAGGING_SENTENCE",
-                        severity="P2",
-                        snippet=_make_snippet(clause),
-                        message=f"单个分句连续 {len(clause)} 字无停顿标点，阅读易产生窒息感",
-                        suggestion="建议在分句中适当增加逗号或句号断句，避免长句窒息感。"
-                    ))
-                    break
+        dragging_findings = scan_dragging_sentences(clean_masked, line_number=line_number, orig_line=orig_line)
+        findings.extend(dragging_findings)
 
         # -------------------------------------------------------------
         # 3. 检测 DIALOGUE_MIXED (P3)

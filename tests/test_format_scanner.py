@@ -20,7 +20,9 @@ from typing import List
 
 from scripts.types import FormatFinding
 from scripts.format_scanner import (
+    SYSTEM_PANEL_KEYWORDS,
     mask_special_blocks,
+    scan_dragging_sentences,
     scan_typography_flaws,
 )
 
@@ -657,6 +659,94 @@ class TestFormatScanner(unittest.TestCase):
             with self.assertRaises(ValueError):
                 from scripts.format_scanner import mask_special_blocks
                 mask_special_blocks("test\ntext")
+
+    def test_mask_scifi_military_system_panels(self):
+        """测试科幻军工、末世造舰系统面板与专有属性掩码识别"""
+        required_keywords = [
+            "载具", "舰体", "结构质量", "能源", "装甲", "动力", "火控", "雷达",
+            "声呐", "重构点", "储备", "弹药", "基数", "航速", "排水量", "垂发",
+            "主炮", "导弹", "近防炮", "模块", "蓝图", "进化核心", "工况", "变动",
+            "损管", "轴系", "耐久", "功率", "负荷", "载重"
+        ]
+        for kw in required_keywords:
+            self.assertIn(kw, SYSTEM_PANEL_KEYWORDS, f"关键词 '{kw}' 必须包含在 SYSTEM_PANEL_KEYWORDS 中")
+
+        # 测试多行科幻造舰面板识别与置空
+        text = (
+            "战斗警报拉响。\n"
+            "【全舰工况数据流】\n"
+            "- 舰体结构质量：98%\n"
+            "- 动力输出功率：4500kW\n"
+            "- 装甲负荷：正常\n"
+            "- 雷达声呐阵列：全频段开启\n"
+            "- 垂发主炮系统：热备中\n"
+            "全员进入战位。"
+        )
+        masked_text, masks = mask_special_blocks(text)
+        self.assertEqual(masked_text.count("\n"), text.count("\n"))
+        self.assertTrue(len(masks) >= 1)
+        self.assertEqual(masks[0]["type"], "system_panel")
+
+        # 检查中间面板行已被置空
+        m_lines = masked_text.split("\n")
+        for idx in range(1, 7):
+            self.assertEqual(m_lines[idx], "")
+        self.assertEqual(m_lines[0], "战斗警报拉响。")
+        self.assertEqual(m_lines[7], "全员进入战位。")
+
+        # 测试单行系统报文掩码
+        single_msg = "【敌方意图判定：航向锁定本舰，航速十二节，正在形成合围拦截阵型。】"
+        masked_single, masks_single = mask_special_blocks(single_msg)
+        self.assertEqual(masked_single.strip(), "")
+        self.assertTrue(len(masks_single) >= 1)
+
+    def test_scan_dragging_sentences_dialogue_denoising(self):
+        """测试对话引号与口语台词放宽/降噪机制：避免将精彩台词误报为 P2 拖沓长句"""
+        # 1. 人物激昂台词（含 5 个逗号），口语自然停顿，不应触发拖沓长句
+        excited_dialogue = (
+            "“能！造船厂水下车间里封存着四台德国进口的五轴数控机床和上百吨特种防弹钢！"
+            "只要把那些东西捞上来，老头子我亲自给你当总师，幼薇当主改装手，三天之内，"
+            "老子给你焊出一艘能硬抗十二级台风、能架三十毫米双联速射机炮的百吨级钢铁巨兽！”"
+        )
+        flaws_dial = scan_typography_flaws(excited_dialogue)
+        drag_flaws_dial = [f for f in flaws_dial if f.flaw_type == "DRAGGING_SENTENCE"]
+        self.assertEqual(len(drag_flaws_dial), 0, "精彩角色口语台词不应被误判为 P2 拖沓长句")
+
+        # 2. 叙述 + 对话混合句：叙述 2 个逗号，对话 3 个逗号，总计 5 个逗号，独立统计不应误报
+        mixed_sent = "王龙飞收起割枪，亮出腕上的军用识别标牌，沉声道，“沈总师，沈幼薇同志，我接到了你们的呼救，现在立刻撤离！”"
+        flaws_mixed = scan_typography_flaws(mixed_sent)
+        drag_flaws_mixed = [f for f in flaws_mixed if f.flaw_type == "DRAGGING_SENTENCE"]
+        self.assertEqual(len(drag_flaws_mixed), 0, "叙述与台词逗号不应机械相加导致误判")
+
+        # 3. 对照纯叙述句子（4 个逗号），依然严格触发 P2 拖沓长句
+        narrative_dragging = "他缓缓拔出腰间长剑，剑锋在寒月下泛着冰冷光华，脚步随之微微挪动，周身真气骤然凝聚，随即猛然向前刺出一击。"
+        flaws_narr = scan_typography_flaws(narrative_dragging)
+        drag_flaws_narr = [f for f in flaws_narr if f.flaw_type == "DRAGGING_SENTENCE"]
+        self.assertEqual(len(drag_flaws_narr), 1, "纯叙述长句逗号>=4仍须精准捕获")
+
+    def test_scan_dragging_sentences_military_data_report_denoising(self):
+        """测试军事战术数据流与遥测报文降噪放行"""
+        # 方括号/【】战术数据报文
+        tactical_msg = "【目标识别：黑旗帮改装铁皮武装渔船，单艇排水量约八吨，加装外挂柴油机与简易钢板防盾，搭载人员共计十二人，持有五连发猎枪、自制土统与砍刀。】"
+        findings = scan_dragging_sentences(tactical_msg, line_number=1)
+        self.assertEqual(len(findings), 0, "战术数据流报文不应触发拖沓长句")
+
+        # 军事通信汇报
+        comms_msg = "“报告舰长，雷达开机完成，声呐就绪，主炮装填完毕，随时可以发射！”"
+        findings_comms = scan_dragging_sentences(comms_msg, line_number=1)
+        self.assertEqual(len(findings_comms), 0, "军事通信战术汇报不应触发拖沓长句")
+
+    def test_scan_dragging_sentences_standalone_api(self):
+        """测试 scan_dragging_sentences 独立 API 多行与单行调用能力"""
+        multiline_text = (
+            "前置正常短句。\n"
+            "他缓缓拔出腰间长剑，剑锋在寒月下泛着冰冷光华，脚步随之微微挪动，周身真气骤然凝聚，随即猛然向前刺出一击。\n"
+            "后置正常短句。\n"
+        )
+        findings = scan_dragging_sentences(multiline_text)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].line_number, 2)
+        self.assertEqual(findings[0].flaw_type, "DRAGGING_SENTENCE")
 
 if __name__ == "__main__":
     unittest.main()

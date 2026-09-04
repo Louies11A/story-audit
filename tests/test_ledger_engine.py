@@ -18,6 +18,7 @@ from scripts.ledger_engine import (
     LedgerState,
     check_dirty_state,
     create_volume_checkpoint,
+    extract_heuristic_assets,
     render_ledger_markdown,
     save_ledger_state,
     scan_foreshadowing_tags,
@@ -682,6 +683,111 @@ class TestSyncFromMarkdown(unittest.TestCase):
             check_dirty_state(self.md_path, self.json_path),
             "超过 0.05s 容差的大于判定应准确识别为脏写"
         )
+
+
+class TestHeuristicAssetsAndForeshadowing(unittest.TestCase):
+    """测试启发式资产与伏笔抽取器"""
+
+    def test_extract_heuristic_assets_bracketed(self):
+        """测试系统出装括号与提示块中的资产抽取"""
+        text = (
+            "【获得：二阶双体炮艇改装蓝图×1】\n"
+            "【打捞成功：获得德国进口五轴数控机床×4台】\n"
+            "【获得重构点：500点】\n"
+            "【开启二号掩体，获得76毫米重炮与拖曳声呐】\n"
+            "【缴获物资：轻机枪3挺，7.62毫米弹药8箱】\n"
+        )
+        assets = extract_heuristic_assets(text, chapter_index=18.0)
+        self.assertTrue(len(assets) >= 6)
+
+        names = {a["name"]: a for a in assets}
+        self.assertIn("二阶双体炮艇改装蓝图", names)
+        self.assertEqual(names["二阶双体炮艇改装蓝图"]["quantity"], 1)
+        self.assertEqual(names["二阶双体炮艇改装蓝图"]["category"], "功法神通")
+
+        self.assertTrue(any("五轴数控机床" in k for k in names.keys()))
+        self.assertIn("重构点", names)
+        self.assertEqual(names["重构点"]["category"], "资金资产")
+        self.assertEqual(names["重构点"]["quantity"], 500)
+
+        self.assertTrue(any("76毫米" in k for k in names.keys()))
+        self.assertTrue(any("声呐" in k for k in names.keys()))
+        self.assertIn("轻机枪", names)
+        self.assertEqual(names["轻机枪"]["quantity"], 3)
+
+    def test_extract_heuristic_assets_natural_text(self):
+        """测试自然网文文本中的装备出装与物资抽取"""
+        text = (
+            "水下车间里封存着四台德国进口的五轴数控机床和上百吨特种防弹钢！\n"
+            "搜刮到了80只重型军用防水弹药箱，还有1门76毫米速射炮与百吨大米。\n"
+            "清点战利品，清点出五十箱军用肉罐头与两吨重油。\n"
+        )
+        assets = extract_heuristic_assets(text, chapter_index=6.0)
+        names = {a["name"]: a for a in assets}
+
+        # 检查 80只弹药箱
+        ammo_box = [v for k, v in names.items() if "弹药箱" in k]
+        self.assertTrue(len(ammo_box) >= 1)
+        self.assertEqual(ammo_box[0]["quantity"], 80)
+        self.assertEqual(ammo_box[0]["unit"], "只")
+
+        # 检查 1门76毫米速射炮
+        cannon = [v for k, v in names.items() if "76毫米速射炮" in k]
+        self.assertTrue(len(cannon) >= 1)
+        self.assertEqual(cannon[0]["quantity"], 1)
+        self.assertEqual(cannon[0]["unit"], "门")
+
+        # 检查 百吨大米
+        rice = [v for k, v in names.items() if "大米" in k]
+        self.assertTrue(len(rice) >= 1)
+        self.assertEqual(rice[0]["quantity"], 100)
+        self.assertEqual(rice[0]["unit"], "吨")
+        self.assertEqual(rice[0]["category"], "丹药耗材")
+
+        # 检查 四台五轴数控机床
+        mach = [v for k, v in names.items() if "机床" in k]
+        self.assertTrue(len(mach) >= 1)
+        self.assertEqual(mach[0]["quantity"], 4)
+
+        # 检查 五十箱肉罐头
+        can = [v for k, v in names.items() if "肉罐头" in k]
+        self.assertTrue(len(can) >= 1)
+        self.assertEqual(can[0]["quantity"], 50)
+        self.assertEqual(can[0]["unit"], "箱")
+
+    def test_extract_heuristic_assets_enemy_exclusion(self):
+        """测试敌方动作与战斗描写不会被误抽为我方资产"""
+        text = "前方三艘黑旗帮改装快艇呼啸而来，两艘敌方铁皮渔船正全速包抄本舰，试图实施撞击拦截！"
+        assets = extract_heuristic_assets(text, chapter_index=3.0)
+        self.assertEqual(len(assets), 0, "纯敌方目标与战斗威胁不应被误判为获取资产")
+
+    def test_scan_foreshadowing_tags_enhanced(self):
+        """测试增强版伏笔扫描：支持 HTML 注释、括号标记与自然文本悬念引子"""
+        text = (
+            '<!-- audit:stash name="远古残卷" origin="第3章" status="UNACQUIRED" -->\n'
+            '【伏笔:深海第三层异动】\n'
+            '【伏笔:神秘海图 origin="第10章" status="UNACQUIRED"】\n'
+            '【悬念:迷雾中的巨型阴影 | 来源:第5章 | 状态:未解】\n'
+            '[线索:失踪的海军科考船]\n'
+        )
+        tags = scan_foreshadowing_tags(text)
+        tag_dict = {t["name"]: t for t in tags}
+
+        self.assertIn("远古残卷", tag_dict)
+        self.assertEqual(tag_dict["远古残卷"]["origin"], "第3章")
+        self.assertEqual(tag_dict["远古残卷"]["status"], "UNACQUIRED")
+
+        self.assertIn("深海第三层异动", tag_dict)
+
+        self.assertIn("神秘海图", tag_dict)
+        self.assertEqual(tag_dict["神秘海图"]["origin"], "第10章")
+        self.assertEqual(tag_dict["神秘海图"]["status"], "UNACQUIRED")
+
+        self.assertIn("迷雾中的巨型阴影", tag_dict)
+        self.assertEqual(tag_dict["迷雾中的巨型阴影"]["origin"], "第5章")
+        self.assertEqual(tag_dict["迷雾中的巨型阴影"]["status"], "未解")
+
+        self.assertIn("失踪的海军科考船", tag_dict)
 
 
 if __name__ == '__main__':

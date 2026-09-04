@@ -17,7 +17,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from scripts.safe_io import read_file_safe, write_file_safe
 
@@ -216,29 +216,327 @@ class LedgerState:
         )
 
 
-def scan_foreshadowing_tags(text: str) -> List[Dict[str, str]]:
-    """扫描提取文本中的伏笔缓冲池注释标签
+def parse_chinese_or_arabic_number(s: str) -> Union[int, float]:
+    """将阿拉伯数字或中文数字串转换为数值"""
+    s = s.strip()
+    if not s:
+        return 1
+    try:
+        if "." in s:
+            return float(s)
+        return int(s)
+    except ValueError:
+        pass
 
-    提取模式：<!-- audit:stash name="..." [origin="..."] [status="..."] -->
+    if s == "半":
+        return 0.5
+    if s in ("百", "上百"):
+        return 100
+    if s in ("千", "上千"):
+        return 1000
+    if s in ("万", "上万"):
+        return 10000
+
+    clean_s = s
+    for pfx in ("上", "数", "约", "近"):
+        if clean_s.startswith(pfx) and len(clean_s) > 1:
+            clean_s = clean_s[len(pfx):]
+    for sfx in ("余", "来", "个", "只"):
+        if clean_s.endswith(sfx) and len(clean_s) > 1:
+            clean_s = clean_s[:-len(sfx)]
+
+    cn_digits = {
+        "零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+        "五": 5, "六": 6, "七": 7, "八": 8, "九": 9,
+    }
+    units = {"十": 10, "百": 100, "千": 1000, "万": 10000}
+
+    if clean_s in cn_digits:
+        return cn_digits[clean_s]
+    if clean_s in units:
+        return units[clean_s]
+
+    total = 0
+    curr = 0
+    for char in clean_s:
+        if char in cn_digits:
+            curr = cn_digits[char]
+        elif char in units:
+            unit_val = units[char]
+            if curr == 0:
+                curr = 1
+            if unit_val >= 10000:
+                total = (total + curr) * unit_val
+            else:
+                total += curr * unit_val
+            curr = 0
+    total += curr
+    return total if total > 0 else 1
+
+
+def _categorize_asset(name: str) -> str:
+    """根据资产名称启发式推断七大资产类别"""
+    if any(k in name for k in ("重构点", "点数", "积分", "金币", "银币", "铜币", "灵石", "能量币", "晶石", "贡献点")):
+        return "资金资产"
+    if any(k in name for k in ("米", "粮", "面", "罐头", "肉", "水", "油", "柴油", "重油", "汽油", "煤油", "药", "抗生素", "急救包", "绷带", "弹药", "子弹", "炮弹", "深弹", "高爆弹", "穿甲弹", "炸药", "防弹钢", "特种钢", "钛合金", "铝合金", "合金", "口粮", "饼干")):
+        return "丹药耗材"
+    if any(k in name for k in ("蓝图", "图纸", "设计图", "功法", "神通", "秘籍", "心法", "技能")):
+        return "功法神通"
+    if any(k in name for k in ("女兵", "幸存者", "工人", "工程师", "水鬼", "战队", "战友", "部下", "亲卫", "随从")):
+        return "随行战力"
+    return "装备道具"
+
+
+def _clean_asset_name(raw: str) -> str:
+    """清洗资产名称中的多余助词与标点"""
+    name = raw.strip("：: ，,、。！？“”\"\'[]【】 ")
+    name = re.sub(r'^(?:未使用的|未经使用的|全新|完好无损的|进口的|德国进口的)', '', name)
+    name = re.sub(r'^(?:一枚|一座|一台|一艘|一套|一只|一门|一把|一挺)', '', name)
+    return name.strip()
+
+
+def extract_heuristic_assets(text: str, chapter_index: float) -> List[Dict[str, Any]]:
+    """
+    启发式资产抽取器：在缺乏人工 audit:stash 注释标签时，
+    从自然网文中识别物资、装备出装、军工资产与系统收录物品。
     """
     if not text:
         return []
 
-    pattern = re.compile(
+    raw_candidates: List[Tuple[str, Union[int, float], str, str]] = []
+
+    # 1. 扫描系统出装/提示括号块 【获得/收录/解锁/建造/打捞/缴获...】
+    bracket_pattern = re.compile(
+        r'【(?P<header>[^】]*?(?:收录|发现|获得|激活|建造|升级|开启|解锁|掉落|装备|制造|打捞|缴获|入库)[^】]*?)[：:\s]*(?P<content>[^】]+)】'
+    )
+    units_regex = "门|座|台|艘|架|挺|只|箱|吨|斤|发|枚|颗|件|套|把|支|组|部|瓶|袋|罐|筒|具|块|根|张|联|卷|桶|批|口|尊|点"
+
+    for m in bracket_pattern.finditer(text):
+        content = m.group("content").strip()
+        full_bracket = m.group(0)
+        clean_content = re.sub(r'^(?:成功[：:]|物资[：:]|获得[：:]|装备[：:]|制造[：:]|缴获[：:]|发现[：:])', '', content).strip()
+        sub_items = [s.strip() for s in re.split(r'[，,、；;\s]+', clean_content) if s.strip()]
+        for sub in sub_items:
+            m_cross = re.match(r'^(?P<name>[^×*x\d]+?)[×*x]\s*(?P<num>\d+(?:\.\d+)?)(?:\s*(?P<unit>[\u4e00-\u9fa5]+))?$', sub)
+            if m_cross:
+                nm = _clean_asset_name(m_cross.group("name"))
+                qty = parse_chinese_or_arabic_number(m_cross.group("num"))
+                un = m_cross.group("unit") or ("台" if "机床" in nm else ("份" if "蓝图" in nm else "个"))
+                if len(nm) >= 2:
+                    raw_candidates.append((nm, qty, un, full_bracket))
+                continue
+
+            m_nu = re.match(rf'^(?P<name>.+?)(?P<num>\d+|[一二两三四五六七八九十百千万半]+)\s*(?P<unit>{units_regex})$', sub)
+            if m_nu:
+                nm = _clean_asset_name(m_nu.group("name"))
+                qty = parse_chinese_or_arabic_number(m_nu.group("num"))
+                un = m_nu.group("unit")
+                if len(nm) >= 2:
+                    raw_candidates.append((nm, qty, un, full_bracket))
+                continue
+
+            m_un = re.match(rf'^(?P<num>\d+|[一二两三四五六七八九十百千万半]+)\s*(?P<unit>{units_regex})\s*(?P<name>.+)$', sub)
+            if m_un:
+                nm = _clean_asset_name(m_un.group("name"))
+                qty = parse_chinese_or_arabic_number(m_un.group("num"))
+                un = m_un.group("unit")
+                if len(nm) >= 2:
+                    raw_candidates.append((nm, qty, un, full_bracket))
+                continue
+
+            nm = _clean_asset_name(sub)
+            if len(nm) >= 2 and not any(p in nm for p in ("完成", "就位", "确认", "正在", "开始")):
+                un = "套" if any(u in nm for u in ("声呐", "雷达", "系统", "网络")) else ("门" if "炮" in nm else "个")
+                raw_candidates.append((nm, 1, un, full_bracket))
+
+    # 2. 扫描自然文本中的 数量 + 单位 + 军工物资名称
+    nums_regex = r"(?:\d+(?:\.\d+)?|[一二两三四五六七八九十百千万半]+|上百|上千|上万|百|千|万)"
+    kws_regex = (
+        r"(?:速射炮|主炮|机炮|舰炮|近防炮|火炮|高射炮|迫击炮|加农炮|重炮|防空炮|火箭炮|"
+        r"鱼雷|导弹|火箭弹|深弹|穿甲弹|高爆弹|曳光弹|燃烧弹|子弹|炮弹|手雷|地雷|水雷|"
+        r"步枪|突击步枪|冲锋枪|狙击步枪|机枪|手枪|猎枪|霰弹枪|火箭筒|发射巢|发射管|发射器|"
+        r"防盾|军火箱|弹药箱|弹药|军火|装甲|骨甲|防弹衣|防弹插板|战术背心|夜视仪|消音器|瞄准镜|刺刀|枪塔|"
+        r"数控机床|五轴机床|五轴数控机床|机床|工业母机|发电机|柴油机|燃气轮机|发动机|电动机|增压机|汽油机|充电机|"
+        r"水泵|抽水机|空压机|潜水器|水肺|呼吸器|浮力气囊|气囊|千斤顶|电动绞盘|绞盘|铣刀|合金铣刀|焊机|电焊机|车床|"
+        r"蓄电池|储能电池|变压器|配电柜|轴系|舵机|螺旋桨|喷水推进器|推进器|相控阵声呐|声呐基阵|声呐|相控阵|水听器|"
+        r"火控系统|火控雷达|火控计算机|通信基站|无线电台|对讲机|巡逻艇|双体炮艇|炮艇|快艇|双体船|冲锋舟|皮划艇|防弹艇|救生艇|"
+        r"拖轮|驳船|货轮|护卫舰|驱逐舰|巡洋舰|战列舰|潜艇|潜航器|装甲车|重卡|"
+        r"大米|白面|面粉|小麦|糙米|粗粮|肉罐头|水果罐头|蔬菜罐头|鱼罐头|罐头|压缩饼干|单兵口粮|军粮|口粮|"
+        r"纯净水|矿泉水|纯水|抗生素|消炎药|止痛药|急救包|重油|柴油|汽油|航空煤油|机油|润滑油|防冻液|"
+        r"防弹钢|特种防弹钢|特种钢|钛合金|铝合金|钨钢|无缝钢管|钢材|钢板|"
+        r"重构点|进化核心|蓝图|改装蓝图|建造蓝图|设计图|图纸|能量核心|能量晶体|晶核)"
+    )
+
+    natural_pattern = re.compile(
+        rf'(?P<num>{nums_regex})\s*(?P<unit>{units_regex})\s*(?P<desc>[\u4e00-\u9fa5a-zA-Z0-9]{{0,10}}?)(?P<kw>{kws_regex})'
+    )
+
+    acquisition_verbs = {
+        "收录", "发现", "获得", "激活", "建造", "升级", "开启", "解锁", "掉落", "装备", "制造",
+        "打捞", "缴获", "入库", "找到", "运回", "搜刮", "收获", "起出", "搬出", "运送", "加装",
+        "清点出", "清点", "囤积", "储备", "开出", "封存着", "拥有", "配备", "装载", "采购",
+        "进账", "得到", "采掘", "提炼", "生产", "改装完成", "捕获", "存有", "堆放着", "物资",
+        "战利品", "战备", "军械库", "仓库", "掩体", "车间", "补给", "起步", "亮剑", "上线", "改装完成", "完成改装", "总装"
+    }
+    enemy_verbs = {"击毁", "击沉", "打烂", "摧毁", "炸沉", "包抄", "呼啸而来", "截击", "逼近", "海盗船", "敌方"}
+
+    for line in text.splitlines():
+        clean_l = line.strip()
+        if not clean_l:
+            continue
+        for m in natural_pattern.finditer(clean_l):
+            matched_str = m.group(0)
+            num_str = m.group("num")
+            unit_str = m.group("unit")
+            desc_str = m.group("desc") or ""
+            kw_str = m.group("kw")
+
+            full_name = _clean_asset_name(desc_str + kw_str)
+            if len(full_name) < 2:
+                continue
+
+            sent_context = clean_l
+            enemy_factions = {"敌方", "敌军", "敌舰", "敌艇", "海盗", "黑旗帮", "铁钩帮", "水匪", "变异体", "丧尸"}
+            loot_verbs = {"缴获", "打捞", "俘获", "搜刮", "战利品", "起出", "入库"}
+
+            # 若名称包含敌对阵营特征且无明确战利品/缴获动词，排除敌方目标
+            if any(ef in full_name for ef in enemy_factions) and not any(lv in sent_context for lv in loot_verbs):
+                continue
+
+            has_acq = any(v in sent_context for v in acquisition_verbs)
+            has_enemy = any(v in sent_context for v in enemy_verbs)
+            if has_enemy and not any(lv in sent_context for lv in loot_verbs):
+                continue
+
+            qty = parse_chinese_or_arabic_number(num_str)
+            raw_candidates.append((full_name, qty, unit_str, matched_str))
+
+    # 3. 结果去重与规整
+    aggregated: Dict[str, Tuple[Union[int, float], str, str]] = {}
+    for name, qty, unit, snip in raw_candidates:
+        if name in ("机床", "钢材", "物资", "装备") and any(name in k for k in aggregated.keys() if len(k) > len(name)):
+            continue
+        if name not in aggregated:
+            aggregated[name] = (qty, unit, snip)
+        else:
+            old_qty, old_un, old_snip = aggregated[name]
+            if qty > old_qty:
+                aggregated[name] = (qty, unit, snip)
+
+    results: List[Dict[str, Any]] = []
+    idx = 1
+    for name, (qty, unit, snip) in aggregated.items():
+        slug = re.sub(r'[^a-zA-Z0-9一-龥]', '', name)
+        asset_id = f"ast_c{int(chapter_index):03d}_{idx}_{slug}"
+        category = _categorize_asset(name)
+        results.append({
+            "id": asset_id,
+            "name": name,
+            "category": category,
+            "quantity": qty,
+            "unit": unit,
+            "owner": "主角",
+            "current_holder": "主角",
+            "status": "ACQUIRED",
+            "origin_chapter": float(chapter_index),
+            "constraints": {},
+            "raw_snippet": snip,
+        })
+        idx += 1
+
+    return results
+
+
+def _parse_foreshadowing_content(
+    content: str,
+    results: List[Dict[str, str]],
+    seen: Set[Tuple[str, str, str]],
+) -> None:
+    """解析单条伏笔/悬念标记内容并去重记录"""
+    if not content:
+        return
+
+    m_orig = re.search(r'origin="([^"]*)"', content)
+    origin = m_orig.group(1).strip() if m_orig else ""
+
+    m_stat = re.search(r'status="([^"]*)"', content)
+    status = m_stat.group(1).strip() if m_stat else ""
+
+    m_name = re.search(r'name="([^"]+)"', content)
+    if m_name:
+        name = m_name.group(1).strip()
+    else:
+        clean = re.sub(r'(?:origin|status)="[^"]*"', '', content).strip()
+        parts = [p.strip() for p in re.split(r'[|，,；;]', clean) if p.strip()]
+        if not parts:
+            return
+        name = parts[0]
+        for p in parts[1:]:
+            mo = re.match(r'^(?:来源|出处|章节)[：:]\s*(.+)$', p)
+            if mo:
+                origin = mo.group(1).strip()
+                continue
+            ms = re.match(r'^(?:状态)[：:]\s*(.+)$', p)
+            if ms:
+                status = ms.group(1).strip()
+                continue
+            if re.match(r'^第?\d+章$', p):
+                origin = p
+                continue
+            if p in ("未解", "未回收", "已揭开", "UNACQUIRED", "STASH", "ACQUIRED", "PENDING"):
+                status = p
+                continue
+
+    name = name.strip("：: ，,、。！？“”\"\'[]【】 ")
+    if not name:
+        return
+
+    key = (name, origin, status)
+    if key not in seen:
+        seen.add(key)
+        results.append({"name": name, "origin": origin, "status": status})
+
+
+def scan_foreshadowing_tags(text: str) -> List[Dict[str, str]]:
+    """扫描提取文本中的伏笔缓冲池注释标签与悬念标记。
+
+    支持语法：
+    1. 标准 HTML 注释标签：<!-- audit:stash name="..." [origin="..."] [status="..."] -->
+    2. 中文 HTML 注释标签：<!-- 伏笔:... --> / <!-- 悬念:... -->
+    3. 方括号与六角括号标记：【伏笔:...】 / 【悬念:...】 / [伏笔:...] / (伏笔:...)
+    """
+    if not text:
+        return []
+
+    results: List[Dict[str, str]] = []
+    seen: Set[Tuple[str, str, str]] = set()
+
+    # 1. 扫描标准 HTML 注释标签
+    pattern_html = re.compile(
         r'<!--\s*audit:stash\s+name="(?P<name>[^"]+)"(?:\s+origin="(?P<origin>[^"]*)")?(?:\s+status="(?P<status>[^"]*)")?\s*-->',
         re.DOTALL,
     )
+    for match in pattern_html.finditer(text):
+        name = match.group("name").strip()
+        origin = (match.group("origin") or "").strip()
+        status = (match.group("status") or "").strip()
+        key = (name, origin, status)
+        if key not in seen:
+            seen.add(key)
+            results.append({"name": name, "origin": origin, "status": status})
 
-    results: List[Dict[str, str]] = []
-    for match in pattern.finditer(text):
-        name = match.group("name")
-        origin = match.group("origin") or ""
-        status = match.group("status") or ""
-        results.append({
-            "name": name,
-            "origin": origin,
-            "status": status,
-        })
+    # 2. 扫描中文 HTML 注释标签 <!-- 伏笔:... -->
+    pattern_cn_html = re.compile(r'<!--\s*(?:伏笔|悬念|线索|暗线)\s*[：:]\s*(?P<content>.*?)\s*-->', re.DOTALL)
+    for match in pattern_cn_html.finditer(text):
+        content = match.group("content").strip()
+        _parse_foreshadowing_content(content, results, seen)
+
+    # 3. 扫描文本括号标记 【伏笔:...】 / [伏笔:...] / (伏笔:...)
+    pattern_bracket = re.compile(r'[【\[（\(](?:伏笔|悬念|线索|暗线|待填坑)\s*[：:]\s*(?P<content>[^】\]）\)]+)[】\]）\)]')
+    for match in pattern_bracket.finditer(text):
+        content = match.group("content").strip()
+        _parse_foreshadowing_content(content, results, seen)
+
     return results
 
 
