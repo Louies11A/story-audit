@@ -1,6 +1,6 @@
 ---
 name: story-audit
-description: 结合第一性原理读者追读卡尺、四大平台商业门禁、毒舌老书虫对抗式审查、确定性双轨资源账本引擎与网文短句排版的军工级小说全维度深度审查系统。专治长篇网文资产失忆、因果断裂、大黑块窒息排版、深度 AI 模式套路与作者自嗨毒点。
+description: 用于长篇网文章节审查、资源账本核对、跨章连续性分析、排版质检和 AI 句式检查。响应 /story-audit、/审查、审本章等请求；通过 Python API 生成确定性预检，语义审查由宿主协调专家执行。
 metadata:
   version: "2.0.0"
   author: "Story Audit Architecture Team"
@@ -14,27 +14,29 @@ metadata:
     - ai-patterns
     - platform-rubrics
     - author-memory
-triggers:
-  - "/story-audit"
-  - "/审查"
-  - "网文审查"
-  - "长篇审查"
-  - "深度审查"
-  - "审本章"
-  - "检查这章"
-  - "查漏补缺"
-  - "核对账本"
-  - "排版质检"
-  - "去AI味审查"
+  triggers:
+    - "/story-audit"
+    - "/审查"
+    - "网文审查"
+    - "长篇审查"
+    - "深度审查"
+    - "审本章"
+    - "检查这章"
+    - "查漏补缺"
+    - "核对账本"
+    - "排版质检"
+    - "去AI味审查"
 ---
 
 # 长篇网文深度审查技能 (story-audit)
 
 > **架构铁律：本项目采用纯模块化 Python API 驱动设计，不提供亦不涉及任何 CLI 命令行接口。后续所有功能开发与生态扩展均严格围绕 Python API、强类型数据契约与 Agent 工具函数展开，坚决不涉及 CLI。**
 
+**执行边界：** `audit_chapter()` 和 `audit_scope()` 执行确定性预检，不会自行调用 LLM 或启动专家子代理。下方四专家矩阵是宿主协调器的作业规范；宿主只有收到实际专家结果后才能给出对应语义裁决。未执行的专家环节必须标为未执行，不能将规则未命中写成“资产全部一致”“人物因果无冲突”或“追读评估通过”。
+
 长篇网络小说连载跨越数十万至数百万字。作者极易陷入“资产失忆、因果断裂、手机端排版大黑块窒息、典型 AI 对仗套路腔、作者自嗨作者自我感动”等创作陷阱。
 
-本技能依托**“底层零依赖 Python 确定性引擎锁死资产与排版，深度 AI 模式毫秒级扫描，四大平台商业门禁卡尺，宿主运行时探测与子代理递归防爆哨兵，单文件作者偏好状态机，顶层 4 专家多 Agent 矩阵对抗审判，第一性原理严把读者追读驱动力，网文短句重塑阅读美学”**，为长篇网文提供全维度的防崩盘质量护城河。
+本技能提供 Python 确定性规则扫描、账本与偏好存储、平台卡尺，以及宿主可使用的 4 专家审查规范。规则检查用于定位可复现问题，资产事实、因果关系和读者体验需结合正文及实际专家证据判断。
 
 ---
 
@@ -49,7 +51,7 @@ triggers:
                                             │
                                             ▼
                ┌────────────────────────────────────────────────────────┐
-               │   【底层：Python 确定性工具链】（零依赖、毫秒级执行）     │
+               │   【底层：Python 确定性工具链】（零运行依赖、本地执行）   │
                │  1. safe_io.py        : 编码嗅探与换行规整             │
                │  2. chapter_resolver  : 自然排序章节定位与序章容错     │
                │  3. ledger_engine.py  : 双轨账本、状态机流转与防脏写   │
@@ -91,7 +93,7 @@ triggers:
                │  2. 报告归档至 reports/单章审查/{分卷}/第N章_审查报告.md│
                │  3. 最新报告刷新 reports/LATEST_REPORT.md               │
                │  4. 跨批大盘报告 reports/BATCH_SUMMARY_SCOPE_{scope}.md │
-               │  5. safe_writer.py 实施三行锚点消歧安全回写 (--apply-fix)│
+               │  5. apply_fix() 实施三行锚点消歧安全回写             │
                └────────────────────────────────────────────────────────┘
 ```
 
@@ -124,9 +126,9 @@ triggers:
 - **反近亲繁殖铁律**：严禁学习系统内部警告、报错与模板话术。
 
 ### 5. 跨批长篇因果状态机 (`scripts/audit_state.py`)
-- 在长篇批量连审（`--scope`）时原子维护 `reports/.audit_state.json`；
+- 在 `audit_scope()` 长篇批量连审时维护 `reports/.audit_state.json`；
 - 记录已完成章节、当前批次以及**“上一批未解决的开放缺陷与伏笔承诺”**；
-- 下一批连审启动时自动装载为 `Inherited Items`，校验跨批因果一致性。
+- 下一批连审启动时自动装载为 `Inherited Items`，供宿主继续核验；存储继承本身不构成跨批因果一致性的语义结论。
 
 ---
 
@@ -137,8 +139,10 @@ triggers:
 ```markdown
 === story-audit 深度审查报告 ===
 Requested Mode: full
-Effective Mode: full
-Fallback: none
+Effective Mode: solo
+Fallback: python_api_deterministic_only
+Review Stage: deterministic_precheck
+Expert Review: not_executed
 Platform Rubric: fanqie
 Genre: 科幻末世
 Scope: 第001章
@@ -162,6 +166,8 @@ Scope: 第001章
 ### Step 2: 驱动底层引擎生成预审包
 协调器调用底层 Python API（如 `audit_chapter` 或 `build_pre_audit_bundle`），生成 `reports/.cache/pre_audit_bundle.json`，提取行号绝对保真的清洗切片、跨章缝合文本、账本快照、平台诊断与作者画像。
 
+若用户要求语义深审，由宿主协调器按所需角色调用实际可用的专家，提供正文、预审包和对应参考卡尺，收集有位置与证据的发现。缺少专家能力或执行失败时，保留确定性结果并明确标注未完成的审查范围。不得依据宿主环境变量或 `mode` 请求值推断专家已经运行。
+
 ### Step 3: 聚合报告与目录归档收口
 严格对照统一 Schema 生成规范 Markdown：
 1. 立即覆盖写入：`reports/LATEST_REPORT.md`（方便作者快速翻阅）；
@@ -170,9 +176,9 @@ Scope: 第001章
 4. 原子更新跨批因果状态机：`reports/.audit_state.json`。
 
 ### Step 4: 状态码映射与质量把关
-- **Status Code 0 (绿灯通过)**：无缺陷，或仅存在 P2/P3 建议项；
+- **Status Code 0 (本次规则检查放行)**：规则未发现 P0，且没有需严格阻断的 P1；可能仍有 P2/P3 建议，非严格模式下也可能有 P1。此状态不等于全文语义审查通过；
 - **Status Code 1 (黄灯警告)**：存在 P1 级严重失误（若 `strict=True` 则阻断）；
-- **Status Code 2 (红灯阻断)**：存在 P0 级致命断裂（世界观吃书、死人复活），**坚决阻断**；
+- **Status Code 2 (红灯阻断)**：本次检查发现 P0 级违规；语义性 P0 判断需要实际专家证据，**不能把未执行的审查写成已通过**；
 - **Status Code 3 (系统异常)**：文件缺失、乱码或防脏写拦截。
 
 ---

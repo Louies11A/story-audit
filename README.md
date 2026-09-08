@@ -1,9 +1,9 @@
 # 长篇网文深度审查系统 (story-audit)
 
 [![Python Version](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/)
-[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-252%20passed-brightgreen.svg)]()
-[![Coverage](https://img.shields.io/badge/coverage-93%25-brightgreen.svg)]()
+![License](https://img.shields.io/badge/license-MIT-green.svg)
+![Tests](https://img.shields.io/badge/tests-617%20passed-brightgreen.svg)
+![Coverage](https://img.shields.io/badge/coverage-92%25-brightgreen.svg)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-zero%20external-orange.svg)]()
 
 > **专治长篇网络小说连载中的五大核心绝症**：
@@ -19,7 +19,7 @@
 
 - [一、核心架构理念](#一核心架构理念)
 - [二、双层协同架构图](#二双层协同架构图)
-- [三、四大升级模块特性](#三四大升级模块特性)
+- [三、五大升级模块特性](#三五大升级模块特性)
   - [1. 底层深度 AI 模式扫描器 (ai_patterns_checker)](#1-底层深度-ai-模式扫描器-ai_patterns_checker)
   - [2. 单文件作者偏好状态机 (author_memory)](#2-单文件作者偏好状态机-author_memory)
   - [3. 宿主探测与子代理递归防爆哨兵 (runtime_detector)](#3-宿主探测与子代理递归防爆哨兵-runtime_detector)
@@ -42,15 +42,17 @@
 
 > **架构铁律：本项目采用纯模块化 Python API 驱动设计，不提供亦不涉及任何 CLI 命令行接口。后续所有功能开发与生态扩展均严格围绕 Python API、强类型数据契约与 Agent 工具函数展开，坚决不涉及 CLI。**
 
+**当前实现范围：** Python API 执行确定性规则检查、账本与报告管理，不会自行调用 LLM 或启动专家。四专家矩阵由上层宿主协调器按技能规范组织；正文的完整语义一致性、人物动机和读者追读评价，需要实际专家审查后才能给出结论。
+
 长篇网络小说创作动辄数百万字，单靠大语言模型（LLM）的模糊记忆极易产生“越写越崩、幻觉频发”的灾难。
 
 `story-audit` 采用 **“底层 Python 零依赖确定性工具链 + 顶层多 Agent 专家矩阵对抗审判”** 的双层解耦架构：
 1. **确定性防线（Zero-Dependency Deterministic Tooling）**：
-   - 不依赖任何第三方库，纯标准库毫秒级执行；
+   - 不依赖任何第三方运行库，使用 Python 标准库本地执行；耗时随章节与账本规模变化；
    - 负责编码嗅探保真（UTF-8/GB18030）、自然章节排序、双轨资源状态机流转、排版正则扫描、深度 AI 句式指纹检测、宿主运行时探测与递归防爆、跨批因果继承栈以及原子三行锚点安全回写。
 2. **审美与商业门禁防线（Adversarial Review & Platform Rubrics）**：
    - 主审查调度器对接番茄（算法完读率）、起点（追读比）、知乎（盐言强第一人称）三大平台商业卡尺；
-   - 调度 4 个细分领域专家 Agent，分别持专属卡尺进行深度语义对抗审判，以真实读者的追读期待为第一性原理，无情撕碎逻辑硬伤与自嗨毒点。
+   - 为宿主协调器提供 4 个领域专家的职责与卡尺。宿主实际调度专家并收集证据后，才能生成对应的深度语义裁决。
 
 ---
 
@@ -63,7 +65,7 @@
                                               │
                                               ▼
                  ┌────────────────────────────────────────────────────────┐
-                 │    【底层：Python 确定性工具链】（零外部依赖、毫秒执行）   │
+                 │    【底层：Python 确定性工具链】（零外部依赖、本地执行）   │
                  │   1. safe_io.py        : 智能编码嗅探、换行规整与原子写盘 │
                  │   2. chapter_resolver  : 智能提取章号、自然排序与断号体检 │
                  │   3. ledger_engine.py  : 双轨资产账本、状态机流转与防脏写 │
@@ -95,16 +97,16 @@
                  │   - 最新总览: reports/LATEST_REPORT.md                 │
                  │   - 批量汇总: reports/BATCH_SUMMARY_SCOPE_{scope}.md   │
                  │   - 跨批因果状态机: reports/.audit_state.json          │
-                 │   - safe_writer.py 实施三行锚点消歧安全回写 (--apply-fix)│
+                 │   - apply_fix() 实施三行锚点消歧安全回写               │
                  └────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 三、四大升级模块特性
+## 三、五大升级模块特性
 
 ### 1. 底层深度 AI 模式扫描器 (`ai_patterns_checker`)
-毫秒级深度扫描 6 大高危 AI 套路句式：
+按确定性规则扫描以下 6 类 AI 套路句式：
 - **`not-is-comparison`**：“不是……而是……”对仗句式，反序对比“是……而不是……”；
 - **`em-dash`**：正文中残留破折号“——”硬停顿；
 - **`voice-contrast`**：音量与神态反差腔（“声音不大，却清晰传入……”、“语气平淡，却让所有人心中一凛”）；
@@ -120,7 +122,7 @@
 
 ### 3. 宿主探测与子代理递归防爆哨兵 (`runtime_detector`)
 - 自适应探测环境：Codex, Claude, OpenCode, Antigravity, Generic (Shell)；
-- **Subagent Recursion Guard**：探测自身是否已处于子代理上下文中；若已处于子代理环境，强制禁止嵌套再次 spawn，平稳降级为 solo，杜绝死锁崩溃。
+- **Subagent Recursion Guard**：探测子代理上下文后返回 `solo` 及降级原因，供宿主协调器避免再次嵌套派生专家；Python API 自身不启动子代理。
 
 ### 4. 平台专属商业门禁卡尺 (`platform_rubrics`)
 - **番茄小说 (`references/rubrics/fanqie.md`)**：前3段核心悬念/钩子、千字情绪波动、3章翻页动力、完读率预测红线；
@@ -129,9 +131,9 @@
 - **通用网文卡尺 (`references/rubrics/generic.md`)**：黄金三问、7 状态变化、开局同质化判定、高潮场景四阶力学（蓄能 → 假胜 → 崩解 → 反转）、对话三大病灶（机械问答、科普嘴、不分场合）。
 
 ### 5. 跨批长篇因果状态机 (`audit_state`)
-- 在长篇批量连审（`--scope`）时原子维护 `reports/.audit_state.json`；
+- 在 `audit_scope()` 长篇批量连审时维护 `reports/.audit_state.json`；
 - 记录已完成章节、当前批次以及**“上一批未解决的开放缺陷与伏笔承诺”**；
-- 下一批连审启动时自动装载为 `Inherited Items`，校验跨批因果一致性。
+- 下一批连审启动时自动装载为 `Inherited Items`，供宿主继续核验跨批因果与伏笔；存储和继承本身不构成语义审查结论。
 
 ---
 
@@ -142,12 +144,16 @@
 ```markdown
 === story-audit 深度审查报告 ===
 Requested Mode: full
-Effective Mode: full
-Fallback: none
+Effective Mode: solo
+Fallback: python_api_deterministic_only
+Review Stage: deterministic_precheck
+Expert Review: not_executed
 Platform Rubric: fanqie
 Genre: 科幻末世
 Scope: 第001章
 ```
+
+该示例表示 Python API 只完成了确定性预检。`Requested Mode` 记录期望模式，`Effective Mode` 记录实际执行；其他宿主或子代理限制也会出现在降级原因中。只有宿主实际执行并汇总专家结果后，才能报告专家审查完成。
 
 统一 Findings Schema 条目包含：`severity` (P0/P1/P2/P3), `category` (structure/character/prose/consistency/platform/factual/format/causal), `location`, `evidence`, `issue`, `fix`。
 铁律约束：事实与因果类缺陷的 `fix` 严格限制为事实统一方向，严禁文学发挥。
@@ -156,7 +162,11 @@ Scope: 第001章
 
 ## 五、快速上手与 Python API 指南
 
-本项目全量功能由纯模块化 Python API 交付，支持无缝嵌入各类 Agent 框架、自动化批处理脚本与上层写作工具箱：
+确定性工具链通过 Python API 提供，可嵌入 Agent 框架、批处理脚本与上层写作工具箱；专家语义审查由宿主另行执行：
+
+公开入口会先验证输入：项目目录必须存在，章号必须是有限的非负数值，`volume` 必须是正整数，布尔开关必须传入 `True` / `False`。`platform` 与 `mode` 接受合法值的大小写和首尾空格；未知值返回状态码 3。范围支持小数章、倒序边界和边界空格；`init_ledger(scope_str=None)` 表示全部章节，空字符串不表示全书。
+
+章号必须能唯一定位文件。同一目标章号出现在多个卷或文件中时，单章、回写及包含该章的批量操作返回 3，需先统一章号。非法参数在生成正文备份、报告或账本前拒绝；三种返回报告的 API 失败时使用 `(3, Path(""))`，调用者应先检查状态码。
 
 ### 1. 基础单章审查与平台门禁 (`audit_chapter`)
 
@@ -172,7 +182,7 @@ status_code, report_path = audit_chapter(project_dir)
 # 指定章节与目标发布平台（支持 fanqie, qidian, zhihu, generic）
 status_code, report_path = audit_chapter(project_dir, chapter_index=1, platform="fanqie")
 
-# 指定执行模式（full 多代理协同 / lean 精简 / solo 单机，默认 auto 自动探测降级）
+# 记录期望模式；Python API 本身只运行确定性预检，专家执行情况以报告为准
 status_code, report_path = audit_chapter(project_dir, chapter_index=1, mode="full")
 
 # 严格模式：发现 P1 级严重问题时返回状态码 1（适用于 CI/CD 质量门禁拦截）
@@ -263,10 +273,10 @@ status_code = apply_fix(
 
 | 状态码 | 状态说明 | 触发场景 |
 | :---: | :--- | :--- |
-| **`0`** | **审查通过 / 仅轻微瑕疵** | 全书无 P0 缺陷；或存在 P2/P3 问题但在常规模式下运行。 |
+| **`0`** | **本次规则检查放行** | 本次检查未发现 P0，且没有需严格阻断的 P1；可能仍有 P2/P3，非严格模式下也可能有 P1。不能据此推断全文语义一致。 |
 | **`1`** | **严重阻断 (P1 违规)** | 在开启 `strict=True` 严格模式下，检测到 P1 级违规（资产断裂、时空错位、平台门禁严重不符等）。 |
-| **`2`** | **致命阻塞 (P0 阻断)** | 发现死亡复活、主线硬伤或账本脏写冲突。 |
-| **`3`** | **运行异常 / 参数错误** | 指定章节不存在、目录找不到正文、参数缺失或格式非法。 |
+| **`2`** | **致命阻塞 (P0 阻断)** | 本次检查发现 P0 级违规；需语义审查的问题应以实际专家证据为准。 |
+| **`3`** | **运行异常 / 参数错误** | 章节缺失、读写失败、账本或状态损坏、防脏写阻断，以及参数缺失或格式非法。 |
 
 ---
 
@@ -296,7 +306,7 @@ status_code = apply_fix(
 
 ## 八、测试套件与工程验证
 
-本项目践行严格的测试驱动开发（TDD）规范，全量测试位于 `tests/` 目录：
+全量测试位于 `tests/` 目录，包含核心模块测试、缺陷回归和公开 API 集成测试：
 
 ```bash
 # 运行全量测试套件
@@ -308,20 +318,18 @@ pytest --cov=scripts --cov-report=term-missing
 
 ### 测试指标
 
-- **用例总数**：**252 项测试** 全部通过（100% Pass Rate）；
-- **执行时间**：~ 1.6 秒（极速并发执行）；
-- **用例覆盖分布**：
-  - `test_story_audit_api.py`：23 项测试（纯 Python API 执行管线、四阶状态码契约、参数消歧与补丁安全回写等）
-  - `test_story_audit_upgrades.py`：4 项测试（端到端固定英文元数据键头部、模式自适应降级等）
-  - `test_ai_patterns_checker.py`：7 项测试（深度 AI 句式指纹、反序对比、掩码排除等）
-  - `test_author_memory.py`：5 项测试（初始化、反近亲繁殖过滤、2048 字节硬上限等）
-  - `test_runtime_detector.py`：3 项测试（宿主环境探测、子代理递归防爆哨兵等）
-  - `test_platform_rubrics.py`：3 项测试（番茄、起点、知乎专属门禁卡尺）
-  - `test_audit_state.py`：2 项测试（跨批状态机原子持久化与 Inherited Items 继承）
-  - 原生套件（`test_format_scanner`, `test_ledger_engine`, `test_safe_writer` 等）：182 项测试全部通过。
+2026-09-08 在 Windows、Python 3.11.15 上执行 `python -X utf8 -m pytest -q --cov=scripts --cov-report=term-missing`：
+
+- **结果**：617 项测试、12 项子测试全部通过。
+- **语句覆盖率**：92%（3346 条语句，274 条未覆盖）。
+- **本次耗时**：13.50 秒，包含覆盖率采集；用时受机器和文件系统负载影响。
+- **覆盖范围**：账本与状态校验、损坏数据保护、双轨失败恢复、章节消歧、补丁字节保真、扫描边界、跨批继承及报告真实性。
+- **完整流程**：`test_workflow_quality.py` 覆盖建账、单章审查、批量审查、正文回写、Markdown 同步和分卷快照，分别验证两种账本布局及 UTF-8/LF、GB18030/CRLF。
+
+另外通过字节码编译、15 个生产模块的 Python 3.8 语法检查及官方技能元数据校验。Python 3.8 的兼容检查使用 `ast.parse(..., feature_version=(3, 8))`，未在 Python 3.8 解释器上运行全套测试。
 
 ---
 
 ## 许可证
 
-本项目基于 [MIT License](LICENSE) 开源。欢迎网络文学创作者、AI 写作助手开发者与文学工程探索者共同维护！
+本项目声明采用 MIT License。欢迎网络文学创作者、AI 写作助手开发者与文学工程探索者共同维护！

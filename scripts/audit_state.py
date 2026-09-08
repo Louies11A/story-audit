@@ -5,12 +5,13 @@ audit_state.py: 跨批长篇因果闭环与状态机管理 (reports/.audit_state
 功能职责：
 1. 跨批次长篇审查连续性状态机落盘与原子更新；
 2. 记录已完成章节列表、当前批次以及“上一批未解决的开放缺陷与伏笔承诺”；
-3. 下一批连审启动时自动将其装载为 Inherited Items，在报告中显式呈现并校验跨批因果一致性。
+3. 下一批连审启动时自动将其装载为 Inherited Items，在报告中呈现供宿主核验跨批因果一致性。
 """
 
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 from dataclasses import asdict, dataclass, field
@@ -36,11 +37,37 @@ class AuditState:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> AuditState:
+        if not isinstance(data, dict):
+            raise ValueError("审计状态根节点必须为对象")
+        for key in ("last_scope", "last_updated_at"):
+            if key in data and not isinstance(data[key], str):
+                raise ValueError(f"{key} 必须为字符串")
+        if not isinstance(data.get("completed_chapters", []), list):
+            raise ValueError("completed_chapters 必须为列表")
+        chapters = data.get("completed_chapters", [])
+        if any(isinstance(chapter, bool) or not math.isfinite(float(chapter)) for chapter in chapters):
+            raise ValueError("completed_chapters 必须包含有限章号")
+        for key in ("open_defects", "foreshadowing_commitments", "resolved_items"):
+            items = data.get(key, [])
+            if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+                raise ValueError(f"{key} 必须为对象列表")
+            for item in items:
+                for text_key in ("severity", "category", "issue", "fix", "tag", "status", "note"):
+                    if text_key in item and not isinstance(item[text_key], str):
+                        raise ValueError(f"{key}.{text_key} 必须为字符串")
+                if "chapter" in item:
+                    chapter = item["chapter"]
+                    if isinstance(chapter, bool) or not math.isfinite(float(chapter)):
+                        raise ValueError(f"{key}.chapter 必须为有限章号")
+                origin_chapter = item.get("origin_chapter")
+                if origin_chapter is not None:
+                    if isinstance(origin_chapter, bool) or not isinstance(origin_chapter, (int, float, str)) or not math.isfinite(float(origin_chapter)):
+                        raise ValueError(f"{key}.origin_chapter 必须为有限章号或 null")
         return cls(
             schema_version=data.get("schema_version", STATE_SCHEMA_VERSION),
             last_scope=data.get("last_scope", ""),
             last_updated_at=data.get("last_updated_at", ""),
-            completed_chapters=[float(x) for x in data.get("completed_chapters", [])],
+            completed_chapters=[float(x) for x in chapters],
             open_defects=list(data.get("open_defects", [])),
             foreshadowing_commitments=list(data.get("foreshadowing_commitments", [])),
             resolved_items=list(data.get("resolved_items", [])),
@@ -55,16 +82,11 @@ def get_audit_state_path(reports_dir: Path) -> Path:
 def load_audit_state(reports_dir: Path) -> AuditState:
     """加载跨批审计状态机，若不存在则返回初始空状态"""
     state_file = get_audit_state_path(reports_dir)
-    if not state_file.is_file():
+    if not state_file.exists():
         return AuditState()
-    try:
-        content = state_file.read_text(encoding="utf-8")
-        data = json.loads(content)
-        if not isinstance(data, dict):
-            return AuditState()
-        return AuditState.from_dict(data)
-    except Exception:
-        return AuditState()
+    content = state_file.read_text(encoding="utf-8")
+    data = json.loads(content)
+    return AuditState.from_dict(data)
 
 
 def save_audit_state(state: AuditState, reports_dir: Path) -> Path:
@@ -117,7 +139,7 @@ def render_inherited_items_section(inherited: Dict[str, Any]) -> str:
     ]
 
     if not defects and not commitments:
-        lines.append("✅ **因果链条闭合良好：前序批次无未解决开放缺陷或悬空承诺。**\n")
+        lines.append("无已记录的开放缺陷或伏笔承诺；未执行语义核验。\n")
         return "\n".join(lines)
 
     if defects:
@@ -135,14 +157,15 @@ def render_inherited_items_section(inherited: Dict[str, Any]) -> str:
 
     if commitments:
         lines.append("### 📌 跨批连带伏笔承诺 (追踪闭环池)")
-        lines.append("| 伏笔标签 | 埋入章节 | 状态 | 预期兑现/闭环说明 |")
+        lines.append("| 伏笔标签 | 来源章节 | 状态 | 来源线索/人工说明 |")
         lines.append("| :--- | :--- | :--- | :--- |")
         for c in commitments:
             tag = c.get("tag", "-")
-            orig = c.get("origin_chapter", "-")
+            orig = c.get("origin_chapter")
+            origin_text = f"第{orig}章" if orig is not None else "来源未记录"
             st = c.get("status", "pending")
             note = c.get("note", "待后文呼应")
-            lines.append(f"| {tag} | 第{orig}章 | {st} | {note} |")
+            lines.append(f"| {tag} | {origin_text} | {st} | {note} |")
         lines.append("")
 
     return "\n".join(lines)

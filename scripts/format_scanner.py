@@ -506,16 +506,20 @@ def _extract_sentences(line: str) -> List[Tuple[int, int, str]]:
             # 吸收后续连续的标点和闭引号
             while i < n and line[i] in "。！？!?……”:\"'’ ":
                 i += 1
-            s = line[start:i].strip()
+            raw = line[start:i]
+            s = raw.strip()
             if s:
-                sentences.append((start, i, s))
+                trimmed_start = start + len(raw) - len(raw.lstrip())
+                sentences.append((trimmed_start, trimmed_start + len(s), s))
             start = i
         else:
             i += 1
     if start < n:
-        s = line[start:n].strip()
+        raw = line[start:n]
+        s = raw.strip()
         if s:
-            sentences.append((start, n, s))
+            trimmed_start = start + len(raw) - len(raw.lstrip())
+            sentences.append((trimmed_start, trimmed_start + len(s), s))
     return sentences
 
 
@@ -554,32 +558,32 @@ def _is_military_data_report(sentence: str) -> bool:
     return False
 
 
-def _find_quote_intervals(line: str) -> List[Tuple[int, int]]:
-    """查找单行文本内所有中英文对话引号的 (start, end) 左闭右开区间"""
+def _find_quote_intervals(line: str, closed_only: bool = False) -> List[Tuple[int, int]]:
+    """查找对话区间；closed_only 仅返回含台词的闭合区间，不反复扫描无闭合后缀。"""
     intervals: List[Tuple[int, int]] = []
+    missing_closers = set()
     i = 0
     n = len(line)
     while i < n:
-        if line[i] == '“':
-            q_start = i
-            q_end = line.find('”', q_start + 1)
-            if q_end != -1:
-                intervals.append((q_start, q_end + 1))
-                i = q_end + 1
-            else:
-                intervals.append((q_start, n))
-                break
-        elif line[i] == '"':
-            q_start = i
-            q_end = line.find('"', q_start + 1)
-            if q_end != -1:
-                intervals.append((q_start, q_end + 1))
-                i = q_end + 1
-            else:
-                intervals.append((q_start, n))
-                break
-        else:
+        opening = line[i]
+        if opening not in ('“', '"') or opening in missing_closers:
             i += 1
+            continue
+        closing = '”' if opening == '“' else '"'
+        q_end = line.find(closing, i + 1)
+        if q_end == -1:
+            if not closed_only:
+                intervals.append((i, n))
+                break
+            missing_closers.add(opening)
+            i += 1
+            continue
+        if closed_only and q_end == i + 1:
+            # 空引号不构成台词；英文闭引号仍可能是下一段台词的开引号。
+            i += 1
+            continue
+        intervals.append((i, q_end + 1))
+        i = q_end + 1
     return intervals
 
 
@@ -796,17 +800,16 @@ def scan_typography_flaws(text: str, original_text: str = "", genre: Optional[st
         # -------------------------------------------------------------
         # 3. 检测 DIALOGUE_MIXED (P3)
         # -------------------------------------------------------------
-        dialogue_matches = list(re.finditer(r'(?:“([^”]+)”|"([^"]+)")', clean_masked))
-        for idx, d_match in enumerate(dialogue_matches):
-            end_of_dialogue = d_match.end()
-            if idx + 1 < len(dialogue_matches):
-                next_start = dialogue_matches[idx + 1].start()
+        dialogue_intervals = _find_quote_intervals(clean_masked, closed_only=True)
+        for idx, (dialogue_start, end_of_dialogue) in enumerate(dialogue_intervals):
+            if idx + 1 < len(dialogue_intervals):
+                next_start = dialogue_intervals[idx + 1][0]
                 desc_text = clean_masked[end_of_dialogue:next_start].strip()
             else:
                 desc_text = clean_masked[end_of_dialogue:].strip()
 
             if len(desc_text) >= 80:
-                start_context = max(0, d_match.start())
+                start_context = dialogue_start
                 stripped_line = orig_line.strip()
                 snippet_text = stripped_line[start_context:start_context + 60]
                 findings.append(FormatFinding(

@@ -10,6 +10,7 @@ story_audit.py: 长篇网文深度审查核心调度管线与纯模块化 Python
 """
 
 import json
+import math
 import os
 import re
 import sys
@@ -31,8 +32,10 @@ from scripts.ledger_engine import (
     LedgerDirtyError,
     LedgerState,
     check_dirty_state,
+    ensure_ledger_recovered,
     create_volume_checkpoint,
     extract_heuristic_assets,
+    parse_chinese_or_arabic_number,
     read_file_safe,
     save_ledger_state,
     scan_foreshadowing_tags,
@@ -45,9 +48,10 @@ from scripts.safe_writer import (
     SafeWriterError,
     apply_patch_with_disambiguation,
 )
+from scripts.safe_io import SafeIOError
 from scripts.ai_patterns_checker import scan_ai_patterns
 from scripts.author_memory import AuthorMemory
-from scripts.runtime_detector import detect_runtime, is_subagent_context, resolve_execution_mode
+from scripts.runtime_detector import VALID_MODES, detect_runtime, is_subagent_context, resolve_execution_mode
 from scripts.platform_rubrics import evaluate_platform_rubric, VALID_PLATFORMS
 from scripts.audit_state import (
     AuditState,
@@ -85,9 +89,83 @@ def safe_console_print(msg: str, file: Any = None) -> None:
         except Exception:
             pass
 
+def _resolve_project_dir(project_dir: Union[str, Path]) -> Path:
+    """拒绝缺省类型错误和空路径，避免意外退回进程工作目录。"""
+    if not isinstance(project_dir, (str, os.PathLike)):
+        raise ValueError("project_dir 必须是现有目录的字符串或 Path")
+    if isinstance(project_dir, str) and not project_dir.strip():
+        raise ValueError("project_dir 不能为空字符串")
+    try:
+        path = Path(project_dir).resolve()
+    except RuntimeError as e:
+        raise ValueError("project_dir 无法解析") from e
+    if not path.is_dir():
+        raise ValueError("project_dir 不存在或不是目录")
+    return path
+
+
+def _validate_chapter_index(index: Optional[float]) -> None:
+    if index is None:
+        return
+    if isinstance(index, bool) or not isinstance(index, (int, float)):
+        raise ValueError("章号必须是有限的非负数值，或用 None 选择最新章")
+    try:
+        valid = math.isfinite(index) and index >= 0
+    except OverflowError:
+        valid = False
+    if not valid:
+        raise ValueError("章号必须是有限的非负数值")
+
+
+def _validate_boolean_options(**options: bool) -> None:
+    for name, value in options.items():
+        if not isinstance(value, bool):
+            raise ValueError(f"{name} 必须是 bool，不能使用字符串或数值代替")
+
+
+def _normalize_audit_options(platform: str, mode: str, genre: str) -> Tuple[str, str, str]:
+    if not isinstance(platform, str) or platform.strip().lower() not in VALID_PLATFORMS:
+        raise ValueError("platform 必须是 fanqie/qidian/zhihu/generic")
+    if not isinstance(mode, str) or mode.strip().lower() not in VALID_MODES:
+        raise ValueError("mode 必须是 auto/full/lean/solo")
+    if genre is not None and not isinstance(genre, str):
+        raise ValueError("genre 必须是题材名称字符串或 None")
+    return platform.strip().lower(), mode.strip().lower(), (genre or "auto").strip()
+
+
+def _report_api_error(error: Exception, silent: bool) -> None:
+    if not silent:
+        safe_console_print(f"[错误] {error}", file=sys.stderr)
+
+
+def _resolve_precheck_mode(requested_mode: str, fallback_reason: Optional[str] = None) -> Tuple[str, str]:
+    """Python 管线只执行确定性预检；保留宿主诊断但不把能力当作已执行结果。"""
+    if fallback_reason is None:
+        _, fallback_reason = resolve_execution_mode(requested_mode)
+    reasons = [reason for reason in fallback_reason.split("; ") if reason and reason != "none"]
+    if requested_mode.strip().lower() != "solo" and "python_api_deterministic_only" not in reasons:
+        reasons.append("python_api_deterministic_only")
+    return "solo", "; ".join(reasons) or "none"
+
+
+def _select_unique_chapter(chapters: List[ChapterItem], index: Optional[float]) -> Optional[ChapterItem]:
+    target = chapters[-1].index if index is None else index
+    matches = [chapter for chapter in chapters if abs(chapter.index - target) < 1e-4]
+    if len(matches) > 1:
+        raise ValueError(f"第 {target:g} 章对应多个文件，请统一章号后重试")
+    return matches[0] if matches else None
+
+
+def _validate_unique_targets(chapters: List[ChapterItem]) -> None:
+    """发现器已按章号排序；批量产生任何报告前拒绝有歧义的集合。"""
+    for previous, current in zip(chapters, chapters[1:]):
+        if abs(previous.index - current.index) < 1e-4:
+            raise ValueError(f"第 {current.index:g} 章对应多个文件，请统一章号后重试")
+
+
 def parse_scope_range(scope_str: str) -> Tuple[float, float]:
     """解析范围字符串，如 '31-35' 或 '1-30'"""
-    if not scope_str or "-" not in scope_str:
+    if not isinstance(scope_str, str) or not scope_str or "-" not in scope_str:
         raise ValueError(f"无效的范围格式: {scope_str}，应形如 '31-35'")
     parts = scope_str.strip().split("-")
     if len(parts) != 2:
@@ -95,8 +173,10 @@ def parse_scope_range(scope_str: str) -> Tuple[float, float]:
     try:
         start = float(parts[0].strip())
         end = float(parts[1].strip())
+        _validate_chapter_index(start)
+        _validate_chapter_index(end)
         return min(start, end), max(start, end)
-    except Exception as e:
+    except ValueError as e:
         raise ValueError(f"范围解析失败: {scope_str}, {e}")
 
 
@@ -166,7 +246,7 @@ def build_pre_audit_bundle(
     gap_warnings: List[str],
     genre_profile: Optional[GenreProfile] = None,
     requested_mode: str = "auto",
-    effective_mode: str = "full",
+    effective_mode: str = "solo",
     fallback_reason: str = "none",
     platform: str = "generic",
     platform_data: Optional[Dict[str, Any]] = None,
@@ -174,6 +254,7 @@ def build_pre_audit_bundle(
     inherited_items: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """构造结构严格冻结契约预审包字典"""
+    effective_mode, fallback_reason = _resolve_precheck_mode(requested_mode, fallback_reason)
     try:
         target_file_str = curr_chapter.path.relative_to(project_dir).as_posix()
     except Exception:
@@ -215,6 +296,8 @@ def build_pre_audit_bundle(
             "requested_mode": requested_mode,
             "effective_mode": effective_mode,
             "fallback_reason": fallback_reason,
+            "review_stage": "deterministic_precheck",
+            "expert_review_executed": False,
             "platform": platform,
         },
         "runtime_dispatch": {
@@ -293,7 +376,7 @@ def render_audit_report(
     gap_warnings: List[str],
     genre_profile: Optional[GenreProfile] = None,
     requested_mode: str = "auto",
-    effective_mode: str = "full",
+    effective_mode: str = "solo",
     fallback_reason: str = "none",
     platform: str = "generic",
     author_memory_text: Optional[str] = None,
@@ -301,6 +384,7 @@ def render_audit_report(
     inherited_items: Optional[Dict[str, Any]] = None,
 ) -> str:
     """渲染符合统一审查报告 Schema (Markdown) 的报告内容"""
+    effective_mode, fallback_reason = _resolve_precheck_mode(requested_mode, fallback_reason)
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     prev_info = f"第 {prev_chapter.index} 章 ({prev_chapter.title})" if prev_chapter else "无 (首章/起点)"
 
@@ -320,14 +404,17 @@ def render_audit_report(
         f"Requested Mode: {requested_mode}",
         f"Effective Mode: {effective_mode}",
         f"Fallback: {fallback_reason}",
+        "Review Stage: deterministic_precheck",
+        "Expert Review: not_executed",
         f"Platform Rubric: {platform}",
         f"Genre: {gp.primary_genre}",
         f"Scope: 第{curr_chapter.index:03g}章",
         "",
-        f"# 📚 长篇网文深度审查报告：第 {curr_chapter.index} 章",
+        f"# 📚 长篇网文确定性预检报告：第 {curr_chapter.index} 章",
         f"> 审查时间：{now_str} | 运行模式：{effective_mode.capitalize()} (Requested: {requested_mode}, Fallback: {fallback_reason})",
         f"> 审查范围：第 {curr_chapter.index} 章 ({curr_chapter.title}) (对比承接源：{prev_info})",
         f"> 平台门禁：{platform} | 综合裁决：{verdict}",
+        "> 本次仅执行规则扫描与上下文整理；专家语义审查未执行，需宿主继续核验资源、因果与剧情质量。",
         "",
         "---",
         "",
@@ -344,7 +431,7 @@ def render_audit_report(
 
     # 平台专属商业门禁诊断
     if platform_data and (platform != "generic" or platform_data.get("findings")):
-        p_status = "🟢 合格通过" if platform_data.get("passed", True) else "🔴 触发门禁拦截"
+        p_status = "未命中 P0/P1 平台规则" if platform_data.get("passed", True) else "命中 P0/P1 平台规则项"
         lines.extend([
             "",
             "---",
@@ -391,55 +478,53 @@ def render_audit_report(
         for i, item in enumerate(p0_list, 1):
             lines.append(f"### {i}. [P0 致命断裂] {item}")
     else:
-        lines.append("✅ **绿灯：未发现 P0 级致命断裂违规。**")
+        lines.append("确定性预检未检出 P0 标记或平台规则项；未执行语义因果核验。")
 
     lines.extend([
         "",
         "---",
         "",
-        "## 📦 二、资源账本与出装审计 (Agent A)",
+        "## 📦 二、P1 标记与资源账本快照",
     ])
 
     if p1_list:
         for i, item in enumerate(p1_list, 1):
             lines.append(f"### {i}. [P1 严重失误] {item}")
             lines.append(f"* **位置**：第 {curr_chapter.index} 章")
-            lines.append("* **💡 短句修复双方案**：")
-            lines.append("  * **【方案 1：前置补源】**：在前章末尾补充获得经过。")
-            lines.append("  * **【方案 2：就地修正】**：改为使用已持有道具或替换描写。")
+            lines.append("* **来源**：正文显式标记或平台确定性规则；具体原因与修复方案需宿主结合原文核验。")
     else:
-        lines.append("✅ **账本状态健康：无凭空出装或资产冲突。**")
+        lines.append("确定性预检未检出 P1 标记或平台规则项；尚未核验正文资产来源与账本冲突。")
 
     lines.extend([
         "",
         "---",
         "",
-        "## ⛓️ 三、上下文一致性与跨章衔接审计 (Agent B)",
+        "## ⛓️ 三、跨章文本与转场线索",
         f"* **跨章承接**：{'有上一章承接' if boundary_ctx.has_prev_chapter else '本章为首章，无前序衔接'}",
-        f"* **POV 转场判定**：{'检测到视角/时空漂移 (' + str(boundary_ctx.transition_clue) + ')' if boundary_ctx.is_pov_transition else '视角平稳继承'}",
+        f"* **转场线索扫描**：{'命中转场提示词 (' + str(boundary_ctx.transition_clue) + ')' if boundary_ctx.is_pov_transition else '未命中已配置的转场提示词'}",
     ])
     if boundary_ctx.isolation_zones:
-        lines.append(f"* **叙事视界隔离区**：发现 {len(boundary_ctx.isolation_zones)} 处闪回/幻境")
+        lines.append(f"* **叙事视界隔离候选**：提示词扫描标记 {len(boundary_ctx.isolation_zones)} 处闪回/幻境候选")
     if gap_warnings:
         lines.append("* **⚠️ 序号连续性警告**：")
         for gw in gap_warnings:
             lines.append(f"  * {gw}")
 
     target_genre = genre_profile.primary_genre if genre_profile else "通用网文"
-    poison_tip = genre_profile.red_lines[0] if (genre_profile and genre_profile.red_lines) else "无恶性毒点"
+    poison_tip = genre_profile.red_lines[0] if (genre_profile and genre_profile.red_lines) else "由宿主结合题材判断"
 
     lines.extend([
         "",
         "---",
         "",
-        "## 🥊 四、第一性原理与对抗式审查 (Agent D)",
-        f"* **题材卡尺对齐**：当前章节严格遵循【{target_genre}】第一性原理驱动。",
-        f"* **驱动力评估**：主线推进平稳，核心目标清晰，有效完成本章情绪位移。",
-        f"* **读者自嗨盲区诊断**：未见明显恶性毒点（重点防范：{poison_tip}）。",
+        "## 🥊 四、专家语义审查待办（需宿主执行）",
+        f"* **题材参考卡尺**：【{target_genre}】；尚未核验原文是否满足该卡尺。",
+        "* **待核验内容**：资源来源与消耗、人物行为与跨章因果、主线推进、情绪变化及读者体验。",
+        f"* **题材风险提示**：{poison_tip}",
         "",
         "---",
         "",
-        "## 📝 五、短句排版与阅读节奏审计 (Agent C)",
+        "## 📝 五、排版与句式规则扫描",
     ])
 
     if findings:
@@ -449,7 +534,7 @@ def render_audit_report(
             lines.append(f"* **问题**：{f.message}")
             lines.append(f"* **建议**：{f.suggestion}")
     else:
-        lines.append("✅ **排版规范良好：无臃肿大黑段或拖沓长句。**")
+        lines.append("本轮确定性排版规则未命中问题。")
 
     lines.extend([
         "",
@@ -457,7 +542,7 @@ def render_audit_report(
         "",
         "## 📊 六、账本流水与快照变动预览",
         "```diff",
-        f"+ 当前热资产数量: {len(state.assets)}",
+        f"+ 账本资产记录数量: {len(state.assets)}",
         f"+ 伏笔池标记数量: {len(state.foreshadowing_stash)}",
         "```",
         "",
@@ -486,14 +571,70 @@ def locate_ledger_paths(project_dir: Path) -> Tuple[Path, Path]:
 
 def load_ledger_state(json_path: Path) -> LedgerState:
     """加载账本状态，若不存在则初始化空状态"""
-    if json_path.is_file():
-        try:
-            content, _, _ = read_file_safe(json_path)
-            data = json.loads(content)
-            return LedgerState.from_dict(data)
-        except Exception:
-            return LedgerState()
-    return LedgerState()
+    ensure_ledger_recovered(json_path)
+    if not json_path.exists():
+        return LedgerState()
+    content, _, _ = read_file_safe(json_path)
+    data = json.loads(content)
+    return LedgerState.from_dict(data)
+
+
+def _record_foreshadowing_tags(stash: List[Dict[str, Any]], tags: List[Dict[str, str]], source_chapter: float) -> bool:
+    """记录新显式标签与实际采集章号；重复标签保留最早已记录来源。"""
+    keys = {(item.get("name", "").strip(), item.get("origin", "").strip(), item.get("status", "").strip()) for item in stash}
+    changed = False
+    for tag in tags:
+        key = (tag["name"].strip(), tag.get("origin", "").strip(), tag.get("status", "").strip())
+        if key not in keys:
+            keys.add(key)
+            entry = dict(tag)
+            entry["source_chapter"] = source_chapter
+            stash.append(entry)
+            changed = True
+    return changed
+
+
+def _collect_foreshadowing_commitments(stash: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """把全部账本标签映射为承诺；显式来源原文保留，未知章号不推测。"""
+    commitments: List[Dict[str, Any]] = []
+    for item in stash:
+        name = item.get("name", "").strip()
+        if not name:
+            continue
+        origin = item.get("origin", "")
+        source_chapter = item.get("source_chapter")
+        origin_chapter = float(source_chapter) if source_chapter is not None else None
+        explicit_chapter = re.match(r"^\s*(?:第\s*)?([0-9]+(?:\.[0-9]+)?|[零〇一二两三四五六七八九十百千万]+)\s*(?:章|$)", origin)
+        if explicit_chapter:
+            try:
+                number = float(parse_chinese_or_arabic_number(explicit_chapter.group(1)))
+                if math.isfinite(number):
+                    origin_chapter = number
+            except (ValueError, OverflowError):
+                # origin 是自由文本；不能解析的内容仍完整保存在 note 中。
+                pass
+        commitments.append({
+            "tag": name,
+            "origin_chapter": origin_chapter,
+            "status": item.get("status") or "pending",
+            "note": origin or "正文显式伏笔标记，待宿主核验。",
+        })
+    return commitments
+
+
+def _merge_foreshadowing_commitments(state: AuditState, commitments: List[Dict[str, Any]]) -> None:
+    """按标签与来源去重，保留手工承诺和已解决记录，不自行判断回收。"""
+    def key(item: Dict[str, Any]) -> Tuple[str, Optional[float], str]:
+        chapter = item.get("origin_chapter")
+        return (item.get("tag", ""), float(chapter) if chapter is not None else None,
+                item.get("note", "") if chapter is None else "")
+
+    known = {key(item) for item in state.foreshadowing_commitments + state.resolved_items}
+    for item in commitments:
+        item_key = key(item)
+        if item_key not in known:
+            known.add(item_key)
+            state.foreshadowing_commitments.append(dict(item))
 
 
 def run_audit(
@@ -510,37 +651,42 @@ def run_audit(
     use_author_memory: bool = False,
     inherited_items: Optional[Dict[str, Any]] = None,
     allow_partial: bool = False,
+    _chapter_snapshot: Optional[List[ChapterItem]] = None,
 ) -> int:
     """执行单章审查管线，生成预审包与归档报告，返回退出码"""
+    try:
+        _validate_chapter_index(target_chapter_index)
+        _validate_boolean_options(strict=strict, force=force, silent=silent,
+                                  author_memory=use_author_memory, allow_partial=allow_partial)
+        platform, mode, genre = _normalize_audit_options(platform, mode, genre)
+    except ValueError as e:
+        _report_api_error(e, silent)
+        return 3
     reports_dir = project_dir / "reports"
     cache_dir = reports_dir / ".cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
 
     # 0. 运行时探测与模式降级
-    effective_mode, fallback_reason = resolve_execution_mode(mode)
+    effective_mode, fallback_reason = _resolve_precheck_mode(mode)
 
     # 1. 发现章节
     resolver = ChapterResolver()
-    chapters = resolver.discover_chapters(project_dir)
+    # 快照只在本次批量调用中复用，独立调用仍重新发现文件。
+    chapters = _chapter_snapshot if _chapter_snapshot is not None else resolver.discover_chapters(project_dir)
     if not chapters:
         if not silent:
             print(f"[错误] 在目录 {project_dir} 中未发现任何小说章节文件！", file=sys.stderr)
         return 3
 
     # 2. 定位目标章节
-    curr_chapter: Optional[ChapterItem] = None
-    if target_chapter_index is not None:
-        for c in chapters:
-            if abs(c.index - target_chapter_index) < 1e-4:
-                curr_chapter = c
-                break
-        if not curr_chapter:
-            if not silent:
-                print(f"[错误] 未找到指定章号: {target_chapter_index}", file=sys.stderr)
-            return 3
-    else:
-        # 默认定位最新章节
-        curr_chapter = chapters[-1]
+    try:
+        curr_chapter = _select_unique_chapter(chapters, target_chapter_index)
+    except ValueError as e:
+        _report_api_error(e, silent)
+        return 3
+    if curr_chapter is None:
+        if not silent:
+            print(f"[错误] 未找到指定章号: {target_chapter_index}", file=sys.stderr)
+        return 3
 
     # 3. 定位上一章节
     curr_pos = chapters.index(curr_chapter)
@@ -604,23 +750,30 @@ def run_audit(
                 )
             return 3
 
-    state = load_ledger_state(json_path)
+    # 所有待更新状态先完整验证，不能在坏状态上继续写出账本或成功报告。
+    try:
+        state = load_ledger_state(json_path)
+        if write_latest_report:
+            audit_state = load_audit_state(reports_dir)
+            if inherited_items is None:
+                inherited_items = get_inherited_items(audit_state)
+    except Exception as e:
+        if not silent:
+            print(f"[错误] 读取持久化状态失败: {e}", file=sys.stderr)
+        return 3
 
     # 提取正文伏笔标签更新账本伏笔池
     new_tags = scan_foreshadowing_tags(curr_text)
-    has_new_tags = False
-    if new_tags:
-        for tag in new_tags:
-            if tag not in state.foreshadowing_stash:
-                state.foreshadowing_stash.append(tag)
-                has_new_tags = True
-        # 若发现新伏笔标签，立即持久化更新账本数据源 (P1-05)
-        if has_new_tags and json_path.exists():
-            try:
-                save_ledger_state(state, json_path, md_path, force=True)
-            except Exception as e:
-                if not silent:
-                    print(f"[警告] 自动持久化新伏笔至账本失败: {e}", file=sys.stderr)
+    has_new_tags = _record_foreshadowing_tags(state.foreshadowing_stash, new_tags, curr_chapter.index)
+    foreshadowing_commitments = _collect_foreshadowing_commitments(state.foreshadowing_stash)
+    # 首次标签可建立双轨；仅有人工 Markdown 时保留原稿，承诺仍进入审计状态。
+    if has_new_tags and (json_path.exists() or not md_path.exists()):
+        try:
+            save_ledger_state(state, json_path, md_path, force=force)
+        except Exception as e:
+            if not silent:
+                print(f"[错误] 持久化新伏笔至账本失败: {e}", file=sys.stderr)
+            return 3
 
     # 8.5 汇集平台卡尺违规项
     p_findings = platform_data.get("findings", [])
@@ -667,6 +820,7 @@ def run_audit(
     # 10. 违规与严重度统计
     p0_list: List[str] = []
     p1_list: List[str] = []
+    detected_defects: List[Dict[str, Any]] = []
 
     detected_violations = detect_violations_in_text(curr_text)
     for v in detected_violations:
@@ -674,6 +828,16 @@ def run_audit(
             p0_list.append(v["message"])
         elif v["level"] == "P1":
             p1_list.append(v["message"])
+        if v["level"] in ("P0", "P1"):
+            detected_defects.append({
+                "chapter": curr_chapter.index,
+                "severity": v["level"],
+                "category": "factual",
+                "location": f"第{curr_chapter.index:g}章显式审计标记",
+                "evidence": v["message"],
+                "issue": v["message"],
+                "fix": "依据原文与设定核验该显式标记，保持已知事实一致。",
+            })
 
     # 平台红线与严重门禁拦截
     for pf in p_findings:
@@ -681,6 +845,10 @@ def run_audit(
             p0_list.append(pf.issue)
         elif pf.severity == "P1":
             p1_list.append(pf.issue)
+        if pf.severity in ("P0", "P1"):
+            defect = pf.to_dict()
+            defect["chapter"] = curr_chapter.index
+            detected_defects.append(defect)
 
     # 11. 生成与归档审查报告
     report_content = render_audit_report(
@@ -706,7 +874,6 @@ def run_audit(
     if write_latest_report:
         write_file_safe(latest_report_path, report_content)
         # 单章审查状态机同步 (P1-04)
-        audit_state = load_audit_state(reports_dir)
         c_idx = curr_chapter.index
         if c_idx not in audit_state.completed_chapters:
             audit_state.completed_chapters.append(c_idx)
@@ -716,22 +883,8 @@ def run_audit(
             d for d in audit_state.open_defects
             if abs(float(d.get("chapter", -1)) - c_idx) > 1e-4
         ]
-        for p0_item in p0_list:
-            audit_state.open_defects.append({
-                "chapter": c_idx,
-                "severity": "P0",
-                "category": "causal",
-                "issue": p0_item,
-                "fix": "严格依据账本与主线事实对齐，杜绝主观文学发挥",
-            })
-        for p1_item in p1_list:
-            audit_state.open_defects.append({
-                "chapter": c_idx,
-                "severity": "P1",
-                "category": "causal",
-                "issue": p1_item,
-                "fix": "严格依据账本与主线事实对齐，杜绝主观文学发挥",
-            })
+        audit_state.open_defects.extend(detected_defects)
+        _merge_foreshadowing_commitments(audit_state, foreshadowing_commitments)
         save_audit_state(audit_state, reports_dir)
 
     archived_report_path = get_report_archive_path(reports_dir, curr_chapter.index)
@@ -743,11 +896,13 @@ def run_audit(
         print(f"Requested Mode: {mode}")
         print(f"Effective Mode: {effective_mode}")
         print(f"Fallback: {fallback_reason}")
+        print("Review Stage: deterministic_precheck")
+        print("Expert Review: not_executed")
         print(f"Platform Rubric: {platform}")
         print(f"Genre: {genre_profile.primary_genre}")
         print(f"Scope: 第{curr_chapter.index:03g}章")
         print(f"----------------------------------------------------------------------------------------")
-        print(f"审查完成：第 {curr_chapter.index} 章 ({curr_chapter.title}) [题材: {genre_profile.primary_genre} | 置信度: {genre_profile.confidence:.0%}]")
+        print(f"确定性预检完成：第 {curr_chapter.index} 章 ({curr_chapter.title}) [题材: {genre_profile.primary_genre} | 置信度: {genre_profile.confidence:.0%}]")
         if write_latest_report:
             print(f"最新报告已写入：{latest_report_path}")
         print(f"归档报告已写入：{archived_report_path}")
@@ -769,7 +924,7 @@ def run_audit(
             exit_code = 0
     else:
         if not silent:
-            print("[绿灯通过] 未发现严重违规。")
+            print("[预检未阻断] 未检出 P0/P1 标记或平台规则项；专家语义审查未执行。")
         exit_code = 0
 
     if summary_collector is not None:
@@ -777,7 +932,7 @@ def run_audit(
         p3_flaws = [f for f in findings if f.severity == "P3"]
         word_count = len(re.findall(r'[一-龥\w]', curr_text))
         para_count = len([line.strip() for line in curr_text.splitlines() if line.strip()])
-        status_str = "P0 阻断" if p0_list else ("P1 警告" if p1_list else "合格")
+        status_str = "P0 阻断" if p0_list else ("P1 警告" if p1_list else "预检未阻断")
         summary_collector.update({
             "chapter_index": curr_chapter.index,
             "chapter_title": curr_chapter.title,
@@ -786,6 +941,8 @@ def run_audit(
             "paragraph_count": para_count,
             "p0_list": list(p0_list),
             "p1_list": list(p1_list),
+            "open_defects": list(detected_defects),
+            "foreshadowing_commitments": list(foreshadowing_commitments),
             "p2_count": len(p2_flaws),
             "p3_count": len(p3_flaws),
             "findings": list(findings),
@@ -820,9 +977,9 @@ def run_sync_from_md(project_dir: Path, silent: bool = False) -> int:
 
 def run_checkpoint(project_dir: Path, volume: Optional[int], force: bool = False, silent: bool = False) -> int:
     """执行 checkpoint_volume 分卷封账结转管线"""
-    if volume is None:
+    if isinstance(volume, bool) or not isinstance(volume, int) or volume <= 0:
         if not silent:
-            safe_console_print("[错误] checkpoint 结转操作必须指定 volume 卷号！", file=sys.stderr)
+            safe_console_print("[错误] checkpoint 结转操作必须指定正整数 volume 卷号！", file=sys.stderr)
         return 3
 
     json_path, _ = locate_ledger_paths(project_dir)
@@ -860,39 +1017,57 @@ def run_checkpoint(project_dir: Path, volume: Optional[int], force: bool = False
 
 def run_init_mode(project_dir: Path, scope_str: Optional[str] = None, force: bool = False, genre: str = "auto", silent: bool = False) -> Tuple[int, Path]:
     """执行 init_ledger 首次建账管线，集成启发式资产与伏笔抽取"""
+    try:
+        _validate_boolean_options(force=force, silent=silent)
+        _, _, genre = _normalize_audit_options("generic", "solo", genre)
+        bounds = parse_scope_range(scope_str) if scope_str is not None else None
+    except ValueError as e:
+        _report_api_error(e, silent)
+        return 3, Path("")
     resolver = ChapterResolver()
     chapters = resolver.discover_chapters(project_dir)
     if not chapters:
-        print(f"[错误] 未发现任何章节文件，无法建账！", file=sys.stderr)
+        if not silent:
+            print(f"[错误] 未发现任何章节文件，无法建账！", file=sys.stderr)
         return 3, Path("")
 
-    if scope_str:
-        try:
-            s_min, s_max = parse_scope_range(scope_str)
-            target_chapters = [c for c in chapters if s_min <= c.index <= s_max]
-        except Exception as e:
-            print(f"[错误] 解析范围失败: {e}", file=sys.stderr)
-            return 3, Path("")
+    if bounds is not None:
+        s_min, s_max = bounds
+        target_chapters = [c for c in chapters if s_min <= c.index <= s_max]
     else:
         target_chapters = chapters
 
     if not target_chapters:
-        print(f"[错误] 范围内未发现章节！", file=sys.stderr)
+        if not silent:
+            print(f"[错误] 范围内未发现章节！", file=sys.stderr)
+        return 3, Path("")
+    try:
+        _validate_unique_targets(target_chapters)
+    except ValueError as e:
+        _report_api_error(e, silent)
         return 3, Path("")
 
     json_path, md_path = locate_ledger_paths(project_dir)
     if md_path.is_file() and json_path.is_file() and not force:
         if check_dirty_state(md_path, json_path):
-            print(f"[防脏写拦截] 账本存在未同步手工编辑，建账被拒绝！", file=sys.stderr)
+            if not silent:
+                print(f"[防脏写拦截] 账本存在未同步手工编辑，建账被拒绝！", file=sys.stderr)
             return 3, Path("")
 
-    # 优先尝试 load_ledger_state(json_path)，继承既有 assets，仅在账本不存在时初始化新对象
-    if json_path.is_file():
-        state = load_ledger_state(json_path)
-    else:
-        state = LedgerState()
+    if md_path.exists() and not json_path.exists() and not force:
+        if not silent:
+            print("[错误] 已有 Markdown 账本但缺少 JSON，请先调用 sync_ledger_from_md() 恢复数据源。", file=sys.stderr)
+        return 3, Path("")
 
-    all_tags: List[Dict[str, str]] = list(state.foreshadowing_stash) if state.foreshadowing_stash else []
+    # 优先尝试 load_ledger_state(json_path)，继承既有 assets，仅在账本不存在时初始化新对象
+    try:
+        state = load_ledger_state(json_path)
+    except Exception as e:
+        if not silent:
+            print(f"[错误] 读取账本失败，建账已终止: {e}", file=sys.stderr)
+        return 3, Path("")
+
+    all_tags: List[Dict[str, Any]] = list(state.foreshadowing_stash) if state.foreshadowing_stash else []
     existing_asset_names: Dict[str, AssetItem] = {item.name: item for item in state.assets.values()}
 
     total_extracted_assets = 0
@@ -901,9 +1076,7 @@ def run_init_mode(project_dir: Path, scope_str: Optional[str] = None, force: boo
             txt, _, _ = read_file_safe(chap.path)
             # 1. 扫描伏笔标签
             tags = scan_foreshadowing_tags(txt)
-            for t in tags:
-                if t not in all_tags:
-                    all_tags.append(t)
+            _record_foreshadowing_tags(all_tags, tags, chap.index)
 
             # 2. 启发式抽取自然网文出装物资与装备
             extracted_assets = extract_heuristic_assets(txt, chap.index, genre=genre)
@@ -921,8 +1094,10 @@ def run_init_mode(project_dir: Path, scope_str: Optional[str] = None, force: boo
                     state.assets[item.id] = item
                     existing_asset_names[nm] = item
                     total_extracted_assets += 1
-        except Exception:
-            pass
+        except Exception as e:
+            if not silent:
+                print(f"[错误] 建账扫描第 {chap.index:g} 章失败: {e}", file=sys.stderr)
+            return 3, Path("")
 
     state.foreshadowing_stash = all_tags
     state.last_updated_chapter = target_chapters[-1].index
@@ -930,8 +1105,9 @@ def run_init_mode(project_dir: Path, scope_str: Optional[str] = None, force: boo
     try:
         save_ledger_state(state, json_path, md_path, force=force)
     except LedgerDirtyError as e:
-        print(f"[错误] 保存账本遇到防脏写拦截: {e}", file=sys.stderr)
-        return 3
+        if not silent:
+            print(f"[错误] 保存账本遇到防脏写拦截: {e}", file=sys.stderr)
+        return 3, Path("")
 
     # 生成建账盘点报告
     reports_stage_dir = project_dir / "reports" / "阶段封账与里程碑"
@@ -974,12 +1150,13 @@ def render_scope_batch_summary(
     chapter_summaries: List[Dict[str, Any]],
     strict: bool,
     requested_mode: str = "auto",
-    effective_mode: str = "full",
+    effective_mode: str = "solo",
     fallback_reason: str = "none",
     platform: str = "generic",
     inherited_items: Optional[Dict[str, Any]] = None,
 ) -> str:
     """渲染批量审查聚合大盘报告 (Markdown)"""
+    effective_mode, fallback_reason = _resolve_precheck_mode(requested_mode, fallback_reason)
     today = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     n_chaps = len(chapter_summaries)
     total_words = sum(c["word_count"] for c in chapter_summaries)
@@ -997,7 +1174,7 @@ def render_scope_batch_summary(
     elif total_p1 > 0:
         overall_status = "🟡 P1 严重失误警告 (严格模式中断)" if strict else "🟡 P1 严重失误警告 (放行)"
     else:
-        overall_status = "🟢 绿灯合格通过"
+        overall_status = "🟢 确定性预检未发现 P0/P1 标记或平台规则项"
 
     primary_genre = chapter_summaries[0]["genre_profile"].primary_genre if chapter_summaries and chapter_summaries[0].get("genre_profile") else "通用网文"
     lines: List[str] = [
@@ -1008,6 +1185,8 @@ def render_scope_batch_summary(
         f"Platform Rubric: {platform}",
         f"Genre: {primary_genre}",
         f"Scope: {scope_str}",
+        "Review Stage: deterministic_precheck",
+        "Expert Review: not_executed",
         "",
         f"# 批量连审大盘汇总报告 (范围: {scope_str})",
         "",
@@ -1015,6 +1194,7 @@ def render_scope_batch_summary(
         f"> 审查范围：第 {s_min:03g} 章 至 第 {s_max:03g} 章  ",
         f"> 覆盖章节：共 {n_chaps} 章  ",
         f"> 综合判定：{overall_status}  ",
+        "> 专家语义审查未执行；资源冲突、因果一致性与剧情质量仍需宿主核验。",
         "",
         "---",
         "",
@@ -1025,8 +1205,8 @@ def render_scope_batch_summary(
         f"| 覆盖章节总数 | {n_chaps} 章 | 设定审查连续范围 |",
         f"| 全篇总字数 | {total_words:,} 字 | 平均单章 {avg_words:,} 字 |",
         f"| 全篇总段数 | {total_paras:,} 段 | 平均单章 {avg_paras} 段 |",
-        f"| P0 致命断裂 | {total_p0} 处 | 包含死亡复活、降智崩坏等红灯项 |",
-        f"| P1 严重失误 | {total_p1} 处 | 包含未记录战力、凭空出装等黄灯项 |",
+        f"| P0 标记与规则项 | {total_p0} 处 | 正文显式标记与平台确定性规则命中 |",
+        f"| P1 标记与规则项 | {total_p1} 处 | 正文显式标记与平台确定性规则命中 |",
         f"| P2 排版长句/长段 | {total_p2} 处 | 单句逗号过多或单段超 120 字 |",
         f"| P3 翻译腔/描写混杂 | {total_p3} 处 | AI 连词或对话后堆砌长动作 |",
         "",
@@ -1053,16 +1233,16 @@ def render_scope_batch_summary(
         if wc < 2000:
             assess_parts.append("篇幅偏薄(<2000字)")
         elif wc > 4500:
-            assess_parts.append("长篇饱满(>4500字)")
+            assess_parts.append("篇幅较长(>4500字)")
         else:
             assess_parts.append("标准篇幅")
 
         if avg_plen > 70:
             assess_parts.append("段落偏密")
         elif avg_plen < 35:
-            assess_parts.append("短句快节奏")
+            assess_parts.append("平均段长少于35字")
         else:
-            assess_parts.append("节奏平稳")
+            assess_parts.append("平均段长35至70字")
 
         lines.append(f"| 第{c['chapter_index']:03g}章 | {c['chapter_title']} | {wc:,} | {pc} | {avg_plen} 字/段 | {'；'.join(assess_parts)} |")
 
@@ -1103,14 +1283,14 @@ def render_scope_batch_summary(
             lines.append("")
 
     if not has_any_flaw:
-        lines.append("（全范围章节未发现任何严重违规或排版缺陷，全绿灯通过！）\n")
+        lines.append("（本批确定性规则与显式标记未命中问题；专家语义审查未执行。）\n")
 
     lines.extend([
         "---",
         "",
         "## 四、跨章接缝与 POV 视点一览表",
         "",
-        "| 章号 | 章节名称 | POV 视点/开篇叙事 | 接缝转场线索 | 承接前章状态 | 接缝质量评估 |",
+        "| 章号 | 章节名称 | 转场提示词扫描 | 接缝转场线索 | 前章上下文 | 语义核验状态 |",
         "| :--- | :--- | :--- | :--- | :--- | :--- |",
     ])
 
@@ -1121,22 +1301,22 @@ def render_scope_batch_summary(
             pov_info = "首章开篇"
             clue = "-"
             prev_status = "首章无前置上下文"
-            seam_rating = "🟢 初始开篇"
+            seam_rating = "无前章对照"
         else:
             if b_ctx.is_pov_transition:
-                pov_info = "多线 POV 转场"
+                pov_info = "命中转场提示词"
                 clue = b_ctx.transition_clue or "视角切换"
-                seam_rating = "🔵 视点切换"
+                seam_rating = "待宿主核验"
             elif b_ctx.isolation_zones:
-                pov_info = "叙事时空切片"
+                pov_info = "命中闪回或幻境提示词"
                 clue = "含回忆/闪回"
-                seam_rating = "🟣 时空隔离"
+                seam_rating = "待宿主核验"
             else:
-                pov_info = "主角主视点顺承"
+                pov_info = "未命中已配置的转场提示词"
                 clue = "-"
-                seam_rating = "🟢 无缝顺承"
+                seam_rating = "待宿主核验"
 
-            prev_status = "紧密相承" if b_ctx.has_prev_chapter else "-"
+            prev_status = "已读取前章切片" if b_ctx.has_prev_chapter else "-"
 
         lines.append(f"| {idx_str} | {c['chapter_title']} | {pov_info} | {clue} | {prev_status} | {seam_rating} |")
 
@@ -1158,7 +1338,13 @@ def run_scope_audit(
 ) -> int:
     """执行批量连审模式，生成大盘汇总报告与紧凑看板输出"""
     try:
+        _validate_boolean_options(strict=strict, force=force, silent=silent,
+                                  author_memory=use_author_memory)
+        if allow_partial is not None:
+            _validate_boolean_options(allow_partial=allow_partial)
+        platform, mode, genre = _normalize_audit_options(platform, mode, genre)
         s_min, s_max = parse_scope_range(scope_str)
+        scope_str = "".join(scope_str.split())
     except Exception as e:
         if not silent:
             safe_console_print(f"[错误] {e}", file=sys.stderr)
@@ -1172,17 +1358,27 @@ def run_scope_audit(
             safe_console_print(f"[错误] 范围 {scope_str} 内未找到任何章节！", file=sys.stderr)
         return 3
 
+    try:
+        _validate_unique_targets(target_chapters)
+    except ValueError as e:
+        _report_api_error(e, silent)
+        return 3
+
     n_total = len(target_chapters)
     if allow_partial is None:
         effective_allow_partial = bool(s_min > 1.0)
     else:
         effective_allow_partial = allow_partial
     reports_dir = project_dir / "reports"
-    reports_dir.mkdir(parents=True, exist_ok=True)
 
     # 运行时探测与跨批状态机继承
-    effective_mode, fallback_reason = resolve_execution_mode(mode)
-    audit_state = load_audit_state(reports_dir)
+    effective_mode, fallback_reason = _resolve_precheck_mode(mode)
+    try:
+        audit_state = load_audit_state(reports_dir)
+    except Exception as e:
+        if not silent:
+            safe_console_print(f"[错误] 读取审计状态失败: {e}", file=sys.stderr)
+        return 3
     inherited_items = get_inherited_items(audit_state)
 
     if not silent:
@@ -1190,6 +1386,8 @@ def run_scope_audit(
         safe_console_print(f"Requested Mode: {mode}")
         safe_console_print(f"Effective Mode: {effective_mode}")
         safe_console_print(f"Fallback: {fallback_reason}")
+        safe_console_print("Review Stage: deterministic_precheck")
+        safe_console_print("Expert Review: not_executed")
         safe_console_print(f"Platform Rubric: {platform}")
         safe_console_print(f"Genre: {genre}")
         safe_console_print(f"Scope: {scope_str}")
@@ -1222,7 +1420,12 @@ def run_scope_audit(
             use_author_memory=use_author_memory,
             inherited_items=inherited_items,
             allow_partial=effective_allow_partial,
+            _chapter_snapshot=chapters,
         )
+        if code == 3:
+            if not silent:
+                safe_console_print(f"[错误] 第 {chap.index:g} 章审查失败，批量审查已停止。", file=sys.stderr)
+            return 3
         chapter_summaries.append(summary)
 
         if code == 2:
@@ -1241,7 +1444,7 @@ def run_scope_audit(
     tot_p1 = sum(len(s['p1_list']) for s in chapter_summaries)
     tot_p2 = sum(s['p2_count'] for s in chapter_summaries)
     tot_p3 = sum(s['p3_count'] for s in chapter_summaries)
-    overall_label = "🔴 P0 阻断" if has_p0 else ("🟡 P1 警告" if has_p1 else "🟢 合格通过")
+    overall_label = "🔴 P0 阻断" if has_p0 else ("🟡 P1 警告" if has_p1 else "🟢 确定性预检未阻断")
 
     if not silent:
         safe_console_print(f"========================================================================================")
@@ -1316,29 +1519,12 @@ def run_scope_audit(
     seen_defect_keys = {(d.get("chapter"), d.get("severity"), d.get("issue")) for d in audit_state.open_defects}
 
     for s in chapter_summaries:
-        c_idx = s.get("chapter_index", 0)
-        for p0_item in s.get("p0_list", []):
-            k = (c_idx, "P0", p0_item)
+        _merge_foreshadowing_commitments(audit_state, s.get("foreshadowing_commitments", []))
+        for defect in s.get("open_defects", []):
+            k = (defect.get("chapter"), defect.get("severity"), defect.get("issue"))
             if k not in seen_defect_keys:
                 seen_defect_keys.add(k)
-                audit_state.open_defects.append({
-                    "chapter": c_idx,
-                    "severity": "P0",
-                    "category": "causal",
-                    "issue": p0_item,
-                    "fix": "严格依据账本与主线事实对齐，杜绝主观文学发挥",
-                })
-        for p1_item in s.get("p1_list", []):
-            k = (c_idx, "P1", p1_item)
-            if k not in seen_defect_keys:
-                seen_defect_keys.add(k)
-                audit_state.open_defects.append({
-                    "chapter": c_idx,
-                    "severity": "P1",
-                    "category": "causal",
-                    "issue": p1_item,
-                    "fix": "严格依据账本与主线事实对齐，杜绝主观文学发挥",
-                })
+                audit_state.open_defects.append(dict(defect))
 
     save_audit_state(audit_state, reports_dir)
 
@@ -1367,6 +1553,12 @@ def run_apply_fix(
     silent: bool = False,
 ) -> int:
     """执行 apply_fix 方案采纳回写管线"""
+    try:
+        _validate_chapter_index(chapter_idx)
+        _validate_boolean_options(silent=silent)
+    except ValueError as e:
+        _report_api_error(e, silent)
+        return 3
     resolver = ChapterResolver()
     chapters = resolver.discover_chapters(project_dir)
     if not chapters:
@@ -1374,14 +1566,11 @@ def run_apply_fix(
             safe_console_print(f"[错误] 未发现章节文件！", file=sys.stderr)
         return 3
 
-    target_chapter: Optional[ChapterItem] = None
-    if chapter_idx is not None:
-        for c in chapters:
-            if abs(c.index - chapter_idx) < 1e-4:
-                target_chapter = c
-                break
-    else:
-        target_chapter = chapters[-1]
+    try:
+        target_chapter = _select_unique_chapter(chapters, chapter_idx)
+    except ValueError as e:
+        _report_api_error(e, silent)
+        return 3
 
     if not target_chapter:
         if not silent:
@@ -1394,7 +1583,7 @@ def run_apply_fix(
             with open(patch_file, encoding="utf-8") as f:
                 p_data = json.load(f)
             patch = PatchSpec(
-                target_line=int(p_data["target_line"]),
+                target_line=p_data["target_line"],
                 context_before=p_data.get("context_before", ""),
                 old_text=p_data["old_text"],
                 new_text=p_data["new_text"],
@@ -1414,11 +1603,30 @@ def run_apply_fix(
             return 3
         patch = PatchSpec(
             target_line=target_line,
-            context_before=context_before or "",
+            context_before=context_before,
             old_text=old_text,
             new_text=new_text,
-            context_after=context_after or "",
+            context_after=context_after,
         )
+
+    # 先验证原始字段，再进入会生成备份的回写器；显式空串仍可用于删除。
+    if (
+        not isinstance(patch.target_line, int)
+        or isinstance(patch.target_line, bool)
+        or patch.target_line <= 0
+        or not isinstance(patch.old_text, str)
+        or not patch.old_text
+        or not isinstance(patch.new_text, str)
+        or not isinstance(patch.context_before, str)
+        or not isinstance(patch.context_after, str)
+    ):
+        if not silent:
+            safe_console_print(
+                "[错误] 补丁必须包含正整数 target_line、非空字符串 old_text，"
+                "且 new_text 与前后锚点必须为字符串。",
+                file=sys.stderr,
+            )
+        return 3
 
     backup_dir = project_dir / "reports" / ".bak"
     try:
@@ -1472,22 +1680,26 @@ def audit_chapter(
     Returns:
         Tuple[int, Path]: (状态码, 报告路径)。成功或发现缺陷时返回具体归档报告路径，失败未生成报告时返回空路径 Path("")
     """
-    p_dir = Path(project_dir).resolve()
-    summary: Dict[str, Any] = {}
-    exit_code = run_audit(
-        project_dir=p_dir,
-        target_chapter_index=chapter_index,
-        strict=strict,
-        force=force,
-        write_latest_report=True,
-        silent=silent,
-        summary_collector=summary,
-        genre=genre,
-        mode=mode,
-        platform=platform,
-        use_author_memory=author_memory,
-        allow_partial=allow_partial,
-    )
+    try:
+        p_dir = _resolve_project_dir(project_dir)
+        summary: Dict[str, Any] = {}
+        exit_code = run_audit(
+            project_dir=p_dir,
+            target_chapter_index=chapter_index,
+            strict=strict,
+            force=force,
+            write_latest_report=True,
+            silent=silent,
+            summary_collector=summary,
+            genre=genre,
+            mode=mode,
+            platform=platform,
+            use_author_memory=author_memory,
+            allow_partial=allow_partial,
+        )
+    except (OSError, SafeIOError, TypeError, ValueError) as e:
+        _report_api_error(e, silent)
+        return 3, Path("")
     report_path = summary.get("archived_report_path")
     if report_path is None or not Path(report_path).exists():
         latest = p_dir / "reports" / "LATEST_REPORT.md"
@@ -1525,20 +1737,26 @@ def audit_scope(
     Returns:
         Tuple[int, Path]: (状态码, 大盘汇总报告路径)
     """
-    p_dir = Path(project_dir).resolve()
-    exit_code = run_scope_audit(
-        project_dir=p_dir,
-        scope_str=scope_str,
-        strict=strict,
-        force=force,
-        genre=genre,
-        mode=mode,
-        platform=platform,
-        use_author_memory=author_memory,
-        silent=silent,
-        allow_partial=allow_partial,
-    )
-    scope_clean = scope_str.replace(" ", "")
+    try:
+        p_dir = _resolve_project_dir(project_dir)
+        exit_code = run_scope_audit(
+            project_dir=p_dir,
+            scope_str=scope_str,
+            strict=strict,
+            force=force,
+            genre=genre,
+            mode=mode,
+            platform=platform,
+            use_author_memory=author_memory,
+            silent=silent,
+            allow_partial=allow_partial,
+        )
+    except (OSError, SafeIOError, TypeError, ValueError) as e:
+        _report_api_error(e, silent)
+        return 3, Path("")
+    if exit_code == 3:
+        return 3, Path("")
+    scope_clean = "".join(scope_str.split())
     scope_summary_path = p_dir / "reports" / f"BATCH_SUMMARY_SCOPE_{scope_clean}.md"
     if not scope_summary_path.exists():
         latest = p_dir / "reports" / "LATEST_REPORT.md"
@@ -1568,14 +1786,18 @@ def init_ledger(
     Returns:
         Tuple[int, Path]: (状态码, 建账盘点报告路径)
     """
-    p_dir = Path(project_dir).resolve()
-    return run_init_mode(
-        project_dir=p_dir,
-        scope_str=scope_str,
-        force=force,
-        genre=genre,
-        silent=silent,
-    )
+    try:
+        p_dir = _resolve_project_dir(project_dir)
+        return run_init_mode(
+            project_dir=p_dir,
+            scope_str=scope_str,
+            force=force,
+            genre=genre,
+            silent=silent,
+        )
+    except (OSError, SafeIOError, TypeError, ValueError) as e:
+        _report_api_error(e, silent)
+        return 3, Path("")
 
 
 def checkpoint_volume(
@@ -1594,8 +1816,13 @@ def checkpoint_volume(
     Returns:
         int: 状态码 (0 成功, 3 失败)
     """
-    p_dir = Path(project_dir).resolve()
-    return run_checkpoint(project_dir=p_dir, volume=volume, force=force, silent=silent)
+    try:
+        p_dir = _resolve_project_dir(project_dir)
+        _validate_boolean_options(force=force, silent=silent)
+        return run_checkpoint(project_dir=p_dir, volume=volume, force=force, silent=silent)
+    except (OSError, SafeIOError, TypeError, ValueError) as e:
+        _report_api_error(e, silent)
+        return 3
 
 
 def sync_ledger_from_md(
@@ -1612,8 +1839,13 @@ def sync_ledger_from_md(
     Returns:
         int: 状态码 (0 成功, 3 失败)
     """
-    p_dir = Path(project_dir).resolve()
-    return run_sync_from_md(project_dir=p_dir, silent=silent)
+    try:
+        p_dir = _resolve_project_dir(project_dir)
+        _validate_boolean_options(force=force, silent=silent)
+        return run_sync_from_md(project_dir=p_dir, silent=silent)
+    except (OSError, SafeIOError, TypeError, ValueError) as e:
+        _report_api_error(e, silent)
+        return 3
 
 
 def apply_fix(
@@ -1644,7 +1876,16 @@ def apply_fix(
     Returns:
         int: 状态码 (0 成功, 3 失败)
     """
-    p_dir = Path(project_dir).resolve()
+    try:
+        p_dir = _resolve_project_dir(project_dir)
+        if patch is not None and not isinstance(patch, (PatchSpec, dict)):
+            raise ValueError("patch 必须是 PatchSpec 或 dict")
+        if patch_file is not None:
+            if not isinstance(patch_file, (str, os.PathLike)) or not str(patch_file).strip():
+                raise ValueError("patch_file 必须是补丁文件路径")
+    except (OSError, TypeError, ValueError) as e:
+        _report_api_error(e, silent)
+        return 3
     if patch is not None:
         if isinstance(patch, PatchSpec):
             target_line = patch.target_line
@@ -1653,24 +1894,28 @@ def apply_fix(
             context_before = patch.context_before
             context_after = patch.context_after
         elif isinstance(patch, dict):
-            target_line = int(patch.get("target_line", 0))
-            old_text = str(patch.get("old_text", ""))
-            new_text = str(patch.get("new_text", ""))
-            context_before = str(patch.get("context_before", ""))
-            context_after = str(patch.get("context_after", ""))
+            target_line = patch.get("target_line")
+            old_text = patch.get("old_text")
+            new_text = patch.get("new_text")
+            context_before = patch.get("context_before", "")
+            context_after = patch.get("context_after", "")
 
     p_file_str = str(patch_file) if patch_file is not None else None
-    return run_apply_fix(
-        project_dir=p_dir,
-        chapter_idx=chapter_index,
-        target_line=target_line,
-        old_text=old_text,
-        new_text=new_text,
-        context_before=context_before,
-        context_after=context_after,
-        patch_file=p_file_str,
-        silent=silent,
-    )
+    try:
+        return run_apply_fix(
+            project_dir=p_dir,
+            chapter_idx=chapter_index,
+            target_line=target_line,
+            old_text=old_text,
+            new_text=new_text,
+            context_before=context_before,
+            context_after=context_after,
+            patch_file=p_file_str,
+            silent=silent,
+        )
+    except (OSError, SafeIOError, TypeError, ValueError) as e:
+        _report_api_error(e, silent)
+        return 3
 
 
 __all__ = [

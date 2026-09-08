@@ -546,7 +546,8 @@ class TestStoryAuditApiGenreIntegration(unittest.TestCase):
         self.assertIn("都市高武", rep_txt)
         self.assertIn("第一性原理追读卡尺", rep_txt)
         self.assertIn("绝不可踩", rep_txt)
-        self.assertIn("Agent D", rep_txt)
+        self.assertIn("专家语义审查待办（需宿主执行）", rep_txt)
+        self.assertIn("Expert Review: not_executed", rep_txt)
 
     def test_api_genre_manual_override(self):
         """测试 CLI 显式传递 --genre 手动指定题材并装配专属卡尺"""

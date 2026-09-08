@@ -155,7 +155,13 @@ class AuthorMemory:
             if not isinstance(data, dict):
                 raise AuthorMemoryError("状态文件格式错误：根节点必须为 JSON 对象")
             if "preferences" not in data or not isinstance(data["preferences"], dict):
-                data["preferences"] = {}
+                raise AuthorMemoryError("状态文件格式错误：preferences 必须为 JSON 对象")
+            if any(not isinstance(item, dict) for item in data["preferences"].values()):
+                raise AuthorMemoryError("状态文件格式错误：偏好条目必须为 JSON 对象")
+            for item in data["preferences"].values():
+                for key in ("id", "key", "value", "category", "source", "confidence", "status", "created_at", "updated_at"):
+                    if key in item and not isinstance(item[key], str):
+                        raise AuthorMemoryError(f"状态文件格式错误：偏好字段 {key} 必须为字符串")
             return data
         except json.JSONDecodeError as e:
             raise AuthorMemoryError(f"状态文件 JSON 解析失败: {e}")

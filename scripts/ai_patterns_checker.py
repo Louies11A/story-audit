@@ -53,19 +53,11 @@ def mask_quotes_in_line(line: str) -> str:
         while i < n:
             if chars[i] == open_q:
                 # 寻找同行的配对闭合引号
-                if open_q == close_q:
-                    # 单一符号引号（如 " 或 '）
-                    j = -1
-                    for k in range(i + 1, n):
-                        if chars[k] == close_q:
-                            j = k
-                            break
-                else:
-                    j = -1
-                    for k in range(i + 1, n):
-                        if chars[k] == close_q:
-                            j = k
-                            break
+                j = -1
+                for k in range(i + 1, n):
+                    if chars[k] == close_q:
+                        j = k
+                        break
 
                 if j != -1:
                     # 掩码闭合区间内内容，保留两端引号字符位置以便调试
@@ -74,8 +66,8 @@ def mask_quotes_in_line(line: str) -> str:
                             chars[k] = " "
                     i = j + 1
                 else:
-                    # 找不到闭引号则不跨行掩码
-                    i += 1
+                    # 后缀已确认没有该闭引号，后续同类开引号也不可能闭合。
+                    break
             else:
                 i += 1
 
@@ -210,8 +202,9 @@ def scan_ai_patterns(text: str) -> List[FormatFinding]:
 
         # 引号外正文掩码
         masked_line = mask_quotes_in_line(orig_line.rstrip("\r"))
+        tail_start = max(0, char_offset_threshold - current_char_offset)
         is_in_tail_window = (
-            line_idx > opening_line_limit and current_char_offset >= char_offset_threshold
+            line_idx > opening_line_limit and tail_start < len(masked_line)
         )
 
         # -------------------------------------------------------------
@@ -319,24 +312,24 @@ def scan_ai_patterns(text: str) -> List[FormatFinding]:
         # 5. 检测 trailer-ending 与 trailer-summary (仅在章末窗口)
         # -------------------------------------------------------------
         if is_in_tail_window:
-            m_te = TRAILER_ENDING_PATTERN.search(masked_line)
+            m_te = TRAILER_ENDING_PATTERN.search(masked_line, tail_start)
             if m_te:
                 findings.append(FormatFinding(
                     line_number=line_num,
                     flaw_type="AI_TRAILER_ENDING",
                     severity="P2",
-                    snippet=_make_snippet(clean_orig[m_te.start():m_te.end() + 20]),
+                    snippet=_make_snippet(orig_line[m_te.start():m_te.end() + 20]),
                     message="检测到章末预告式总结收尾（没人知道/殊不知/才刚刚开始等）",
                     suggestion="建议删去全知叙述者的剧透预告，将视角锁定在角色当下体验，留白让读者自然翻页。"
                 ))
 
-            m_ts = TRAILER_SUMMARY_PATTERN.search(masked_line)
+            m_ts = TRAILER_SUMMARY_PATTERN.search(masked_line, tail_start)
             if m_ts:
                 findings.append(FormatFinding(
                     line_number=line_num,
                     flaw_type="AI_TRAILER_SUMMARY",
                     severity="P2",
-                    snippet=_make_snippet(clean_orig[m_ts.start():m_ts.end() + 20]),
+                    snippet=_make_snippet(orig_line[m_ts.start():m_ts.end() + 20]),
                     message="检测到章末状态总结体（这一夜注定……/这一切都结束了/命运的齿轮等）",
                     suggestion="建议删去机械的状态盖章句，以角色具体的动作、环境定格或事件余波收尾。"
                 ))

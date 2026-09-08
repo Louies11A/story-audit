@@ -67,8 +67,9 @@ class TestStoryAuditUpgrades(unittest.TestCase):
         # 校验固定英文元数据键
         self.assertIn("=== story-audit 深度审查报告 ===", content)
         self.assertIn("Requested Mode: full", content)
-        self.assertIn("Effective Mode: full", content)
-        self.assertIn("Fallback: none", content)
+        self.assertIn("Effective Mode: solo", content)
+        self.assertIn("python_api_deterministic_only", content)
+        self.assertIn("Expert Review: not_executed", content)
         self.assertIn("Platform Rubric: fanqie", content)
         self.assertIn("Genre: 科幻末世", content)
         self.assertIn("Scope: 第001章", content)

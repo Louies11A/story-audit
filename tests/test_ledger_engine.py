@@ -610,8 +610,8 @@ class TestSyncFromMarkdown(unittest.TestCase):
         self.assertIn("i1", state.assets)
         self.assertEqual(state.assets["i1"].name, "盾牌")
 
-    def test_sync_from_markdown_resilience(self):
-        """测试解析损坏JSON及包含非数值格式的Markdown表格"""
+    def test_sync_from_markdown_preserves_corrupt_json(self):
+        """已有 JSON 损坏时拒绝同步，保留两个来源供作者修复。"""
         # 写入损坏的 json
         self.json_path.write_text("{corrupted_json: true", encoding="utf-8")
 
@@ -623,11 +623,12 @@ class TestSyncFromMarkdown(unittest.TestCase):
         custom_md = f"# 资源账本\n\n{table_header}\n{table_sep}\n{row}\n{empty_row}\n"
         self.md_path.write_text(custom_md, encoding="utf-8")
 
-        state = sync_from_markdown(self.md_path, self.json_path)
-        self.assertIn("sword_x", state.assets)
-        # 非法数值回退为默认 1 和 1.0
-        self.assertEqual(state.assets["sword_x"].quantity, 1)
-        self.assertEqual(state.assets["sword_x"].origin_chapter, 1.0)
+        original_json = self.json_path.read_bytes()
+        original_md = self.md_path.read_bytes()
+        with self.assertRaises(ValueError):
+            sync_from_markdown(self.md_path, self.json_path)
+        self.assertEqual(self.json_path.read_bytes(), original_json)
+        self.assertEqual(self.md_path.read_bytes(), original_md)
 
 
     def test_sync_from_markdown_removes_physically_deleted_assets(self):

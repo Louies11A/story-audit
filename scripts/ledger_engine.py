@@ -12,14 +12,16 @@
 """
 
 import json
+import math
 import os
 import re
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Union
 
-from scripts.safe_io import read_file_safe, write_file_safe
+from scripts.safe_io import SafeIOWriteError, read_file_safe, write_file_safe
 
 # 七类资产标准分类
 ASSET_CATEGORIES: Set[str] = {
@@ -126,7 +128,7 @@ class AssetItem:
     quantity: Union[int, float]                             # 数量
     unit: str                                               # 单位（如 "块", "把", "枚"）
     owner: str = "主角"                                     # 原始所有者（默认 "主角"）
-    current_holder: str = "主角"                             # 当前实际持有人（默认同 owner）
+    current_holder: str = ""                                 # 当前实际持有人（默认同 owner）
     status: str = "ACQUIRED"                                # 当前状态
     origin_chapter: float = 1.0                             # 获取章节
     lend_meta: Optional[Dict[str, Any]] = None              # 借出元数据（借用人、时限等）
@@ -233,19 +235,37 @@ class AssetItem:
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "AssetItem":
         """从字典反序列化构建 AssetItem 实例"""
+        if not isinstance(d, dict):
+            raise ValueError("资产条目必须为对象")
+        for key in ("id", "name", "category", "unit", "owner", "current_holder", "status"):
+            if key in d and not isinstance(d[key], str):
+                raise ValueError(f"资产字段 {key} 必须为字符串")
+        quantity = d.get("quantity", 1)
+        if isinstance(quantity, bool) or not isinstance(quantity, (int, float)) or not math.isfinite(quantity):
+            raise ValueError("资产 quantity 必须为有限数值")
+        origin_chapter = float(d.get("origin_chapter", 1.0))
+        if not math.isfinite(origin_chapter):
+            raise ValueError("资产 origin_chapter 必须为有限数值")
+        if not isinstance(d.get("constraints", {}), dict):
+            raise ValueError("资产 constraints 必须为对象")
+        history = d.get("history", [])
+        if not isinstance(history, list) or any(not isinstance(item, dict) for item in history):
+            raise ValueError("资产 history 必须为对象列表")
+        if d.get("lend_meta") is not None and not isinstance(d["lend_meta"], dict):
+            raise ValueError("资产 lend_meta 必须为对象或空值")
         return cls(
             id=str(d.get("id", "")),
             name=str(d.get("name", "")),
             category=str(d.get("category", "装备道具")),
-            quantity=d.get("quantity", 1),
+            quantity=quantity,
             unit=str(d.get("unit", "个")),
             owner=str(d.get("owner", "主角")),
             current_holder=str(d.get("current_holder", d.get("owner", "主角"))),
             status=str(d.get("status", "ACQUIRED")),
-            origin_chapter=float(d.get("origin_chapter", 1.0)),
+            origin_chapter=origin_chapter,
             lend_meta=d.get("lend_meta"),
             constraints=dict(d.get("constraints", {})),
-            history=list(d.get("history", [])),
+            history=list(history),
         )
 
 
@@ -267,18 +287,35 @@ class LedgerState:
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "LedgerState":
         """从字典反序列化为 LedgerState 实例"""
+        if not isinstance(d, dict):
+            raise ValueError("账本根节点必须为对象")
         raw_assets = d.get("assets", {})
+        if not isinstance(raw_assets, dict):
+            raise ValueError("账本 assets 必须为对象")
+        stash = d.get("foreshadowing_stash", [])
+        if not isinstance(stash, list) or any(not isinstance(item, dict) for item in stash):
+            raise ValueError("账本 foreshadowing_stash 必须为对象列表")
+        for item in stash:
+            for text_key in ("name", "origin", "status"):
+                if text_key in item and not isinstance(item[text_key], str):
+                    raise ValueError(f"伏笔 {text_key} 必须为字符串")
+            source_chapter = item.get("source_chapter")
+            if source_chapter is not None:
+                if isinstance(source_chapter, bool) or not isinstance(source_chapter, (int, float, str)) or not math.isfinite(float(source_chapter)):
+                    raise ValueError("伏笔 source_chapter 必须为有限章号或 null")
         assets: Dict[str, AssetItem] = {}
         for k, v in raw_assets.items():
             if isinstance(v, AssetItem):
                 assets[k] = v
             elif isinstance(v, dict):
                 assets[k] = AssetItem.from_dict(v)
+            else:
+                raise ValueError(f"资产 {k} 必须为对象")
 
         return cls(
             last_updated_chapter=float(d.get("last_updated_chapter", 0.0)),
             assets=assets,
-            foreshadowing_stash=list(d.get("foreshadowing_stash", [])),
+            foreshadowing_stash=list(stash),
         )
 
 
@@ -412,6 +449,19 @@ def _clean_asset_name(raw: str) -> str:
     return name.strip("：: ，,、。！？“”\"'[]【】 ")
 
 
+def _iter_heuristic_brackets(text: str) -> Iterator[re.Match]:
+    """按右括号划分候选区间，每段只匹配一次，避免重复回溯同一后缀。"""
+    opening = text.find("【")
+    while opening != -1:
+        closing = text.find("】", opening + 1)
+        if closing == -1:
+            break
+        match = HEURISTIC_BRACKET_PATTERN.match(text, opening, closing + 1)
+        if match is not None:
+            yield match
+        opening = text.find("【", closing + 1)
+
+
 def extract_heuristic_assets(text: str, chapter_index: float, genre: Optional[str] = None) -> List[Dict[str, Any]]:
     """
     启发式资产抽取器：在缺乏人工 audit:stash 注释标签时，
@@ -423,7 +473,7 @@ def extract_heuristic_assets(text: str, chapter_index: float, genre: Optional[st
     raw_candidates: List[Tuple[str, Union[int, float], str, str]] = []
 
     # 1. 扫描系统出装/提示括号块 【获得/收录/解锁/建造/打捞/缴获...】
-    for m in HEURISTIC_BRACKET_PATTERN.finditer(text):
+    for m in _iter_heuristic_brackets(text):
         full_bracket = m.group(0)
         bracket_inner = full_bracket[1:-1].strip()
         # 优先以冒号切分标题与正文
@@ -631,14 +681,30 @@ def scan_foreshadowing_tags(text: str) -> List[Dict[str, str]]:
     return results
 
 
+def _ledger_recovery_path(json_path: Path) -> Path:
+    return json_path.with_name(f".{json_path.name}.recovery.json")
+
+
+def ensure_ledger_recovered(json_path: Path) -> None:
+    """未完成的双轨保存必须先恢复，force 不能绕过恢复标记。"""
+    recovery_path = _ledger_recovery_path(Path(json_path))
+    if recovery_path.exists():
+        raise SafeIOWriteError(
+            f"账本存在未完成的双轨保存，请先按恢复标记 {recovery_path} "
+            "检查并恢复原文件，再移除该标记；恢复副本不得直接删除。"
+        )
+
+
 def check_dirty_state(md_path: Path, json_path: Path, tolerance: float = 0.05) -> bool:
     """检查 Markdown 账本是否存在比 JSON 更加新的外部修改冲突
 
-    当且仅当 md_path 与 json_path 均存在且 (md_path.stat().st_mtime - json_path.stat().st_mtime) > tolerance 时返回 True。
+    存在双轨恢复标记，或两轨均存在且 Markdown 时间戳明显更新时返回 True。
     增加 0.05s 时间戳浮点安全容差，避免 Windows NTFS 微秒截断引起误判脏写。
     """
     md = Path(md_path)
     js = Path(json_path)
+    if _ledger_recovery_path(js).exists():
+        return True
     if not md.is_file() or not js.is_file():
         return False
     return (md.stat().st_mtime - js.stat().st_mtime) > tolerance
@@ -759,14 +825,10 @@ def save_ledger_state(
     md_path: Optional[Path] = None,
     force: bool = False,
 ) -> None:
-    """原子保存账本状态并执行防脏写拦截
-
-    若提供了 md_path，在写入前检查 check_dirty_state：
-    若 dirty 且 force=False，抛出 LedgerDirtyError；
-    写入完成后同步时间戳，消除误报。
-    """
+    """保存账本；双轨提交失败时恢复原字节，恢复失败则保留副本并阻止复用。"""
     json_p = Path(json_path)
     md_p = Path(md_path) if md_path else None
+    ensure_ledger_recovered(json_p)
 
     # 防脏写拦截
     if md_p is not None and not force:
@@ -776,21 +838,108 @@ def save_ledger_state(
                 "存在潜在外部人工编辑冲突！若需强制覆写请指定 force=True，或先执行 sync_from_markdown。"
             )
 
-    # 保存 JSON
+    # 两份内容必须均准备成功后，才能改变任意目标文件。
     json_content = json.dumps(state.to_dict(), ensure_ascii=False, indent=2)
-    write_file_safe(json_p, json_content)
+    if md_p is None:
+        write_file_safe(json_p, json_content)
+        return
+    md_content = render_ledger_markdown(state)
+    if json_p.resolve() == md_p.resolve():
+        raise SafeIOWriteError("JSON 与 Markdown 账本不能使用同一路径")
 
-    # 若指定了 md_path，渲染并原子写入 Markdown
-    if md_p is not None:
-        md_content = render_ledger_markdown(state)
-        write_file_safe(md_p, md_content)
+    recovery_path = _ledger_recovery_path(json_p)
+    backups: Dict[Path, Optional[Path]] = {}
+    attempted: List[Path] = []
+    created_dirs: List[Path] = []
+    owns_marker = False
+    completed = False
+    try:
+        for target in (json_p, md_p):
+            missing_dirs: List[Path] = []
+            parent = target.parent
+            while not parent.exists():
+                missing_dirs.append(parent)
+                parent = parent.parent
+            created_dirs.extend(path for path in reversed(missing_dirs) if path not in created_dirs)
+            target.parent.mkdir(parents=True, exist_ok=True)
 
-        # 消除时间戳微小偏差带来的脏写误报：使 json 的 mtime 不早于 md 的 mtime
-        if md_p.exists() and json_p.exists():
-            md_mtime = md_p.stat().st_mtime
-            json_mtime = json_p.stat().st_mtime
-            if md_mtime > json_mtime:
-                os.utime(json_p, (md_mtime, md_mtime))
+        # 独占标记同时阻止另一次保存覆盖本次恢复信息。
+        with recovery_path.open("x", encoding="utf-8") as marker:
+            owns_marker = True
+            json.dump({"phase": "preparing", "targets": [str(json_p.resolve()), str(md_p.resolve())]}, marker, ensure_ascii=False)
+            marker.flush()
+            os.fsync(marker.fileno())
+
+        for target in (json_p, md_p):
+            backups[target] = None
+            if target.exists():
+                original_stat = target.stat()
+                backup_fd, backup_name = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.recovery-", suffix=".bak")
+                backup_path = Path(backup_name)
+                backups[target] = backup_path
+                with os.fdopen(backup_fd, "wb") as backup:
+                    backup.write(target.read_bytes())
+                    backup.flush()
+                    os.fsync(backup.fileno())
+                os.utime(backup_path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+
+        write_file_safe(recovery_path, json.dumps({
+            "phase": "committing",
+            "targets": [
+                {"path": str(target.resolve()), "existed": backup is not None,
+                 "backup": str(backup.resolve()) if backup is not None else None}
+                for target, backup in backups.items()
+            ],
+        }, ensure_ascii=False, indent=2))
+
+        for target, content in ((json_p, json_content), (md_p, md_content)):
+            attempted.append(target)
+            write_file_safe(target, content)
+
+        # 保持原有防脏写时间戳约定；该步骤失败也应恢复两轨。
+        md_mtime_ns = md_p.stat().st_mtime_ns
+        json_stat = json_p.stat()
+        if md_mtime_ns > json_stat.st_mtime_ns:
+            os.utime(json_p, ns=(json_stat.st_atime_ns, md_mtime_ns))
+        recovery_path.unlink()
+        completed = True
+    except Exception as error:
+        restore_errors: List[str] = []
+        for target in reversed(attempted):
+            try:
+                backup = backups[target]
+                if backup is not None:
+                    os.replace(backup, target)
+                elif target.exists():
+                    target.unlink()
+            except OSError as restore_error:
+                restore_errors.append(f"{target}: {restore_error}")
+        if owns_marker and not restore_errors:
+            try:
+                recovery_path.unlink()
+            except OSError as marker_error:
+                restore_errors.append(str(marker_error))
+        if restore_errors:
+            raise SafeIOWriteError(
+                f"双轨账本保存失败且恢复未完成，请保留恢复标记 {recovery_path} 与副本："
+                + "; ".join(restore_errors)
+            ) from error
+        raise SafeIOWriteError(f"双轨账本保存失败，原文件已保留或恢复：{error}") from error
+    finally:
+        # 恢复中断时副本必须留下；正常完成或完整回滚后只清理本次临时文件。
+        if owns_marker and not recovery_path.exists():
+            for backup in backups.values():
+                if backup is not None:
+                    try:
+                        backup.unlink()
+                    except OSError:
+                        pass
+        if not completed:
+            for directory in reversed(created_dirs):
+                try:
+                    directory.rmdir()
+                except OSError:
+                    pass
 
 
 def create_volume_checkpoint(volume: int, state: LedgerState, archive_dir: Path) -> Path:
@@ -810,17 +959,15 @@ def sync_from_markdown(md_path: Path, json_path: Path) -> LedgerState:
     """从 Markdown 账本表格反向增量解析并合并至 JSON 数据源"""
     md_p = Path(md_path)
     json_p = Path(json_path)
+    ensure_ledger_recovered(json_p)
 
     md_content, _, _ = read_file_safe(md_p)
 
     # 读取现有 JSON 状态或初始化空状态
-    if json_p.is_file():
+    if json_p.exists():
         raw_json_str, _, _ = read_file_safe(json_p)
-        try:
-            raw_data = json.loads(raw_json_str)
-            state = LedgerState.from_dict(raw_data)
-        except Exception:
-            state = LedgerState()
+        raw_data = json.loads(raw_json_str)
+        state = LedgerState.from_dict(raw_data)
     else:
         state = LedgerState()
 
@@ -832,22 +979,45 @@ def sync_from_markdown(md_path: Path, json_path: Path) -> LedgerState:
         except ValueError:
             pass
 
-    # 解析表格行
-    table_lines = [line.strip() for line in md_content.split(chr(10)) if line.strip().startswith("|")]
+    # 先完整解析资产表，坏行不能被当作作者主动删除的资产。
     col_mapping: Optional[Dict[str, int]] = None
+    column_count = 0
+    saw_asset_table = False
+    in_asset_section = False
     valid_asset_ids: Set[str] = set()
+    required_columns = {"资产ID", "资产名称", "类别", "数量", "单位", "所有者", "当前持有者", "状态", "初始章节"}
 
-    for line in table_lines:
+    for line_number, raw_line in enumerate(md_content.splitlines(), 1):
+        line = raw_line.strip()
+        if line.startswith("#") or line.startswith("<summary>") or line == "</details>":
+            in_asset_section = "当前持有与生效资产" in line or "历史已消耗与归档资产" in line
+        # 先识别畸形表头，避免丢失第一列后把整张表当作普通文本跳过。
+        header_cells = [cell.strip() for cell in line.strip("|").split("|")]
+        looks_like_header = "资产ID" in header_cells or "资产名称" in header_cells or ("名称" in header_cells and "数量" in header_cells)
+        if not line.startswith("|"):
+            if "|" in line and (col_mapping is not None or in_asset_section or looks_like_header):
+                raise ValueError(f"Markdown 资产表第 {line_number} 行缺少起始分隔符")
+            col_mapping = None
+            continue
         cells = [c.strip() for c in line.split("|")[1:-1]]
         if not cells:
+            if col_mapping is not None:
+                raise ValueError(f"Markdown 资产表第 {line_number} 行缺少数据列")
             continue
 
         # 识别表头行
-        if "资产ID" in cells and ("资产名称" in cells or "名称" in cells):
+        if looks_like_header:
             col_mapping = {col: idx for idx, col in enumerate(cells)}
             if "名称" in col_mapping and "资产名称" not in col_mapping:
                 col_mapping["资产名称"] = col_mapping["名称"]
+            if not line.endswith("|") or not required_columns.issubset(col_mapping) or len(set(cells)) != len(cells):
+                raise ValueError(f"Markdown 资产表第 {line_number} 行表头缺列或含重复列")
+            column_count = len(cells)
+            saw_asset_table = True
             continue
+
+        if col_mapping is None and in_asset_section:
+            raise ValueError(f"Markdown 资产表第 {line_number} 行缺少有效表头")
 
         # 跳过分隔行
         if all(re.match(r'^:?-+:?$', c) for c in cells):
@@ -857,9 +1027,13 @@ def sync_from_markdown(md_path: Path, json_path: Path) -> LedgerState:
             continue
 
         try:
+            if not line.endswith("|") or len(cells) != column_count:
+                raise ValueError("数据列数与表头不一致")
             item_id = cells[col_mapping["资产ID"]]
-            if not item_id or item_id.startswith("---"):
-                continue
+            if not item_id:
+                raise ValueError("资产ID不能为空")
+            if item_id in valid_asset_ids:
+                raise ValueError(f"资产ID重复: {item_id}")
 
             name = cells[col_mapping.get("资产名称", 1)]
             category = cells[col_mapping.get("类别", 2)]
@@ -871,18 +1045,24 @@ def sync_from_markdown(md_path: Path, json_path: Path) -> LedgerState:
             chap_raw = cells[col_mapping.get("初始章节", 8)]
             constraints_str = cells[col_mapping.get("约束说明", 9)] if "约束说明" in col_mapping else ""
 
-            # 解析数量
             try:
-                quantity = int(qty_raw) if "." not in qty_raw else float(qty_raw)
+                quantity = int(qty_raw)
             except ValueError:
-                quantity = 1
+                quantity = float(qty_raw)
+            origin_chapter = float(chap_raw)
+            if (isinstance(quantity, float) and not math.isfinite(quantity)) or not math.isfinite(origin_chapter):
+                raise ValueError("数量与初始章节必须为有限数值")
+            if isinstance(quantity, float) and quantity.is_integer():
+                quantity = int(quantity)
+            if category not in ASSET_CATEGORIES or status not in ASSET_STATUSES:
+                raise ValueError("资产类别或状态无效")
+            if not all((name, unit, owner, current_holder)):
+                raise ValueError("资产名称、单位、所有者与当前持有者不能为空")
 
-            # 解析章节
-            try:
-                origin_chapter = float(chap_raw)
-            except ValueError:
-                origin_chapter = 1.0
-
+            if constraints_str and constraints_str.strip() not in ("-", "无"):
+                for part in constraints_str.split(";"):
+                    if part.strip() and (":" not in part or not part.split(":", 1)[0].strip()):
+                        raise ValueError("约束说明必须采用键值对格式")
             constraints = _parse_constraints(constraints_str)
 
             if item_id in state.assets:
@@ -890,19 +1070,23 @@ def sync_from_markdown(md_path: Path, json_path: Path) -> LedgerState:
                 existing = state.assets[item_id]
                 changed = (
                     existing.name != name
+                    or existing.category != category
                     or existing.quantity != quantity
+                    or existing.unit != unit
+                    or existing.owner != owner
                     or existing.current_holder != current_holder
                     or existing.status != status
+                    or existing.origin_chapter != origin_chapter
                     or existing.constraints != constraints
                 )
                 if changed:
                     existing.name = name
-                    existing.category = category if category in ASSET_CATEGORIES else existing.category
+                    existing.category = category
                     existing.quantity = quantity
                     existing.unit = unit
                     existing.owner = owner
                     existing.current_holder = current_holder
-                    existing.status = status if status in ASSET_STATUSES else existing.status
+                    existing.status = status
                     existing.origin_chapter = origin_chapter
                     existing.constraints = constraints
                     existing.history.append({
@@ -914,25 +1098,28 @@ def sync_from_markdown(md_path: Path, json_path: Path) -> LedgerState:
                 new_item = AssetItem(
                     id=item_id,
                     name=name,
-                    category=category if category in ASSET_CATEGORIES else "装备道具",
+                    category=category,
                     quantity=quantity,
                     unit=unit,
-                    owner=owner or "主角",
-                    current_holder=current_holder or owner or "主角",
-                    status=status if status in ASSET_STATUSES else "ACQUIRED",
+                    owner=owner,
+                    current_holder=current_holder,
+                    status=status,
                     origin_chapter=origin_chapter,
                     constraints=constraints,
                     history=[{"action": "created_from_markdown_sync", "timestamp": time.time()}],
                 )
                 state.assets[item_id] = new_item
             valid_asset_ids.add(item_id)
-        except (IndexError, ValueError):
-            continue
+        except (IndexError, ValueError) as e:
+            raise ValueError(f"Markdown 资产表第 {line_number} 行无效: {e}") from e
+
+    if not saw_asset_table and (state.assets or "（暂无活跃资产）" not in md_content):
+        raise ValueError("Markdown 中未发现可同步的有效资产表")
 
     # 若成功识别到资产表头，对在 Markdown 中物理删除的条目从 state.assets 中同步清理
     # 安全保护：如果识别到的有效资产集合不为空，且条目不属于冷资产（CONSUMED/DAMAGED/TRANSFERRED 等），才执行清理；
     # 坚决防止 Markdown 仅展示活跃随身资产或发生空表时将冷资产历史记录一笔抹除！
-    if col_mapping is not None and valid_asset_ids:
+    if saw_asset_table and valid_asset_ids:
         removed_ids = [
             aid for aid, item in list(state.assets.items())
             if aid not in valid_asset_ids and item.status not in COLD_ASSET_STATUSES
