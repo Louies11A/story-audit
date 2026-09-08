@@ -4,6 +4,8 @@
 
 审查代理仅修改本报告；所有复现均在 Python `tempfile.TemporaryDirectory(prefix='story-audit-review-')` 下执行。未对用户小说、原工作区、真实设定文件运行写入 API。下面的源码行号是问题首次确认时的基线行号，关闭时补充修后证据。
 
+源码定位链接使用主项目路径，便于合并并清理临时工作树后继续查阅；上方审查工作树、分支与下文基线行号保留为过程记录。
+
 ## 范围与方法
 
 已阅读全部 15 个 Python 模块的结构与实现，及 README、SKILL、账本模型、审查规则和相关测试契约。使用 Python AST 建立结构地图，再针对输入、异常、持久化与报告链路逐函数审查。已实测而非仅凭静态推断的问题列入编号；启发式规则本身的主观准确性不作为缺陷。
@@ -39,7 +41,7 @@
 
 ## R01 — 损坏状态不能当作首次初始化
 
-- 定位：[story_audit.py:487](F:/program/Aopen-pro/write/.worktrees/story-audit-quality-20260908/scripts/story_audit.py:487)、[story_audit.py:607](F:/program/Aopen-pro/write/.worktrees/story-audit-quality-20260908/scripts/story_audit.py:607)、[ledger_engine.py:817](F:/program/Aopen-pro/write/.worktrees/story-audit-quality-20260908/scripts/ledger_engine.py:817)、[audit_state.py:60](F:/program/Aopen-pro/write/.worktrees/story-audit-quality-20260908/scripts/audit_state.py:60)、[author_memory.py:157](F:/program/Aopen-pro/write/.worktrees/story-audit-quality-20260908/scripts/author_memory.py:157)。
+- 定位：[story_audit.py:487](F:/program/Aopen-pro/write/审查技能/scripts/story_audit.py:487)、[story_audit.py:607](F:/program/Aopen-pro/write/审查技能/scripts/story_audit.py:607)、[ledger_engine.py:817](F:/program/Aopen-pro/write/审查技能/scripts/ledger_engine.py:817)、[audit_state.py:60](F:/program/Aopen-pro/write/审查技能/scripts/audit_state.py:60)、[author_memory.py:157](F:/program/Aopen-pro/write/审查技能/scripts/author_memory.py:157)。
 - 触发：已有账本含一个合法资产和一个非法 `category`；目标章含新 `audit:stash` 标签。或者已有 `.audit_state.json` 的 `completed_chapters` 类型非法；或者作者状态的 `preferences` 错为列表。
 - 实测：`audit_chapter(..., silent=True)` 返回 0，含合法资产的原 JSON 被改写为 `assets={}`；坏审查状态被重写且旧 `open_defects` 清空；`AuthorMemory.record()` 成功但旧偏好内容消失。
 - 根因：加载捕获解析/校验异常并返回初始对象，或把损坏字段无提示置空；后续保存无法区分“缺失”与“损坏”。同步账本的同类捕获也存在。单章新伏笔保存直接使用 `force=True` 扩大影响。
@@ -52,7 +54,7 @@
 
 ## R02 — 批量单章失败导致二次异常
 
-- 定位：[story_audit.py:1208](F:/program/Aopen-pro/write/.worktrees/story-audit-quality-20260908/scripts/story_audit.py:1208)、[story_audit.py:1238](F:/program/Aopen-pro/write/.worktrees/story-audit-quality-20260908/scripts/story_audit.py:1238)。
+- 定位：[story_audit.py:1208](F:/program/Aopen-pro/write/审查技能/scripts/story_audit.py:1208)、[story_audit.py:1238](F:/program/Aopen-pro/write/审查技能/scripts/story_audit.py:1238)。
 - 触发：临时项目第 1 章正常，第 2 章内容为 `b'\x00'`；调用 `audit_scope(p, '1-2', silent=True)`。
 - 实测：抛 `KeyError('word_count')`，没有按公共契约返回状态码 3。账本防脏写使单章提前返回 3 时同样进入该路径。
 - 根因：无条件收集空 `summary`，只检查状态码 1、2，之后直接索引各项统计。
@@ -62,7 +64,7 @@
 
 ## R03 — 未读到的章节被记为已建账
 
-- 定位：[story_audit.py:899](F:/program/Aopen-pro/write/.worktrees/story-audit-quality-20260908/scripts/story_audit.py:899)、[story_audit.py:924](F:/program/Aopen-pro/write/.worktrees/story-audit-quality-20260908/scripts/story_audit.py:924)、[story_audit.py:928](F:/program/Aopen-pro/write/.worktrees/story-audit-quality-20260908/scripts/story_audit.py:928)。
+- 定位：[story_audit.py:899](F:/program/Aopen-pro/write/审查技能/scripts/story_audit.py:899)、[story_audit.py:924](F:/program/Aopen-pro/write/审查技能/scripts/story_audit.py:924)、[story_audit.py:928](F:/program/Aopen-pro/write/审查技能/scripts/story_audit.py:928)。
 - 触发：正常第 1 章与 `b'\x00'` 第 2 章，调用 `init_ledger(p, scope_str='1-2', silent=True)`。
 - 实测：返回 0；账本 `last_updated_chapter=2.0`；报告写出“扫描章节数：2”。
 - 根因：整个章节读取、标签与资产提取被 `except Exception: pass` 吞掉；随后使用目标清单最后一章推进检查点。
@@ -74,7 +76,7 @@
 
 ## R04 — 执行与报告真实性
 
-- 定位：[runtime_detector.py:101](F:/program/Aopen-pro/write/.worktrees/story-audit-quality-20260908/scripts/runtime_detector.py:101)、[story_audit.py:400](F:/program/Aopen-pro/write/.worktrees/story-audit-quality-20260908/scripts/story_audit.py:400)、[story_audit.py:435](F:/program/Aopen-pro/write/.worktrees/story-audit-quality-20260908/scripts/story_audit.py:435)、[story_audit.py:1135](F:/program/Aopen-pro/write/.worktrees/story-audit-quality-20260908/scripts/story_audit.py:1135)。
+- 定位：[runtime_detector.py:101](F:/program/Aopen-pro/write/审查技能/scripts/runtime_detector.py:101)、[story_audit.py:400](F:/program/Aopen-pro/write/审查技能/scripts/story_audit.py:400)、[story_audit.py:435](F:/program/Aopen-pro/write/审查技能/scripts/story_audit.py:435)、[story_audit.py:1135](F:/program/Aopen-pro/write/审查技能/scripts/story_audit.py:1135)。
 - 触发：`patch.dict(os.environ, {'CODEX_HOME':'dummy'}, clear=True)`，对“桌上是一杯水。”调用 `audit_chapter(mode='full', silent=True)`。
 - 实测：元数据为 `Effective Mode: full`、`Fallback: none`；报告无依据声称“账本状态健康：无凭空出装或资产冲突”“主线推进平稳，核心目标清晰，有效完成本章情绪位移”。管线没有专家调用、适配器或专家结果输入。批量章节仅因未命中 POV 关键词就被称为“无缝顺承”。
 - 根因：环境能力规划被当作实际执行状态；报告模板硬编码语义成功判断。P1 平台问题还被套用“补获得经过/已有道具”建议。
@@ -88,7 +90,7 @@
 
 ## R05 — 批量重复全目录扫描
 
-- 定位：[story_audit.py:1167](F:/program/Aopen-pro/write/.worktrees/story-audit-quality-20260908/scripts/story_audit.py:1167)、[story_audit.py:1211](F:/program/Aopen-pro/write/.worktrees/story-audit-quality-20260908/scripts/story_audit.py:1211)、[story_audit.py:523](F:/program/Aopen-pro/write/.worktrees/story-audit-quality-20260908/scripts/story_audit.py:523)。
+- 定位：[story_audit.py:1167](F:/program/Aopen-pro/write/审查技能/scripts/story_audit.py:1167)、[story_audit.py:1211](F:/program/Aopen-pro/write/审查技能/scripts/story_audit.py:1211)、[story_audit.py:523](F:/program/Aopen-pro/write/审查技能/scripts/story_audit.py:523)。
 - 主代理实测：相同 3 行临时章节，以 `unittest.mock.patch` 包裹 `ChapterResolver.discover_chapters`。30 章发现 31 次，发现耗时 0.3406 秒/总 0.6058 秒；100 章 101 次，3.5258/4.4 秒；200 章 201 次，14.4409/16.2728 秒。
 - 根因：批量已发现章节后，每章再次运行完整单章发现流程，目录遍历呈二次增长。
 - 最小建议：单次构建章节快照与定位索引，内部单章流程复用；保持公开 API 兼容。
@@ -100,7 +102,7 @@
 
 ## R06 — 补丁输入校验必须早于备份和写入
 
-- 定位：[story_audit.py:1655](F:/program/Aopen-pro/write/.worktrees/story-audit-quality-20260908/scripts/story_audit.py:1655)。
+- 定位：[story_audit.py:1655](F:/program/Aopen-pro/write/审查技能/scripts/story_audit.py:1655)。
 - 触发与独立实测：原稿 `前句。\n旧正文\n后句。\n`；`patch={'target_line':2,'old_text':'旧正文'}` 返回 0 并删除旧句；`new_text=None` 返回 0 并写字面 `None`；`target_line='bad'` 泄漏 ValueError。修复代理另证实 `target_line=2.9` 被截断后写入。
 - 根因：缺字段默认空串；无条件 `str()`、`int()` 转换把错误输入伪装为合法补丁。
 - 最小建议：四种入口（dict、JSON 文件、显式参数、PatchSpec）统一校验；target_line 为正整数且不接受 bool/小数，old_text 为非空字符串，new_text/锚点为字符串。显式 `new_text=''` 仍是合法删除。
@@ -110,7 +112,7 @@
 
 ## R07 — 失败不能返回旧批量报告
 
-- 定位：[story_audit.py:1541](F:/program/Aopen-pro/write/.worktrees/story-audit-quality-20260908/scripts/story_audit.py:1541)。
+- 定位：[story_audit.py:1541](F:/program/Aopen-pro/write/审查技能/scripts/story_audit.py:1541)。
 - 触发：临时项目先成功 `audit_scope(p, '1-1')`，删除临时章节，再调用相同范围。
 - 独立实测：第二次 code=3，但返回 path 与首轮完全相同，且 `is_file()` 为 True。
 - 根因：公开包装层按文件是否存在推断报告是否来自本次运行。
@@ -120,7 +122,7 @@
 
 ## R08 — Markdown 独立字段修改被恢复
 
-- 定位：[ledger_engine.py:891](F:/program/Aopen-pro/write/.worktrees/story-audit-quality-20260908/scripts/ledger_engine.py:891)。
+- 定位：[ledger_engine.py:891](F:/program/Aopen-pro/write/审查技能/scripts/ledger_engine.py:891)。
 - 触发：正常保存 owner/holder 均为“陆离”的资产，随后只改 MD owner 为“作者新设定”，调用 `sync_from_markdown(md, json)`。
 - 实测：返回 owner 仍为“陆离”，重渲染 MD 后用户编辑消失。
 - 根因：changed 条件只比较 name、quantity、current_holder、status、constraints，遗漏 category、unit、owner、origin_chapter；这些列只有别的字段改变时才更新。
@@ -131,7 +133,7 @@
 
 ## R09 — 无效 Markdown 行触发隐式删资产
 
-- 定位：[ledger_engine.py:859](F:/program/Aopen-pro/write/.worktrees/story-audit-quality-20260908/scripts/ledger_engine.py:859)、[ledger_engine.py:929](F:/program/Aopen-pro/write/.worktrees/story-audit-quality-20260908/scripts/ledger_engine.py:929)、[ledger_engine.py:935](F:/program/Aopen-pro/write/.worktrees/story-audit-quality-20260908/scripts/ledger_engine.py:935)。
+- 定位：[ledger_engine.py:859](F:/program/Aopen-pro/write/审查技能/scripts/ledger_engine.py:859)、[ledger_engine.py:929](F:/program/Aopen-pro/write/审查技能/scripts/ledger_engine.py:929)、[ledger_engine.py:935](F:/program/Aopen-pro/write/审查技能/scripts/ledger_engine.py:935)。
 - 触发：两项正常热资产 a、b；把 MD b 行截成 `| b | b | 装备道具 | 1 | 把 |` 后同步。
 - 实测：同步成功，JSON 只余 a，b 被永久移除。
 - 根因：坏行被 IndexError/ValueError 分支跳过，之后把不在 valid_asset_ids 的热资产视为用户删除；非法数量默认 1、非法枚举回退也会悄悄改造数据。
@@ -144,7 +146,7 @@
 
 ## R10 — 文档与技能包契约
 
-- 定位：[SKILL.md:1](F:/program/Aopen-pro/write/.worktrees/story-audit-quality-20260908/SKILL.md:1)、[README.md:1](F:/program/Aopen-pro/write/.worktrees/story-audit-quality-20260908/README.md:1)、[report-template.md:1](F:/program/Aopen-pro/write/.worktrees/story-audit-quality-20260908/references/report-template.md:1)。
+- 定位：[SKILL.md:1](F:/program/Aopen-pro/write/审查技能/SKILL.md:1)、[README.md:1](F:/program/Aopen-pro/write/审查技能/README.md:1)、[report-template.md:1](F:/program/Aopen-pro/write/审查技能/references/report-template.md:1)。
 - 主代理证据：官方 `skill-creator/scripts/quick_validate.py .` 基线退出 1，`Unexpected key(s) in SKILL.md frontmatter: triggers`；实际覆盖率 89% 与 README 93% 不符；无 CLI 项目仍提供 `--scope`、`--apply-fix` 等调用指引。
 - 最小建议：触发词保留移入允许的 metadata，description 说明使用场景；用现有 Python API 更正文档；测试数字由实际验证证据支持。专家执行表述归 R04 同步修正。
 - 验收：官方校验退出 0，触发词集合不丢失；相关说明只给实际存在的 API；测试/覆盖率注明测量证据与边界。
@@ -156,7 +158,7 @@
 
 ## R11 — 对话空格触发扫描崩溃
 
-- 定位：[format_scanner.py:509](F:/program/Aopen-pro/write/.worktrees/story-audit-quality-20260908/scripts/format_scanner.py:509)、[format_scanner.py:649](F:/program/Aopen-pro/write/.worktrees/story-audit-quality-20260908/scripts/format_scanner.py:649)、[format_scanner.py:674](F:/program/Aopen-pro/write/.worktrees/story-audit-quality-20260908/scripts/format_scanner.py:674)。
+- 定位：[format_scanner.py:509](F:/program/Aopen-pro/write/审查技能/scripts/format_scanner.py:509)、[format_scanner.py:649](F:/program/Aopen-pro/write/审查技能/scripts/format_scanner.py:649)、[format_scanner.py:674](F:/program/Aopen-pro/write/审查技能/scripts/format_scanner.py:674)。
 - 独立实测：`scan_typography_flaws('“你好。” 他走了。')`、`scan_typography_flaws('他说：“走。”  门开了。')`、`scan_typography_flaws('他走了。 “别去！”  我喊。')` 均抛 `IndexError: string index out of range`。
 - 根因：提取句子时对内容 `.strip()`，但返回原始未裁剪区间；后续根据 end-start 计算长度索引已缩短的字符串。
 - 最小建议：统一偏移和内容，不以捕获 IndexError 掩盖。保留正确的引号内外叙述切分。
@@ -165,7 +167,7 @@
 
 ## R12 — 默认持有人不继承自定义所有者
 
-- 定位：[ledger_engine.py:128](F:/program/Aopen-pro/write/.worktrees/story-audit-quality-20260908/scripts/ledger_engine.py:128)、[ledger_engine.py:141](F:/program/Aopen-pro/write/.worktrees/story-audit-quality-20260908/scripts/ledger_engine.py:141)。
+- 定位：[ledger_engine.py:128](F:/program/Aopen-pro/write/审查技能/scripts/ledger_engine.py:128)、[ledger_engine.py:141](F:/program/Aopen-pro/write/审查技能/scripts/ledger_engine.py:141)。
 - 独立实测：`AssetItem(id='a',name='青钢剑',category='装备道具',quantity=1,unit='把',owner='陆离')` 得到 owner='陆离'、current_holder='主角'。
 - 根因：current_holder 的非空默认值阻止 __post_init__ 使用 owner；与字段注释“默认同 owner”及多主体账本语义冲突。
 - 最小建议：未指定持有人时以 owner 填充；显式持有者继续保留。
@@ -175,7 +177,7 @@
 
 ## R13 — 伏笔未进入跨批继承链路
 
-- 定位：[story_audit.py:609](F:/program/Aopen-pro/write/.worktrees/story-audit-quality-20260908/scripts/story_audit.py:609)、[story_audit.py:1303](F:/program/Aopen-pro/write/.worktrees/story-audit-quality-20260908/scripts/story_audit.py:1303)、[audit_state.py:31](F:/program/Aopen-pro/write/.worktrees/story-audit-quality-20260908/scripts/audit_state.py:31)。
+- 定位：[story_audit.py:609](F:/program/Aopen-pro/write/审查技能/scripts/story_audit.py:609)、[story_audit.py:1303](F:/program/Aopen-pro/write/审查技能/scripts/story_audit.py:1303)、[audit_state.py:31](F:/program/Aopen-pro/write/审查技能/scripts/audit_state.py:31)。
 - 触发：全新临时项目，第 1 章 `<!-- audit:stash name="深海旧钥匙" origin="第1章" status="pending" -->`；先 audit_scope('1-1')，再 audit_scope('2-2')。
 - 独立实测：首批 `foreshadowing_commitments=[]`；第二批 bundle.inherited_items 对应字段仍空，报告不含“深海旧钥匙”。
 - 根因：扫描标签只并入临时 LedgerState，且 JSON 已存在时才持久化；AuditState 更新逻辑从不写 foreshadowing_commitments，无法兑现“下一批继承开放伏笔”的契约。
@@ -189,7 +191,7 @@
 
 ## R14 — 未闭合符号造成二次扫描
 
-- 定位：[ai_patterns_checker.py:51](F:/program/Aopen-pro/write/.worktrees/story-audit-quality-20260908/scripts/ai_patterns_checker.py:51)、[ai_patterns_checker.py:65](F:/program/Aopen-pro/write/.worktrees/story-audit-quality-20260908/scripts/ai_patterns_checker.py:65)、[ledger_engine.py:67](F:/program/Aopen-pro/write/.worktrees/story-audit-quality-20260908/scripts/ledger_engine.py:67)。
+- 定位：[ai_patterns_checker.py:51](F:/program/Aopen-pro/write/审查技能/scripts/ai_patterns_checker.py:51)、[ai_patterns_checker.py:65](F:/program/Aopen-pro/write/审查技能/scripts/ai_patterns_checker.py:65)、[ledger_engine.py:67](F:/program/Aopen-pro/write/审查技能/scripts/ledger_engine.py:67)。
 - 触发：单行大量未闭合 `“`，或资产文本含大量未闭合 `【`。
 - 独立实测：1000/2000/4000 字符时，`mask_quotes_in_line('“'*n)` 分别 0.0160/0.0680/0.2628 秒；`extract_heuristic_assets('【'*n,1)` 分别 0.0228/0.0935/0.3621 秒。每次输入翻倍，耗时约四倍。
 - 根因：每遇到未闭合开引号，Python 循环重新扫描整个剩余后缀；资产模式允许从不同开括号重复尝试长后缀。20MB 文件限额不足以控制这类二次成本。
@@ -201,7 +203,7 @@
 
 ## R15 — 章末长自然段漏检
 
-- 定位：[ai_patterns_checker.py:213](F:/program/Aopen-pro/write/.worktrees/story-audit-quality-20260908/scripts/ai_patterns_checker.py:213)。
+- 定位：[ai_patterns_checker.py:213](F:/program/Aopen-pro/write/审查技能/scripts/ai_patterns_checker.py:213)。
 - 独立实测：`text='开门。\n他走近。\n'+'路很远。'*100+'命运的齿轮转动了。'` 没有任何 AI_TRAILER 类发现；只在最终句前添加一个换行，就产生 `AI_TRAILER_SUMMARY`。
 - 根因：以整行起点判断是否进入最后 600 字/后 25% 窗口，导致跨窗口的长末段完全跳过，虽然真正命中的句子位于文本最末端。
 - 最小建议：按匹配实际绝对偏移筛选尾窗，保留原始物理行号以及开篇保护规则。
@@ -210,7 +212,7 @@
 
 ## R16 — 双轨保存失败不能留下隐形分裂
 
-- 定位：[ledger_engine.py:779](F:/program/Aopen-pro/write/.worktrees/story-audit-quality-20260908/scripts/ledger_engine.py:779)、[ledger_engine.py:784](F:/program/Aopen-pro/write/.worktrees/story-audit-quality-20260908/scripts/ledger_engine.py:784)、[ledger_engine.py:634](F:/program/Aopen-pro/write/.worktrees/story-audit-quality-20260908/scripts/ledger_engine.py:634)。
+- 定位：[ledger_engine.py:779](F:/program/Aopen-pro/write/审查技能/scripts/ledger_engine.py:779)、[ledger_engine.py:784](F:/program/Aopen-pro/write/审查技能/scripts/ledger_engine.py:784)、[ledger_engine.py:634](F:/program/Aopen-pro/write/审查技能/scripts/ledger_engine.py:634)。
 - 触发：临时项目先保存 quantity=1 的双轨账本，随后改为 9。通过 `unittest.mock.patch.object(ledger_engine, 'write_file_safe', side_effect=...)` 仅对 MD 路径抛 `SafeIOWriteError`，模拟第二轨写入失败。
 - 独立实测：抛异常后 JSON 已变为新内容，MD 保持旧内容，`check_dirty_state(md,json)` 返回 False。
 - 根因：两轨分别原子写，但整体没有失败恢复；先更新的 JSON mtime 使时间戳守卫无法看出未完成的双轨事务。
@@ -223,7 +225,7 @@
 
 ## R17 — 重复章号必须拒绝歧义目标
 
-- 定位：[story_audit.py:1379](F:/program/Aopen-pro/write/.worktrees/story-audit-quality-20260908/scripts/story_audit.py:1379)、[story_audit.py:533](F:/program/Aopen-pro/write/.worktrees/story-audit-quality-20260908/scripts/story_audit.py:533)。
+- 定位：[story_audit.py:1379](F:/program/Aopen-pro/write/审查技能/scripts/story_audit.py:1379)、[story_audit.py:533](F:/program/Aopen-pro/write/审查技能/scripts/story_audit.py:533)。
 - 触发：临时项目 `正文/甲卷/第001章.txt` 与 `正文/乙卷/第001章.txt` 都含“旧正文”；`apply_fix(chapter_index=1,target_line=1,old_text='旧正文',new_text='新正文')`。
 - 独立实测：返回 0，两个文件变为 `['旧正文','新正文']`，没有要求/证明唯一目标。
 - 根因：发现器允许重复章号并只作为 P2 警告，但纯章号公共 API 直接取第一个匹配。批量遍历再次以章号定位还可能重复审查同一文件而遗漏另一份。
@@ -234,7 +236,7 @@
 
 ## R18 — 公共输入错误应受控返回
 
-- 定位：[platform_rubrics.py:46](F:/program/Aopen-pro/write/.worktrees/story-audit-quality-20260908/scripts/platform_rubrics.py:46)、[story_audit.py:96](F:/program/Aopen-pro/write/.worktrees/story-audit-quality-20260908/scripts/story_audit.py:96)、[story_audit.py:1294](F:/program/Aopen-pro/write/.worktrees/story-audit-quality-20260908/scripts/story_audit.py:1294)。
+- 定位：[platform_rubrics.py:46](F:/program/Aopen-pro/write/审查技能/scripts/platform_rubrics.py:46)、[story_audit.py:96](F:/program/Aopen-pro/write/审查技能/scripts/story_audit.py:96)、[story_audit.py:1294](F:/program/Aopen-pro/write/审查技能/scripts/story_audit.py:1294)。
 - 独立实测：临时章文本“他走进庭院。”重复 30 次，`audit_chapter(platform='zhihu',strict=True)` 返回 1；拼错为 `platform='zihu'` 返回 0。`audit_scope('1-inf')` 接受范围、开始生成报告后抛 `OverflowError: cannot convert float infinity to integer`。
 - 根因：公开 API 未校验平台，底层静默回退 generic；范围解析直接接受 Python float 的 inf/nan，直到文件名格式化才出错。
 - 最小建议：公开入口在产生副作用前校验合法平台/模式、有限章节范围、必要参数和可用目录；错误返回状态码 3。底层规划辅助的既有兼容策略不必全部修改。
