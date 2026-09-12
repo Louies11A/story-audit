@@ -3,6 +3,9 @@
 
 import hashlib
 import json
+import os
+import stat
+import uuid
 from datetime import datetime as real_datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -394,3 +397,162 @@ def test_f02_integer_history_glob_stays_compatible(project):
     assert "2026-09-08_" in matches[0].name
     assert matches[0].name.split("_")[1]
     assert matches[0].name != "2026-09-08_批量审查_第001-002章.md"
+
+def _file_bytes(path):
+    return path.read_bytes() if path.exists() else None
+
+
+def _make_readonly(path):
+    os.chmod(path, stat.S_IREAD)
+
+
+def _make_writable(path):
+    os.chmod(path, stat.S_IREAD | stat.S_IWRITE)
+
+
+def _history_files(project):
+    history_dir = project / "reports" / "批量审查"
+    return set(history_dir.glob("*")) if history_dir.exists() else set()
+
+
+def test_f01_single_state_save_failure_publishes_nothing(project):
+    chapter = _write_chapter(
+        project,
+        "第001章.txt",
+        "第一章\n<!-- audit:p1 message=\"首次规则问题\" -->\n",
+    )
+    first_code, first_report = audit_chapter(project, chapter_index=1, silent=True)
+    assert first_code == 0
+
+    reports = project / "reports"
+    state_path = get_audit_state_path(reports)
+    bundle_path = reports / ".cache" / "pre_audit_bundle.json"
+    latest_path = reports / "LATEST_REPORT.md"
+    archive_path = first_report
+    observed = (state_path, bundle_path, latest_path, archive_path)
+    assert all(path.exists() for path in observed)
+    originals = {path: path.read_bytes() for path in observed}
+
+    chapter.write_text(
+        "第一章\n<!-- audit:p1 message=\"第二次规则问题\" -->\n",
+        encoding="utf-8",
+    )
+    try:
+        _make_readonly(state_path)
+        code, report = audit_chapter(project, chapter_index=1, silent=True)
+    finally:
+        _make_writable(state_path)
+
+    assert code == 3
+    assert report == Path("")
+    for path, original in originals.items():
+        assert path.read_bytes() == original
+
+
+def test_f01_batch_mid_failure_discards_all_staged_artifacts(project):
+    _write_chapter(
+        project,
+        "第001章.txt",
+        "第一章\n<!-- audit:p1 message=\"批中失败规则\" -->\n",
+    )
+    bad_chapter = _write_chapter(project, "第002章.txt", "第二章\n")
+    bad_chapter.write_bytes(b"\x00")
+
+    reports = project / "reports"
+    state_path = _save_state(
+        project,
+        [_legacy_defect(1, "既有专家问题", source="expert")],
+        completed=(1, 2),
+    )
+    bundle_path = reports / ".cache" / "pre_audit_bundle.json"
+    bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    bundle_path.write_bytes(b"old-bundle")
+    archive_path = reports / "单章审查" / "001-100章" / "第001章_审查报告.md"
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    archive_path.write_bytes(b"old-archive")
+    latest_path = reports / "LATEST_REPORT.md"
+    latest_path.write_bytes(b"old-latest")
+    originals = {
+        path: path.read_bytes()
+        for path in (state_path, bundle_path, archive_path, latest_path)
+    }
+    history_before = _history_files(project)
+
+    code, report = audit_scope(project, "1-2", silent=True)
+    assert code == 3
+    assert report == Path("")
+    for path, original in originals.items():
+        assert path.read_bytes() == original
+    assert not (reports / "BATCH_SUMMARY_SCOPE_1-2.md").exists()
+    assert _history_files(project) == history_before
+
+
+def test_f01_batch_state_save_failure_publishes_nothing(project):
+    _write_chapter(
+        project,
+        "第001章.txt",
+        "第一章\n<!-- audit:p1 message=\"批末规则\" -->\n",
+    )
+    _write_chapter(project, "第002章.txt", "第二章\n")
+
+    reports = project / "reports"
+    state_path = _save_state(
+        project,
+        [_legacy_defect(1, "既有专家问题", source="expert")],
+        completed=(1, 2),
+    )
+    bundle_path = reports / ".cache" / "pre_audit_bundle.json"
+    bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    bundle_path.write_bytes(b"old-bundle")
+    archive_path = reports / "单章审查" / "001-100章" / "第001章_审查报告.md"
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    archive_path.write_bytes(b"old-archive")
+    latest_path = reports / "LATEST_REPORT.md"
+    latest_path.write_bytes(b"old-latest")
+    originals = {
+        path: path.read_bytes()
+        for path in (state_path, bundle_path, archive_path, latest_path)
+    }
+    history_before = _history_files(project)
+
+    try:
+        _make_readonly(state_path)
+        code, report = audit_scope(project, "1-2", silent=True)
+    finally:
+        _make_writable(state_path)
+
+    assert code == 3
+    assert report == Path("")
+    for path, original in originals.items():
+        assert path.read_bytes() == original
+    assert not (reports / "BATCH_SUMMARY_SCOPE_1-2.md").exists()
+    assert _history_files(project) == history_before
+
+
+def test_f02_run_id_collision_adds_incrementing_suffix(project):
+    _write_chapter(project, "第001章.txt", "第一章\n")
+    _write_chapter(project, "第002章.txt", "第二章\n")
+    fixed_uuid = uuid.UUID(int=1)
+
+    with patch("scripts.story_audit.datetime", _FrozenDateTime), patch(
+        "scripts.story_audit.uuid.uuid4", return_value=fixed_uuid
+    ):
+        first_code, _ = audit_scope(project, "1-2", silent=True)
+        first_files = sorted(
+            (project / "reports" / "批量审查").glob("*_批量审查_第001-002章.md")
+        )
+        assert len(first_files) == 1
+        first_bytes = first_files[0].read_bytes()
+        second_code, _ = audit_scope(project, "1-2", silent=True)
+
+    assert first_code == second_code == 0
+    files = sorted(
+        (project / "reports" / "批量审查").glob("*_批量审查_第001-002章.md")
+    )
+    assert len(files) == 2
+    run_ids = {item.name.split("_")[1] for item in files}
+    assert run_ids == {"000000000000", "000000000000-1"}
+    assert any(item.read_bytes() == first_bytes for item in files)
+    for item in files:
+        run_id = item.name.split("_")[1]
+        assert "Run ID: {}".format(run_id) in item.read_text(encoding="utf-8")

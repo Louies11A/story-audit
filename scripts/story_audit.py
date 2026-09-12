@@ -199,6 +199,73 @@ def _format_history_chapter_number(chapter_index: float) -> str:
     return f"{whole.zfill(3)}.{fraction}" if fraction else whole.zfill(3)
 
 
+def _read_optional_bytes(path: Path) -> Optional[bytes]:
+    try:
+        return path.read_bytes()
+    except FileNotFoundError:
+        return None
+
+
+def _restore_optional_bytes(path: Path, original: Optional[bytes]) -> None:
+    if original is None:
+        if path.exists():
+            path.unlink()
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(original)
+
+
+def _flush_staged_writes(staged_writes: Dict[Path, str]) -> None:
+    for path, content in staged_writes.items():
+        write_file_safe(path, content)
+
+
+def _flush_staged_writes_with_rollback(
+    staged_writes: Dict[Path, str],
+    state_path: Path,
+    original_state: Optional[bytes],
+    original_artifacts: Dict[Path, Optional[bytes]],
+) -> None:
+    """产物写入失败时回滚已写产物与状态，避免与未落盘状态矛盾。"""
+    try:
+        _flush_staged_writes(staged_writes)
+    except Exception:
+        for path, original in original_artifacts.items():
+            try:
+                _restore_optional_bytes(path, original)
+            except OSError:
+                pass
+        try:
+            _restore_optional_bytes(state_path, original_state)
+        except OSError:
+            pass
+        raise
+
+
+def _resolve_batch_history_path(
+    batch_dir: Path,
+    today: str,
+    s_fmt: str,
+    e_fmt: str,
+    initial_run_id: str,
+) -> Tuple[str, Path]:
+    """选择未占用的批量历史路径；uuid 注入冲突时追加递增后缀。"""
+    run_id = initial_run_id
+    for _ in range(100):
+        candidate = batch_dir / f"{today}_{run_id}_批量审查_第{s_fmt}-{e_fmt}章.md"
+        if not candidate.exists():
+            return run_id, candidate
+        run_id = uuid.uuid4().hex[:12]
+
+    suffix = 1
+    while True:
+        candidate_run_id = f"{run_id}-{suffix}"
+        candidate = batch_dir / f"{today}_{candidate_run_id}_批量审查_第{s_fmt}-{e_fmt}章.md"
+        if not candidate.exists():
+            return candidate_run_id, candidate
+        suffix += 1
+
+
 def get_report_archive_path(reports_dir: Path, chapter_index: float) -> Path:
     """计算单章归档路径：reports/单章审查/{001-100章等}/第{N}章_审查报告.md"""
     idx = float(chapter_index)
@@ -672,6 +739,7 @@ def run_audit(
     allow_partial: bool = False,
     _chapter_snapshot: Optional[List[ChapterItem]] = None,
     _audit_state: Optional[AuditState] = None,
+    _staged_writes: Optional[Dict[Path, str]] = None,
 ) -> int:
     """执行单章审查管线，生成预审包与归档报告，返回退出码"""
     try:
@@ -918,7 +986,7 @@ def run_audit(
         inherited_items=inherited_items,
     )
     bundle_path = cache_dir / "pre_audit_bundle.json"
-    write_file_safe(bundle_path, json.dumps(bundle, ensure_ascii=False, indent=2))
+    bundle_content = json.dumps(bundle, ensure_ascii=False, indent=2)
 
     # 11. 生成与归档审查报告
     report_content = render_audit_report(
@@ -941,19 +1009,43 @@ def run_audit(
     )
 
     latest_report_path = reports_dir / "LATEST_REPORT.md"
+    archived_report_path = get_report_archive_path(reports_dir, curr_chapter.index)
+    pending_writes: Dict[Path, str] = {
+        bundle_path: bundle_content,
+        archived_report_path: report_content,
+    }
     if write_latest_report:
-        write_file_safe(latest_report_path, report_content)
-        # 单章审查状态机同步（缺陷已在报告与预审包之前完成内存合并）
+        pending_writes[latest_report_path] = report_content
+
+    if _staged_writes is not None:
+        # 批量模式只暂存内容，待批次状态原子落盘后再统一发布。
+        _staged_writes.update(pending_writes)
+    elif write_latest_report:
+        # 状态优先：状态保存失败时不得发布任何报告或预审包。
+        state_path = get_audit_state_path(reports_dir)
+        original_state = _read_optional_bytes(state_path)
+        original_artifacts = {
+            path: _read_optional_bytes(path) for path in pending_writes
+        }
         c_idx = curr_chapter.index
         if c_idx not in audit_state.completed_chapters:
             audit_state.completed_chapters.append(c_idx)
             audit_state.completed_chapters.sort()
         audit_state.last_scope = f"{c_idx:g}"
         save_audit_state(audit_state, reports_dir)
-
-    archived_report_path = get_report_archive_path(reports_dir, curr_chapter.index)
-    archived_report_path.parent.mkdir(parents=True, exist_ok=True)
-    write_file_safe(archived_report_path, report_content)
+        _flush_staged_writes_with_rollback(
+            pending_writes, state_path, original_state, original_artifacts
+        )
+    else:
+        # 保留内部直接调用（非公开 API）既有行为：不写 LATEST，也不改持久状态。
+        state_path = get_audit_state_path(reports_dir)
+        original_state = _read_optional_bytes(state_path)
+        original_artifacts = {
+            path: _read_optional_bytes(path) for path in pending_writes
+        }
+        _flush_staged_writes_with_rollback(
+            pending_writes, state_path, original_state, original_artifacts
+        )
 
     if not silent:
         print(f"=== story-audit 深度审查报告 ===")
@@ -1468,6 +1560,7 @@ def run_scope_audit(
         safe_console_print(f"========================================================================================")
 
     chapter_summaries: List[Dict[str, Any]] = []
+    staged_writes: Dict[Path, str] = {}
     has_p0 = False
     has_p1 = False
 
@@ -1490,6 +1583,7 @@ def run_scope_audit(
             allow_partial=effective_allow_partial,
             _chapter_snapshot=chapters,
             _audit_state=audit_state,
+            _staged_writes=staged_writes,
         )
         if code == 3:
             if not silent:
@@ -1537,6 +1631,15 @@ def run_scope_audit(
         safe_console_print(f"【判定结论】{overall_label}")
         safe_console_print(f"========================================================================================")
 
+    reports_dir = project_dir / "reports"
+    batch_dir = reports_dir / "批量审查"
+    today = datetime.now().strftime("%Y-%m-%d")
+    s_fmt = _format_history_chapter_number(s_min)
+    e_fmt = _format_history_chapter_number(s_max)
+    run_id, batch_report_file = _resolve_batch_history_path(
+        batch_dir, today, s_fmt, e_fmt, run_id
+    )
+
     # 生成聚合大盘报告 Markdown 内容
     batch_summary_content = render_scope_batch_summary(
         scope_str=scope_str,
@@ -1552,36 +1655,39 @@ def run_scope_audit(
         inherited_items=get_inherited_items(audit_state),
     )
 
-    reports_dir = project_dir / "reports"
-    reports_dir.mkdir(parents=True, exist_ok=True)
-
-    # 1. 输出指定命名大盘报告：reports/BATCH_SUMMARY_SCOPE_{scope}.md
     scope_clean = scope_str.replace(" ", "")
     scope_summary_path = reports_dir / f"BATCH_SUMMARY_SCOPE_{scope_clean}.md"
-    write_file_safe(scope_summary_path, batch_summary_content)
-
-    # 2. 输出历史归档批量报告：reports/批量审查/{today}_{run_id}_批量审查_第{s_fmt}-{e_fmt}章.md
-    batch_dir = reports_dir / "批量审查"
-    batch_dir.mkdir(parents=True, exist_ok=True)
-    today = datetime.now().strftime("%Y-%m-%d")
-    s_fmt = _format_history_chapter_number(s_min)
-    e_fmt = _format_history_chapter_number(s_max)
-    batch_report_file = batch_dir / f"{today}_{run_id}_批量审查_第{s_fmt}-{e_fmt}章.md"
-    write_file_safe(batch_report_file, batch_summary_content)
-
-    # 3. 统一将最新报告更新为本次批量审查大盘报告
     latest_report_path = reports_dir / "LATEST_REPORT.md"
-    write_file_safe(latest_report_path, batch_summary_content)
+    staged_writes[scope_summary_path] = batch_summary_content
+    staged_writes[batch_report_file] = batch_summary_content
+    staged_writes[latest_report_path] = batch_summary_content
 
-    # 原子更新跨批长篇因果状态机 (reports/.audit_state.json)
+    # 先在内存更新跨批状态，状态原子落盘成功后才能发布任何产物。
     audit_state.last_scope = scope_str
     for chap in target_chapters:
         if chap.index not in audit_state.completed_chapters:
             audit_state.completed_chapters.append(chap.index)
     audit_state.completed_chapters.sort()
 
-    # 缺陷与伏笔已在各章 run_audit 中按覆盖范围合并到共享状态；批次失败时不会落盘。
-    save_audit_state(audit_state, reports_dir)
+    state_path = get_audit_state_path(reports_dir)
+    original_state = _read_optional_bytes(state_path)
+    original_artifacts = {
+        path: _read_optional_bytes(path) for path in staged_writes
+    }
+    try:
+        save_audit_state(audit_state, reports_dir)
+    except Exception as e:
+        if not silent:
+            safe_console_print(f"[错误] 保存审计状态失败: {e}", file=sys.stderr)
+        return 3
+    try:
+        _flush_staged_writes_with_rollback(
+            staged_writes, state_path, original_state, original_artifacts
+        )
+    except Exception as e:
+        if not silent:
+            safe_console_print(f"[错误] 写入审查产物失败: {e}", file=sys.stderr)
+        return 3
 
     if not silent:
         safe_console_print(f"✅ 批量审查大盘报告已生成：{scope_summary_path}")
