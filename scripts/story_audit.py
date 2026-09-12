@@ -9,11 +9,13 @@ story_audit.py: 长篇网文深度审查核心调度管线与纯模块化 Python
 严格遵循 Python 3.8+ 标准库与零外部依赖约定。
 """
 
+import hashlib
 import json
 import math
 import os
 import re
 import sys
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -59,6 +61,8 @@ from scripts.audit_state import (
     load_audit_state,
     save_audit_state,
     get_inherited_items,
+    make_defect_id,
+    merge_defect_scan,
     render_inherited_items_section,
 )
 from scripts.types import BoundaryContext, ChapterItem, Finding, FormatFinding, PatchSpec, format_factual_fix
@@ -178,6 +182,21 @@ def parse_scope_range(scope_str: str) -> Tuple[float, float]:
         return min(start, end), max(start, end)
     except ValueError as e:
         raise ValueError(f"范围解析失败: {scope_str}, {e}")
+
+
+def _text_content_version(text: str) -> str:
+    """计算规范化正文内容的 SHA-256，作为缺陷关闭依据的正文版本。"""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _format_history_chapter_number(chapter_index: float) -> str:
+    """历史归档章号：整数补足三位，小数保留完整有效位。"""
+    value = float(chapter_index)
+    if value.is_integer():
+        return f"{int(value):03d}"
+    text = f"{value:g}"
+    whole, _, fraction = text.partition(".")
+    return f"{whole.zfill(3)}.{fraction}" if fraction else whole.zfill(3)
 
 
 def get_report_archive_path(reports_dir: Path, chapter_index: float) -> Path:
@@ -652,6 +671,7 @@ def run_audit(
     inherited_items: Optional[Dict[str, Any]] = None,
     allow_partial: bool = False,
     _chapter_snapshot: Optional[List[ChapterItem]] = None,
+    _audit_state: Optional[AuditState] = None,
 ) -> int:
     """执行单章审查管线，生成预审包与归档报告，返回退出码"""
     try:
@@ -751,12 +771,13 @@ def run_audit(
             return 3
 
     # 所有待更新状态先完整验证，不能在坏状态上继续写出账本或成功报告。
+    audit_state: Optional[AuditState] = _audit_state
     try:
         state = load_ledger_state(json_path)
-        if write_latest_report:
+        if audit_state is None and write_latest_report:
             audit_state = load_audit_state(reports_dir)
-            if inherited_items is None:
-                inherited_items = get_inherited_items(audit_state)
+        if audit_state is not None and inherited_items is None:
+            inherited_items = get_inherited_items(audit_state)
     except Exception as e:
         if not silent:
             print(f"[错误] 读取持久化状态失败: {e}", file=sys.stderr)
@@ -793,7 +814,89 @@ def run_audit(
                 fix=pf.fix,
             ))
 
-    # 9. 构建预审包
+    # 9. 违规与严重度统计（预审包将在与持久状态合并后构建）
+    p0_list: List[str] = []
+    p1_list: List[str] = []
+    detected_defects: List[Dict[str, Any]] = []
+
+    detected_violations = detect_violations_in_text(curr_text)
+    for v in detected_violations:
+        if v["level"] == "P0":
+            p0_list.append(v["message"])
+        elif v["level"] == "P1":
+            p1_list.append(v["message"])
+        if v["level"] in ("P0", "P1"):
+            detected_defects.append({
+                "chapter": curr_chapter.index,
+                "severity": v["level"],
+                "category": "factual",
+                "location": f"第{curr_chapter.index:g}章显式审计标记",
+                "evidence": v["message"],
+                "issue": v["message"],
+                "fix": "依据原文与设定核验该显式标记，保持已知事实一致。",
+                "source": "deterministic",
+                "checker": "explicit_violation",
+                "platform": platform,
+                "status": "open",
+            })
+
+    # 平台红线与严重门禁拦截
+    for pf in p_findings:
+        if pf.severity == "P0":
+            p0_list.append(pf.issue)
+        elif pf.severity == "P1":
+            p1_list.append(pf.issue)
+        if pf.severity in ("P0", "P1"):
+            defect = pf.to_dict()
+            defect["chapter"] = curr_chapter.index
+            defect["source"] = "deterministic"
+            defect["checker"] = "platform_rubric"
+            defect["platform"] = platform
+            defect["status"] = "open"
+            detected_defects.append(defect)
+
+    curr_text_version = _text_content_version(curr_text)
+    for defect in detected_defects:
+        defect.setdefault("source", "deterministic")
+        defect.setdefault("checker", "explicit_violation")
+        defect.setdefault("platform", platform)
+        defect.setdefault("status", "open")
+        defect.setdefault("text_version", curr_text_version)
+        defect["id"] = make_defect_id(
+            "deterministic",
+            defect.get("checker", ""),
+            defect.get("platform", platform),
+            defect.get("chapter", curr_chapter.index),
+            defect.get("issue", ""),
+        )
+
+    chapter_text_versions = {float(curr_chapter.index): curr_text_version}
+    if audit_state is None:
+        audit_state = AuditState()
+        if inherited_items:
+            audit_state.last_scope = inherited_items.get("last_scope", "")
+            audit_state.open_defects = [
+                dict(item)
+                for item in inherited_items.get("open_defects", [])
+                if isinstance(item, dict)
+            ]
+            audit_state.foreshadowing_commitments = [
+                dict(item)
+                for item in inherited_items.get("foreshadowing_commitments", [])
+                if isinstance(item, dict)
+            ]
+    merge_defect_scan(
+        audit_state,
+        detected_defects,
+        covered_chapters=[curr_chapter.index],
+        checkers=["explicit_violation", "platform_rubric"],
+        platform=platform,
+        text_versions=chapter_text_versions,
+    )
+    _merge_foreshadowing_commitments(audit_state, foreshadowing_commitments)
+    inherited_items = get_inherited_items(audit_state)
+
+    # 10.5 构建预审包（问题列表与合并后的持久状态一致）
     bundle = build_pre_audit_bundle(
         project_dir=project_dir,
         curr_chapter=curr_chapter,
@@ -816,39 +919,6 @@ def run_audit(
     )
     bundle_path = cache_dir / "pre_audit_bundle.json"
     write_file_safe(bundle_path, json.dumps(bundle, ensure_ascii=False, indent=2))
-
-    # 10. 违规与严重度统计
-    p0_list: List[str] = []
-    p1_list: List[str] = []
-    detected_defects: List[Dict[str, Any]] = []
-
-    detected_violations = detect_violations_in_text(curr_text)
-    for v in detected_violations:
-        if v["level"] == "P0":
-            p0_list.append(v["message"])
-        elif v["level"] == "P1":
-            p1_list.append(v["message"])
-        if v["level"] in ("P0", "P1"):
-            detected_defects.append({
-                "chapter": curr_chapter.index,
-                "severity": v["level"],
-                "category": "factual",
-                "location": f"第{curr_chapter.index:g}章显式审计标记",
-                "evidence": v["message"],
-                "issue": v["message"],
-                "fix": "依据原文与设定核验该显式标记，保持已知事实一致。",
-            })
-
-    # 平台红线与严重门禁拦截
-    for pf in p_findings:
-        if pf.severity == "P0":
-            p0_list.append(pf.issue)
-        elif pf.severity == "P1":
-            p1_list.append(pf.issue)
-        if pf.severity in ("P0", "P1"):
-            defect = pf.to_dict()
-            defect["chapter"] = curr_chapter.index
-            detected_defects.append(defect)
 
     # 11. 生成与归档审查报告
     report_content = render_audit_report(
@@ -873,18 +943,12 @@ def run_audit(
     latest_report_path = reports_dir / "LATEST_REPORT.md"
     if write_latest_report:
         write_file_safe(latest_report_path, report_content)
-        # 单章审查状态机同步 (P1-04)
+        # 单章审查状态机同步（缺陷已在报告与预审包之前完成内存合并）
         c_idx = curr_chapter.index
         if c_idx not in audit_state.completed_chapters:
             audit_state.completed_chapters.append(c_idx)
             audit_state.completed_chapters.sort()
         audit_state.last_scope = f"{c_idx:g}"
-        audit_state.open_defects = [
-            d for d in audit_state.open_defects
-            if abs(float(d.get("chapter", -1)) - c_idx) > 1e-4
-        ]
-        audit_state.open_defects.extend(detected_defects)
-        _merge_foreshadowing_commitments(audit_state, foreshadowing_commitments)
         save_audit_state(audit_state, reports_dir)
 
     archived_report_path = get_report_archive_path(reports_dir, curr_chapter.index)
@@ -1153,6 +1217,7 @@ def render_scope_batch_summary(
     effective_mode: str = "solo",
     fallback_reason: str = "none",
     platform: str = "generic",
+    run_id: str = "",
     inherited_items: Optional[Dict[str, Any]] = None,
 ) -> str:
     """渲染批量审查聚合大盘报告 (Markdown)"""
@@ -1184,14 +1249,16 @@ def render_scope_batch_summary(
         f"Fallback: {fallback_reason}",
         f"Platform Rubric: {platform}",
         f"Genre: {primary_genre}",
+        f"Run ID: {run_id}",
         f"Scope: {scope_str}",
+        f"Normalized Scope: {_format_history_chapter_number(s_min)}-{_format_history_chapter_number(s_max)}",
         "Review Stage: deterministic_precheck",
         "Expert Review: not_executed",
         "",
-        f"# 批量连审大盘汇总报告 (范围: {scope_str})",
+        f"# 批量连审大盘汇总报告 (范围: {scope_str} | Run ID: {run_id})",
         "",
         f"> 生成时间：{today}  ",
-        f"> 审查范围：第 {s_min:03g} 章 至 第 {s_max:03g} 章  ",
+        f"> 审查范围：第 {_format_history_chapter_number(s_min)} 章 至 第 {_format_history_chapter_number(s_max)} 章  ",
         f"> 覆盖章节：共 {n_chaps} 章  ",
         f"> 综合判定：{overall_status}  ",
         "> 专家语义审查未执行；资源冲突、因果一致性与剧情质量仍需宿主核验。",
@@ -1370,6 +1437,7 @@ def run_scope_audit(
     else:
         effective_allow_partial = allow_partial
     reports_dir = project_dir / "reports"
+    run_id = uuid.uuid4().hex[:12]
 
     # 运行时探测与跨批状态机继承
     effective_mode, fallback_reason = _resolve_precheck_mode(mode)
@@ -1418,9 +1486,10 @@ def run_scope_audit(
             mode=mode,
             platform=platform,
             use_author_memory=use_author_memory,
-            inherited_items=inherited_items,
+            inherited_items=None,
             allow_partial=effective_allow_partial,
             _chapter_snapshot=chapters,
+            _audit_state=audit_state,
         )
         if code == 3:
             if not silent:
@@ -1479,7 +1548,8 @@ def run_scope_audit(
         effective_mode=effective_mode,
         fallback_reason=fallback_reason,
         platform=platform,
-        inherited_items=inherited_items,
+        run_id=run_id,
+        inherited_items=get_inherited_items(audit_state),
     )
 
     reports_dir = project_dir / "reports"
@@ -1490,13 +1560,13 @@ def run_scope_audit(
     scope_summary_path = reports_dir / f"BATCH_SUMMARY_SCOPE_{scope_clean}.md"
     write_file_safe(scope_summary_path, batch_summary_content)
 
-    # 2. 输出历史归档批量报告：reports/批量审查/{today}_批量审查_第{s_fmt}-{e_fmt}章.md
+    # 2. 输出历史归档批量报告：reports/批量审查/{today}_{run_id}_批量审查_第{s_fmt}-{e_fmt}章.md
     batch_dir = reports_dir / "批量审查"
     batch_dir.mkdir(parents=True, exist_ok=True)
     today = datetime.now().strftime("%Y-%m-%d")
-    s_fmt = str(int(s_min)).zfill(3)
-    e_fmt = str(int(s_max)).zfill(3)
-    batch_report_file = batch_dir / f"{today}_批量审查_第{s_fmt}-{e_fmt}章.md"
+    s_fmt = _format_history_chapter_number(s_min)
+    e_fmt = _format_history_chapter_number(s_max)
+    batch_report_file = batch_dir / f"{today}_{run_id}_批量审查_第{s_fmt}-{e_fmt}章.md"
     write_file_safe(batch_report_file, batch_summary_content)
 
     # 3. 统一将最新报告更新为本次批量审查大盘报告
@@ -1510,22 +1580,7 @@ def run_scope_audit(
             audit_state.completed_chapters.append(chap.index)
     audit_state.completed_chapters.sort()
 
-    # 累积本批次发现的开放 P0/P1 缺陷 (P1-01: 先清理待审章节旧记录，防止重审无限堆叠)
-    target_chapter_indices = {c.index for c in target_chapters}
-    audit_state.open_defects = [
-        d for d in audit_state.open_defects
-        if float(d.get("chapter", -1)) not in target_chapter_indices
-    ]
-    seen_defect_keys = {(d.get("chapter"), d.get("severity"), d.get("issue")) for d in audit_state.open_defects}
-
-    for s in chapter_summaries:
-        _merge_foreshadowing_commitments(audit_state, s.get("foreshadowing_commitments", []))
-        for defect in s.get("open_defects", []):
-            k = (defect.get("chapter"), defect.get("severity"), defect.get("issue"))
-            if k not in seen_defect_keys:
-                seen_defect_keys.add(k)
-                audit_state.open_defects.append(dict(defect))
-
+    # 缺陷与伏笔已在各章 run_audit 中按覆盖范围合并到共享状态；批次失败时不会落盘。
     save_audit_state(audit_state, reports_dir)
 
     if not silent:

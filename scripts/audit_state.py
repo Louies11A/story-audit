@@ -10,6 +10,7 @@ audit_state.py: 跨批长篇因果闭环与状态机管理 (reports/.audit_state
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -124,6 +125,161 @@ def get_inherited_items(state: AuditState) -> Dict[str, Any]:
         "open_defects": list(state.open_defects),
         "foreshadowing_commitments": list(state.foreshadowing_commitments),
     }
+
+
+def _chapter_key(chapter: Any) -> str:
+    try:
+        return f"{float(chapter):g}"
+    except (TypeError, ValueError):
+        return str(chapter)
+
+
+def _same_chapter(left: Any, right: Any) -> bool:
+    try:
+        return abs(float(left) - float(right)) < 1e-4
+    except (TypeError, ValueError):
+        return False
+
+
+def _lookup_text_version(text_versions: Optional[Dict[float, str]], chapter: Any) -> Optional[str]:
+    if not text_versions:
+        return None
+    for key, value in text_versions.items():
+        if _same_chapter(key, chapter):
+            return value
+    return None
+
+
+def make_defect_id(source: str, checker: str, platform: str, chapter: Any, issue: str) -> str:
+    """构造确定性缺陷的稳定身份，避免同一问题在重扫时重复累积。"""
+    basis = "|".join(
+        [
+            str(source or ""),
+            str(checker or ""),
+            str(platform or ""),
+            _chapter_key(chapter),
+            str(issue or ""),
+        ]
+    )
+    return "defect-" + hashlib.sha256(basis.encode("utf-8")).hexdigest()[:24]
+
+
+def merge_defect_scan(
+    state: AuditState,
+    detected_defects: List[Dict[str, Any]],
+    covered_chapters: List[float],
+    checkers: List[str],
+    platform: str,
+    text_versions: Optional[Dict[float, str]] = None,
+    resolved_at: Optional[str] = None,
+) -> None:
+    """把本轮确定性发现合并进开放缺陷，仅替换本轮检查器真正覆盖的记录。
+
+    专家、人工、未知来源、旧 schema 缺来源记录以及其他未覆盖平台记录一律保留。
+    本轮重扫未再命中的自有确定性记录进入 resolved_items，并保存关闭依据与正文版本。
+    """
+    covered = [float(item) for item in covered_chapters]
+    covered_checkers = {str(item) for item in checkers}
+    normalized: List[Dict[str, Any]] = []
+    for raw in detected_defects:
+        if not isinstance(raw, dict):
+            continue
+        item = dict(raw)
+        chapter = item.get("chapter")
+        if chapter is None:
+            continue
+        try:
+            chapter_value = float(chapter)
+        except (TypeError, ValueError):
+            continue
+        if not any(_same_chapter(chapter_value, target) for target in covered):
+            continue
+        checker = str(item.get("checker") or "deterministic")
+        item_platform = str(item.get("platform") or platform)
+        item["source"] = "deterministic"
+        item["checker"] = checker
+        item["platform"] = item_platform
+        item["chapter"] = chapter_value
+        item.setdefault("status", "open")
+        version = _lookup_text_version(text_versions, chapter_value)
+        if version:
+            item["text_version"] = version
+        item["id"] = item.get("id") or make_defect_id(
+            "deterministic", checker, item_platform, chapter_value, item.get("issue", "")
+        )
+        normalized.append(item)
+
+    current_ids = {str(item["id"]) for item in normalized}
+    resolved_at_value = resolved_at or datetime.now(timezone.utc).isoformat()
+    resolved_ids = {
+        str(item.get("id"))
+        for item in state.resolved_items
+        if isinstance(item, dict) and item.get("id")
+    }
+
+    # 重新命中的问题不再是已解决状态，避免同一身份同时出现在两个列表。
+    if current_ids:
+        state.resolved_items = [
+            item
+            for item in state.resolved_items
+            if not (isinstance(item, dict) and str(item.get("id")) in current_ids)
+        ]
+        resolved_ids -= current_ids
+
+    remaining: List[Dict[str, Any]] = []
+    for existing in state.open_defects:
+        if not isinstance(existing, dict):
+            remaining.append(existing)
+            continue
+        chapter = existing.get("chapter")
+        checker = str(existing.get("checker") or "")
+        existing_platform = str(existing.get("platform") or "")
+        owned = (
+            existing.get("source") == "deterministic"
+            and checker in covered_checkers
+            and existing_platform == platform
+            and chapter is not None
+            and any(_same_chapter(chapter, target) for target in covered)
+        )
+        if not owned:
+            remaining.append(existing)
+            continue
+
+        computed_id = make_defect_id(
+            "deterministic", checker, existing_platform, chapter, existing.get("issue", "")
+        )
+        existing_id = existing.get("id") or computed_id
+        if str(existing_id) in current_ids or computed_id in current_ids:
+            # 本轮重新命中，由下方以本轮证据替换，避免重复。
+            continue
+
+        resolved = dict(existing)
+        resolved["id"] = existing_id
+        resolved["status"] = "resolved"
+        resolved["resolved_at"] = resolved_at_value
+        resolved["resolution_reason"] = "本轮确定性预检未再命中"
+        version = _lookup_text_version(text_versions, chapter)
+        if version:
+            resolved["text_version"] = version
+        resolved["resolution_evidence"] = (
+            "checker={}; platform={}; chapter={}; text_version={}".format(
+                checker, platform, _chapter_key(chapter), resolved.get("text_version", "unknown")
+            )
+        )
+        resolved["resolution_source"] = "deterministic_rescan"
+        resolved_id = str(resolved.get("id"))
+        if resolved_id not in resolved_ids:
+            state.resolved_items.append(resolved)
+            resolved_ids.add(resolved_id)
+
+    added_ids = set()
+    for item in normalized:
+        item_id = str(item["id"])
+        if item_id in added_ids:
+            continue
+        remaining.append(item)
+        added_ids.add(item_id)
+    state.open_defects = remaining
 
 
 def render_inherited_items_section(inherited: Dict[str, Any]) -> str:
