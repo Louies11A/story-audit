@@ -2,7 +2,7 @@
 
 [![Python Version](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
-![Tests](https://img.shields.io/badge/tests-751%20passed-brightgreen.svg)
+![Tests](https://img.shields.io/badge/tests-811%20passed-brightgreen.svg)
 ![Coverage](https://img.shields.io/badge/coverage-92%25-brightgreen.svg)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-zero%20external-orange.svg)]()
 
@@ -36,7 +36,7 @@
   - [7. 专家结果接入与汇总 (`ExpertResult`, `archive_expert_results`)](#7-专家结果接入与汇总-expertresult-archive_expert_results)
   - [8. 回写后的复审协调 (`get_pending_rechecks`, `resolve_recheck`, `record_issue_closure`)](#8-回写后的复审协调-get_pending_rechecks-resolve_recheck-record_issue_closure)
   - [9. 资产事件预览与幂等提交 (`preview_asset_changes`, `confirm_asset_event`)](#9-资产事件预览与幂等提交-preview_asset_changes-confirm_asset_event)
-  - [10. 逐章流式审查与运行清单 (`iter_audit_scope`)](#10-逐章流式审查与运行清单-iter_audit_scope)
+  - [10. 逐章流式审查与运行清单 (`iter_audit_scope`, `audit_scope_stream`)](#10-逐章流式审查与运行清单-iter_audit_scope-audit_scope_stream)
   - [11. 问题处置与规则解释 (`record_finding_disposition`)](#11-问题处置与规则解释-record_finding_disposition)
   - [12. 上下文预算与按需检索 (`build_context_package`, `query_asset_history`)](#12-上下文预算与按需检索-build_context_package-query_asset_history)
 - [六、状态码 (Status Codes) 规范](#六状态码-status-codes-规范)
@@ -56,7 +56,7 @@
 `story-audit` 采用 **“底层 Python 零依赖确定性工具链 + 顶层多 Agent 专家矩阵对抗审判”** 的双层解耦架构：
 1. **确定性防线（Zero-Dependency Deterministic Tooling）**：
    - 不依赖任何第三方运行库，使用 Python 标准库本地执行；耗时随章节与账本规模变化；
-   - 负责编码嗅探保真（UTF-8/GB18030）、自然章节排序、双轨资源状态机流转、排版正则扫描、深度 AI 句式指纹检测、宿主运行时探测与递归防爆、跨批因果继承栈以及原子三行锚点安全回写。
+   - 负责编码嗅探保真（UTF-8/GB18030，损坏 BOM 拒绝静默回退防原稿损毁）、Windows 文件占用指数退避重试、自然章节排序与浮点章号支持、双轨资源状态机流转与伏笔双轨同步、排版正则与直角引号（「」『』）扫描、台词连词掩码与 POV 转场协同、深度 AI 句式指纹检测、宿主运行时探测与递归防爆、跨批因果继承栈以及原子三行锚点安全回写。
 2. **审美与商业门禁防线（Adversarial Review & Platform Rubrics）**：
    - 主审查调度器对接番茄（算法完读率）、起点（追读比）、知乎（盐言强第一人称）三大平台商业卡尺；
    - 为宿主协调器提供 4 个领域专家的职责与卡尺。宿主实际调度专家并收集证据后，才能生成对应的深度语义裁决。
@@ -308,6 +308,10 @@ status_code, state_path = adjudicate_foreshadowing(
 
 已确认或已关闭的条目不会被正文旧标签重新激活；重复确认是幂等空操作；同名伏笔按来源章号分别登记裁决。
 
+**双轨同步与跨章继承保证**：
+- 显式裁决成功后，系统会自动定位项目账本，同步更新 `设定/资源账本.json` 与 `设定/资源账本.md` 中 `foreshadowing_stash` 的伏笔条目状态（`RESOLVED` / `CLOSED` / `PENDING`）与 `adjudicated_at` 时间戳，彻底消除审查报告状态与物理账本快照的脱节；
+- 跨章节检测时，后续有明确章号的新伏笔不会被历史上无章号的模糊旧裁决误压制。
+
 ### 7. 专家结果接入与汇总 (`ExpertResult`, `archive_expert_results`)
 
 宿主执行完语义审查后，用统一契约回传实际结果；底层只接收真实执行结果，不代为调用专家。
@@ -392,7 +396,7 @@ for candidate in preview["candidates"]:
 
 同一事件重复提交不会重复加账或扣账；改判会被拒绝；消耗未入账资产会被拒绝，避免制造负事实；两位角色的同名装备各自独立记账；裁决流水与证据保留在账本 JSON 与 Markdown。
 
-### 10. 逐章流式审查与运行清单 (`iter_audit_scope`)
+### 10. 逐章流式审查与运行清单 (`iter_audit_scope`, `audit_scope_stream`)
 
 需要逐章结果（而不是一次拿到大盘报告）时使用流式入口，宿主可以边产出边组织专家审查：
 
@@ -409,7 +413,19 @@ for item in iter_audit_scope(project_dir, scope_str="1-30", platform="qidian"):
         ...
 ```
 
-每次运行写出 `reports/批量审查/运行清单/{run_id}.json`；中途失败时清单区分已完成、失败与未执行章节，失败运行不发布章节报告与预审包。运行成功时会同时产出与 `audit_scope` 一致的 `LATEST_REPORT.md`、范围汇总与历史归档。生成器必须消费到底，提前中断会让清单停留在 `running`。
+每次运行写出 `reports/批量审查/运行清单/{run_id}.json`；中途失败时清单区分已完成、失败与未执行章节，失败运行不发布章节报告与预审包。运行成功时会同时产出与 `audit_scope` 一致的 `LATEST_REPORT.md`、范围汇总与历史归档。推荐使用上下文管理器 `audit_scope_stream`，以保证中途退出时自动触发安全清理与账本回滚：
+
+```python
+from scripts.story_audit import iter_audit_scope, audit_scope_stream
+
+# 推荐方式：上下文管理器自动拦截异常与中断，确保账本回滚与清单更新
+with audit_scope_stream(project_dir, scope_str="1-30", platform="qidian") as stream:
+    for item in stream:
+        if item["kind"] == "chapter":
+            ...
+```
+
+**中断保护与原子回滚**：若生成器被调用方提前 `break`、抛出外部异常或显式 `close()`，底层的 `try...finally` 守卫会自动拦截中断，将运行清单原子标记为 `run_status="interrupted"`，并将账本实时状态安全回滚到批次启动前的初始快照，杜绝半写脏账本留盘。
 
 ### 11. 问题处置与规则解释 (`record_finding_disposition`)
 
@@ -448,6 +464,10 @@ status_code, history = query_asset_history(project_dir, name="灵石", limit=20,
 ```
 
 被省略的条目代表"本轮未携带"，不能据此推断不存在冲突；`omissions` 中给出账本相对路径与 JSON Pointer，可按需取回完整证据。
+
+**参数防呆与同名消歧**：
+- `chapter_range` 显式拦截 `bool` 布尔类型参数，避免类型伪装隐式穿透；
+- 未指定 `owner` 且账本中存在多个同名资产时，返回体置入 `"ambiguous": True`、`"candidates"` 候选列表与消歧提示，避免将他人的资产历史张冠李戴。
 
 ---
 
@@ -502,7 +522,7 @@ pytest --cov=scripts --cov-report=term-missing
 
 2026-09-14 在 Windows、Python 3.11.15 上执行 `python -B -X utf8 -m pytest -q -p no:cacheprovider`：
 
-- **结果**：751 项测试、12 项子测试全部通过。
+- **结果**：811 项测试、12 项子测试全部通过（新增 60 项深度边界用例，覆盖切片坐标对齐、Windows I/O 退避重试、流式中断安全清理、伏笔双轨状态同步、同名资产消歧与民间口语数词解析等）。
 - **语句覆盖率**：617 项版本时为 92%；本轮未重新采集覆盖率，不把旧数值当作当前实测。
 - **本次耗时**：约 15 秒，受机器和文件系统负载影响。
 - **覆盖范围**：账本与状态校验、损坏数据保护、双轨失败恢复、章节消歧、补丁字节保真、扫描边界、跨批继承、伏笔裁决、专家结果接入、复审协调、资产事件、流式运行清单、问题处置与上下文预算。

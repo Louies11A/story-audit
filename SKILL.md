@@ -2,7 +2,7 @@
 name: story-audit
 description: 用于长篇网文章节审查、资源账本核对、跨章连续性分析、排版质检和 AI 句式检查。响应 /story-audit、/审查、审本章等请求；通过 Python API 生成确定性预检，语义审查由宿主协调专家执行。
 metadata:
-  version: "2.0.0"
+  version: "2.1.0"
   author: "Story Audit Architecture Team"
   category: "writing-assistant"
   tags:
@@ -162,6 +162,9 @@ Scope: 第001章
 - **人工账本反向同步**：`sync_ledger_from_md(project_dir)`
 - **分卷封账结转**：`checkpoint_volume(project_dir, volume=N)`
 - **采纳修复方案回写**：`apply_fix(project_dir, chapter_index=N, patch=...)`
+- **流式审查与安全中断**：`with audit_scope_stream(project_dir, scope_str="N-M") as stream:`（退出时自动安全回滚与清理清单）
+- **伏笔显式裁决双轨同步**：`adjudicate_foreshadowing(project_dir, name="...", action="confirm|close|reopen", ...)`（自动同步账本伏笔池）
+- **按需资产流水检索**：`query_asset_history(project_dir, name="...", owner="...", limit=20, offset=0)`（支持同名消歧与布尔参数防护）
 
 ### Step 2: 驱动底层引擎生成预审包
 协调器调用底层 Python API（如 `audit_chapter` 或 `build_pre_audit_bundle`），生成 `reports/.cache/pre_audit_bundle.json`，提取行号绝对保真的清洗切片、跨章缝合文本、账本快照、平台诊断与作者画像。
@@ -187,16 +190,16 @@ Scope: 第001章
 
 遵循**零第三方依赖**承诺（仅依赖 Python 3.8+ 标准库）：
 
-1. `scripts/story_audit.py`：纯模块化 Python API 核心调度管线、流程串联与标准状态码；
-2. `scripts/ai_patterns_checker.py`：毫秒级深度 AI 套路句式与模式扫描器；
+1. `scripts/story_audit.py`：纯模块化 Python API 核心调度管线、流程串联、流式生成器中断守卫（audit_scope_stream）、伏笔双轨同步与标准状态码；
+2. `scripts/ai_patterns_checker.py`：毫秒级深度 AI 套路句式扫描（坐标严格对齐、章末覆盖增强、反向否定精准断言与逗号计数短路）；
 3. `scripts/platform_rubrics.py`：四大平台（番茄/起点/知乎/通用）商业门禁卡尺评估；
 4. `scripts/runtime_detector.py`：宿主运行时探测与子代理递归防爆哨兵；
 5. `scripts/author_memory.py`：单文件作者偏好状态机与只读画像（含反近亲繁殖校验）；
-6. `scripts/audit_state.py`：跨批长篇因果状态机与 Inherited Items 继承栈原子管理；
-7. `scripts/safe_io.py`：编码嗅探（utf-8-sig / utf-8 / gb18030）、换行规整与原子备份；
-8. `scripts/chapter_resolver.py`：自然数值排序、零依赖大写中文数字解析、序章与子章节定位；
-9. `scripts/ledger_engine.py`：双轨账本同步、防脏写拦截、多实体资产状态机与分卷快照；
-10. `scripts/format_scanner.py`：行数保持白名单掩码、大黑块与长难句检测、集成深度 AI 扫描；
+6. `scripts/audit_state.py`：跨批长篇因果状态机、Inherited Items 继承栈原子管理与跨章无章号历史不误压制机制；
+7. `scripts/safe_io.py`：编码嗅探（utf-8-sig/utf-8/gb18030）、损坏 BOM 拒绝回退防乱码、Windows 文件占用退避重试、描述符安全释放与原子备份；
+8. `scripts/chapter_resolver.py`：自然数值排序、零依赖大写中文数字解析、浮点章号支持与分卷前缀防吞字；
+9. `scripts/ledger_engine.py`：双轨账本同步、防脏写拦截、多实体资产状态机、民间口语数词解析（含“半”与省略单位）与分卷快照；
+10. `scripts/format_scanner.py`：行数保持白名单掩码、直角引号（「」『』）覆盖、台词连词放行、转场连词协同、大黑块与长难句检测；
 11. `scripts/chapter_linker.py`：跨章前后 300 字提取、显式 POV 转场识别与闪回隔离标注；
 12. `scripts/safe_writer.py`：三行锚点匹配、局部邻域消歧与安全原子回写；
 13. `scripts/types.py`：强类型数据模型定义（ChapterItem, Finding, FormatFinding, BoundaryContext, PatchSpec）；
