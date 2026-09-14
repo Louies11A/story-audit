@@ -46,6 +46,12 @@ ADJUDICATED_COMMITMENT_STATUSES = (
 )
 REOPENED_COMMITMENT_STATUS = "reopened"
 
+# F05：版本感知的复审协调。待办条目按 (章号, 作用域) 唯一，解除后保留可追溯记录。
+VALID_RECHECK_SCOPES = ("chapter", "seam")
+VALID_COORDINATION_SOURCES = ("author", "expert")
+RECHECK_STATUS_PENDING = "pending"
+RECHECK_STATUS_RESOLVED = "resolved"
+
 
 class ForeshadowingAdjudicationError(ValueError):
     """伏笔裁决无法执行：参数非法或目标条目不存在。"""
@@ -60,6 +66,10 @@ class AuditState:
     open_defects: List[Dict[str, Any]] = field(default_factory=list)
     foreshadowing_commitments: List[Dict[str, Any]] = field(default_factory=list)
     resolved_items: List[Dict[str, Any]] = field(default_factory=list)
+    # F05 新增可选字段：旧状态文件缺少这些键时按空值加载，旧字段语义不变。
+    chapter_versions: Dict[str, str] = field(default_factory=dict)
+    pending_rechecks: List[Dict[str, Any]] = field(default_factory=list)
+    version_events: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -76,7 +86,19 @@ class AuditState:
         chapters = data.get("completed_chapters", [])
         if any(isinstance(chapter, bool) or not math.isfinite(float(chapter)) for chapter in chapters):
             raise ValueError("completed_chapters 必须包含有限章号")
-        for key in ("open_defects", "foreshadowing_commitments", "resolved_items"):
+        chapter_versions = data.get("chapter_versions", {})
+        if not isinstance(chapter_versions, dict) or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in chapter_versions.items()
+        ):
+            raise ValueError("chapter_versions 必须为字符串到字符串的章节指纹映射")
+        for key in (
+            "open_defects",
+            "foreshadowing_commitments",
+            "resolved_items",
+            "pending_rechecks",
+            "version_events",
+        ):
             items = data.get(key, [])
             if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
                 raise ValueError(f"{key} 必须为对象列表")
@@ -100,6 +122,9 @@ class AuditState:
             open_defects=list(data.get("open_defects", [])),
             foreshadowing_commitments=list(data.get("foreshadowing_commitments", [])),
             resolved_items=list(data.get("resolved_items", [])),
+            chapter_versions=chapter_versions,
+            pending_rechecks=list(data.get("pending_rechecks", [])),
+            version_events=list(data.get("version_events", [])),
         )
 
 
@@ -621,6 +646,187 @@ def apply_foreshadowing_adjudication(
         "removed": 0,
         "record": record,
     }
+
+
+def make_patch_id(chapter: Any, patch: Any) -> str:
+    """构造补丁稳定身份：章号 + 目标行 + 锚点 + 替换文本。"""
+    basis = "|".join(
+        [
+            _chapter_key(chapter),
+            str(getattr(patch, "target_line", "")),
+            str(getattr(patch, "old_text", "")),
+            str(getattr(patch, "new_text", "")),
+            str(getattr(patch, "context_before", "")),
+            str(getattr(patch, "context_after", "")),
+        ]
+    )
+    return "patch-" + hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
+
+
+def record_chapter_version(state: AuditState, chapter: Any, text_version: str) -> str:
+    """登记某章当前已完成审查的正文指纹，返回写入键。"""
+    key = _chapter_key(chapter)
+    if isinstance(text_version, str) and text_version:
+        state.chapter_versions[key] = text_version
+    return key
+
+
+def get_chapter_version(state: AuditState, chapter: Any) -> str:
+    """读取某章已记录（已审）的正文指纹；未记录时返回空字符串。"""
+    key = _chapter_key(chapter)
+    value = state.chapter_versions.get(key)
+    if isinstance(value, str) and value:
+        return value
+    for raw_key, raw_value in state.chapter_versions.items():
+        if isinstance(raw_value, str) and raw_value and _same_chapter(raw_key, chapter):
+            return raw_value
+    return ""
+
+
+def is_chapter_version_audited(state: AuditState, chapter: Any, text_version: Optional[str]) -> bool:
+    """判断某章当前版本是否已审：章号已完成且记录指纹与给定指纹一致。
+
+    完成章号本身不再代表当前版本已审；旧状态文件没有指纹记录时同样返回 False。
+    """
+    if not any(_same_chapter(chapter, item) for item in state.completed_chapters):
+        return False
+    if not isinstance(text_version, str) or not text_version:
+        return False
+    return get_chapter_version(state, chapter) == text_version
+
+
+def _recheck_id(chapter: Any, scope: str) -> str:
+    basis = f"{_chapter_key(chapter)}|{scope}"
+    return "recheck-" + hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
+
+
+def register_pending_recheck(
+    state: AuditState,
+    chapter: Any,
+    scope: str,
+    reason: str,
+    text_version: str = "",
+    previous_text_version: str = "",
+    trigger_chapter: Any = None,
+    patch_id: str = "",
+    source: str = "apply_fix",
+    at: Optional[str] = None,
+) -> Dict[str, Any]:
+    """登记待复审项；同一 (章号, 作用域) 只保留一条，重复登记原位更新。"""
+    timestamp = at or datetime.now(timezone.utc).isoformat()
+    chapter_value = float(chapter)
+    scope_value = str(scope)
+    trigger_value = chapter_value if trigger_chapter is None else float(trigger_chapter)
+    recheck_id = _recheck_id(chapter_value, scope_value)
+    for item in state.pending_rechecks:
+        if isinstance(item, dict) and item.get("id") == recheck_id:
+            item.update(
+                {
+                    "chapter": chapter_value,
+                    "scope": scope_value,
+                    "status": RECHECK_STATUS_PENDING,
+                    "reason": reason,
+                    "text_version": text_version,
+                    "previous_text_version": previous_text_version,
+                    "trigger_chapter": trigger_value,
+                    "patch_id": patch_id,
+                    "source": source,
+                    "updated_at": timestamp,
+                }
+            )
+            for key in (
+                "resolution",
+                "resolution_reason",
+                "resolution_source",
+                "resolution_text_version",
+                "resolved_at",
+            ):
+                item[key] = ""
+            return item
+
+    entry = {
+        "id": recheck_id,
+        "chapter": chapter_value,
+        "scope": scope_value,
+        "status": RECHECK_STATUS_PENDING,
+        "reason": reason,
+        "text_version": text_version,
+        "previous_text_version": previous_text_version,
+        "trigger_chapter": trigger_value,
+        "patch_id": patch_id,
+        "source": source,
+        "created_at": timestamp,
+        "updated_at": timestamp,
+        "resolution": "",
+        "resolution_reason": "",
+        "resolution_source": "",
+        "resolution_text_version": "",
+        "resolved_at": "",
+    }
+    state.pending_rechecks.append(entry)
+    return entry
+
+
+def resolve_pending_rechecks(
+    state: AuditState,
+    chapter: Any,
+    scope: Optional[str] = None,
+    reason: str = "",
+    source: str = "",
+    resolution: str = "reaudit",
+    text_version: str = "",
+    at: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """清除匹配的待办复审项（保留解除依据），返回被清除的条目。"""
+    timestamp = at or datetime.now(timezone.utc).isoformat()
+    resolved: List[Dict[str, Any]] = []
+    for item in state.pending_rechecks:
+        if not isinstance(item, dict) or item.get("status") != RECHECK_STATUS_PENDING:
+            continue
+        if not _same_chapter(item.get("chapter"), chapter):
+            continue
+        if scope is not None and str(item.get("scope") or "") != str(scope):
+            continue
+        item["status"] = RECHECK_STATUS_RESOLVED
+        item["resolution"] = resolution
+        item["resolution_reason"] = reason
+        item["resolution_source"] = source
+        item["resolution_text_version"] = text_version
+        item["resolved_at"] = timestamp
+        item["updated_at"] = timestamp
+        resolved.append(item)
+    return resolved
+
+
+def collect_pending_rechecks(
+    state: AuditState,
+    include_resolved: bool = False,
+) -> List[Dict[str, Any]]:
+    """收集待办复审项（可选含已解除历史），按章号与作用域排序返回副本。"""
+    items: List[Dict[str, Any]] = []
+    for item in state.pending_rechecks:
+        if not isinstance(item, dict):
+            continue
+        if not include_resolved and item.get("status") != RECHECK_STATUS_PENDING:
+            continue
+        items.append(dict(item))
+
+    def sort_key(item: Dict[str, Any]):
+        try:
+            chapter = float(item.get("chapter"))
+        except (TypeError, ValueError, OverflowError):
+            chapter = 0.0
+        return (chapter, str(item.get("scope") or ""), str(item.get("id") or ""))
+
+    return sorted(items, key=sort_key)
+
+
+def append_version_event(state: AuditState, event: Dict[str, Any]) -> Dict[str, Any]:
+    """追加版本事件（补丁写入、复审解除、问题关闭等），自动补时间戳。"""
+    record = dict(event)
+    record.setdefault("at", datetime.now(timezone.utc).isoformat())
+    state.version_events.append(record)
+    return record
 
 
 def render_inherited_items_section(inherited: Dict[str, Any]) -> str:

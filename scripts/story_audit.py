@@ -15,6 +15,7 @@ import math
 import os
 import re
 import sys
+import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -59,10 +60,20 @@ from scripts.audit_state import (
     AuditState,
     VALID_FORESHADOWING_ACTIONS,
     VALID_FORESHADOWING_SOURCES,
+    VALID_COORDINATION_SOURCES,
+    VALID_RECHECK_SCOPES,
+    append_version_event,
     apply_foreshadowing_adjudication,
+    collect_pending_rechecks,
     get_audit_state_path,
+    get_chapter_version,
     is_foreshadowing_adjudicated,
+    is_chapter_version_audited,
     load_audit_state,
+    make_patch_id,
+    record_chapter_version,
+    register_pending_recheck,
+    resolve_pending_rechecks,
     save_audit_state,
     get_inherited_items,
     make_defect_id,
@@ -234,13 +245,76 @@ def _restore_optional_bytes(path: Path, original: Optional[bytes]) -> None:
     path.write_bytes(original)
 
 
-def _flush_staged_writes(staged_writes: Dict[Path, str]) -> None:
+def _write_bytes_safe(path: Path, data: bytes) -> None:
+    """按字节原子写入（临时文件 + fsync + os.replace），用于原样归档历史产物。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path_str: Optional[str] = None
+    try:
+        temp_fd, temp_path_str = tempfile.mkstemp(
+            dir=path.parent, prefix=f".tmp_{path.stem}_", suffix=".tmp"
+        )
+        with os.fdopen(temp_fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path_str, path)
+    except Exception as e:
+        if temp_path_str and os.path.exists(temp_path_str):
+            try:
+                os.remove(temp_path_str)
+            except OSError:
+                pass
+        raise SafeIOWriteError(f"写入文件失败 {path}: {e}") from e
+
+
+def _flush_staged_writes(staged_writes: Dict[Path, Union[str, bytes]]) -> None:
     for path, content in staged_writes.items():
-        write_file_safe(path, content)
+        if isinstance(content, bytes):
+            _write_bytes_safe(path, content)
+        else:
+            write_file_safe(path, content)
+
+
+def _clip_event_text(text: Any, limit: int = 300) -> str:
+    """事件留痕用的文本截断，避免超长补丁把状态文件撑大。"""
+    value = "" if text is None else str(text)
+    if len(value) <= limit:
+        return value
+    return value[:limit] + "..."
+
+
+def _rollback_chapter_write(
+    chapter_path: Path,
+    original_bytes: Optional[bytes],
+    created_backups: List[Path],
+    backup_dir: Optional[Path] = None,
+    backup_dir_existed: bool = True,
+) -> bool:
+    """回滚本次安全回写：恢复正文原始字节并删除本次新增备份，返回是否恢复成功。"""
+    restored = False
+    if original_bytes is not None:
+        try:
+            _write_bytes_safe(chapter_path, original_bytes)
+            restored = True
+        except Exception:
+            restored = False
+    if restored:
+        for backup in created_backups:
+            try:
+                backup.unlink()
+            except OSError:
+                pass
+        if backup_dir is not None and not backup_dir_existed:
+            # 本次调用新建的空备份目录一并清理，失败路径不留任何残留。
+            try:
+                backup_dir.rmdir()
+            except OSError:
+                pass
+    return restored
 
 
 def _flush_staged_writes_with_rollback(
-    staged_writes: Dict[Path, str],
+    staged_writes: Dict[Path, Union[str, bytes]],
     state_path: Path,
     original_state: Optional[bytes],
     original_artifacts: Dict[Path, Optional[bytes]],
@@ -300,6 +374,18 @@ def get_report_archive_path(reports_dir: Path, chapter_index: float) -> Path:
     else:
         filename = f"第{idx}章_审查报告.md"
     return reports_dir / "单章审查" / bucket / filename
+
+
+def get_report_history_path(reports_dir: Path, chapter_index: float, text_version: str) -> Path:
+    """计算旧版本报告归档路径：reports/单章审查/历史/{桶}/第{N}章_审查报告_v{指纹前12位}.md"""
+    archive_path = get_report_archive_path(reports_dir, chapter_index)
+    version_tag = (text_version or "unknown")[:12]
+    return (
+        archive_path.parent.parent
+        / "历史"
+        / archive_path.parent.name
+        / f"{archive_path.stem}_v{version_tag}{archive_path.suffix}"
+    )
 
 
 def detect_violations_in_text(text: str) -> List[Dict[str, str]]:
@@ -771,6 +857,39 @@ def _merge_foreshadowing_commitments(state: AuditState, commitments: List[Dict[s
         state.foreshadowing_commitments.append(dict(item))
 
 
+def _resolve_rechecks_for_audited_chapter(
+    audit_state: AuditState,
+    chapter_index: float,
+    text_version: str,
+) -> List[Dict[str, Any]]:
+    """按当前版本完成审查后清除对应待办复审项，并追加可追溯的解除事件。"""
+    resolved = resolve_pending_rechecks(
+        audit_state,
+        chapter=chapter_index,
+        reason="按当前正文版本完成复审",
+        source="audit",
+        resolution="reaudit",
+        text_version=text_version,
+    )
+    for item in resolved:
+        append_version_event(
+            audit_state,
+            {
+                "type": "recheck_resolved",
+                "chapter": float(item.get("chapter", chapter_index)),
+                "scope": str(item.get("scope") or ""),
+                "recheck_id": str(item.get("id") or ""),
+                "trigger_chapter": item.get("trigger_chapter"),
+                "previous_text_version": str(item.get("text_version") or ""),
+                "text_version": text_version,
+                "resolution": "reaudit",
+                "reason": "按当前正文版本完成复审",
+                "source": "audit",
+            },
+        )
+    return resolved
+
+
 def run_audit(
     project_dir: Path,
     target_chapter_index: Optional[float] = None,
@@ -787,7 +906,7 @@ def run_audit(
     allow_partial: bool = False,
     _chapter_snapshot: Optional[List[ChapterItem]] = None,
     _audit_state: Optional[AuditState] = None,
-    _staged_writes: Optional[Dict[Path, str]] = None,
+    _staged_writes: Optional[Dict[Path, Union[str, bytes]]] = None,
 ) -> int:
     """执行单章审查管线，生成预审包与归档报告，返回退出码"""
     try:
@@ -1012,6 +1131,12 @@ def run_audit(
         text_versions=chapter_text_versions,
     )
     _merge_foreshadowing_commitments(audit_state, foreshadowing_commitments)
+    # 版本感知：登记本次审查的正文指纹，并按当前版本清除对应待办复审项。
+    previous_version = get_chapter_version(audit_state, curr_chapter.index)
+    record_chapter_version(audit_state, curr_chapter.index, curr_text_version)
+    _resolve_rechecks_for_audited_chapter(
+        audit_state, curr_chapter.index, curr_text_version
+    )
     try:
         # 已归档的专家执行状态按当前正文重新判定过期后随继承栏目进入报告与预审包。
         expert_view = _refresh_expert_records(expert_records, project_dir)
@@ -1069,10 +1194,21 @@ def run_audit(
 
     latest_report_path = reports_dir / "LATEST_REPORT.md"
     archived_report_path = get_report_archive_path(reports_dir, curr_chapter.index)
-    pending_writes: Dict[Path, str] = {
+    pending_writes: Dict[Path, Union[str, bytes]] = {
         bundle_path: bundle_content,
         archived_report_path: report_content,
     }
+    # 正文版本变化时先把旧归档报告原样搬进历史目录，杜绝静默覆盖旧裁决。
+    if (
+        previous_version
+        and previous_version != curr_text_version
+        and archived_report_path.is_file()
+    ):
+        history_path = get_report_history_path(
+            reports_dir, curr_chapter.index, previous_version
+        )
+        if not history_path.exists():
+            pending_writes[history_path] = archived_report_path.read_bytes()
     # 过期判定视图发生变化时，随本轮产物原子刷新专家汇总渲染（归档 JSON 保持不变）。
     summary_stale = expert_summary_signature(expert_view) != expert_summary_signature(expert_records)
     if expert_view and summary_stale:
@@ -1629,7 +1765,7 @@ def run_scope_audit(
         safe_console_print(f"========================================================================================")
 
     chapter_summaries: List[Dict[str, Any]] = []
-    staged_writes: Dict[Path, str] = {}
+    staged_writes: Dict[Path, Union[str, bytes]] = {}
     has_p0 = False
     has_p1 = False
 
@@ -1868,18 +2004,45 @@ def run_apply_fix(
             )
         return 3
 
-    backup_dir = project_dir / "reports" / ".bak"
+    reports_dir = project_dir / "reports"
+    # 协调状态与正文必须先完成读取与校验，任何前置失败都不得触碰原稿。
+    try:
+        audit_state = load_audit_state(reports_dir)
+        original_bytes = target_chapter.path.read_bytes()
+        original_text, _, _ = read_file_safe(target_chapter.path)
+    except Exception as e:
+        if not silent:
+            safe_console_print(f"[错误] 读取回写上下文失败: {e}", file=sys.stderr)
+        return 3
+    before_version = _text_content_version(original_text)
+
+    curr_pos = chapters.index(target_chapter)
+    next_chapter: Optional[ChapterItem] = (
+        chapters[curr_pos + 1] if curr_pos + 1 < len(chapters) else None
+    )
+    next_text_version = ""
+    if next_chapter is not None:
+        try:
+            next_text, _, _ = read_file_safe(next_chapter.path)
+            next_text_version = _text_content_version(next_text)
+        except Exception:
+            # 下一章暂时无法读取时仍登记接缝待办，只是无法记录指纹。
+            next_text_version = ""
+
+    backup_dir = reports_dir / ".bak"
+    backup_dir_existed = backup_dir.is_dir()
+    existing_backups = (
+        {path for path in backup_dir.glob("*") if path.is_file()}
+        if backup_dir.is_dir()
+        else set()
+    )
     try:
         success = apply_patch_with_disambiguation(
             file_path=target_chapter.path,
             patch=patch,
             backup_dir=backup_dir,
         )
-        if success:
-            if not silent:
-                safe_console_print(f"成功安全回写第 {target_chapter.index} 章，已生成原子备份。")
-            return 0
-        else:
+        if not success:
             if not silent:
                 safe_console_print(f"[错误] 回写未成功完成。", file=sys.stderr)
             return 3
@@ -1891,6 +2054,94 @@ def run_apply_fix(
         if not silent:
             safe_console_print(f"[系统异常] 安全回写失败: {e}", file=sys.stderr)
         return 3
+
+    # 回写成功：登记补丁事件与受影响章节的待复审项（第 N 章报告 + 第 N+1 章接缝）。
+    created_backups = sorted(
+        {path for path in backup_dir.glob("*") if path.is_file()} - existing_backups
+    ) if backup_dir.is_dir() else []
+    try:
+        updated_text, _, _ = read_file_safe(target_chapter.path)
+    except Exception as e:
+        restored = _rollback_chapter_write(
+            target_chapter.path, original_bytes, created_backups, backup_dir, backup_dir_existed
+        )
+        if not silent:
+            detail = "已回滚原稿" if restored else "回滚失败，请依据备份人工恢复"
+            safe_console_print(
+                f"[错误] 回写后无法读取正文 ({e})，{detail}。", file=sys.stderr
+            )
+        return 3
+    after_version = _text_content_version(updated_text)
+    patch_id = make_patch_id(target_chapter.index, patch)
+    backup_rel = ""
+    if created_backups:
+        try:
+            backup_rel = created_backups[-1].relative_to(project_dir).as_posix()
+        except ValueError:
+            backup_rel = created_backups[-1].as_posix()
+
+    register_pending_recheck(
+        audit_state,
+        target_chapter.index,
+        "chapter",
+        reason="补丁写入后本章正文版本变化，原归档报告失效，需按当前版本复审",
+        text_version=after_version,
+        previous_text_version=before_version,
+        trigger_chapter=target_chapter.index,
+        patch_id=patch_id,
+        source="apply_fix",
+    )
+    affected_chapters = [float(target_chapter.index)]
+    if next_chapter is not None:
+        register_pending_recheck(
+            audit_state,
+            next_chapter.index,
+            "seam",
+            reason="上一章补丁写入后接缝检查失效，需按当前正文复审",
+            text_version=next_text_version,
+            previous_text_version=next_text_version,
+            trigger_chapter=target_chapter.index,
+            patch_id=patch_id,
+            source="apply_fix",
+        )
+        affected_chapters.append(float(next_chapter.index))
+    append_version_event(
+        audit_state,
+        {
+            "type": "patch_applied",
+            "chapter": float(target_chapter.index),
+            "patch_id": patch_id,
+            "target_line": patch.target_line,
+            "old_text": _clip_event_text(patch.old_text),
+            "new_text": _clip_event_text(patch.new_text),
+            "before_text_version": before_version,
+            "after_text_version": after_version,
+            "backup": backup_rel,
+            "affected_chapters": affected_chapters,
+            "source": "apply_fix",
+        },
+    )
+
+    try:
+        save_audit_state(audit_state, reports_dir)
+    except Exception as e:
+        restored = _rollback_chapter_write(
+            target_chapter.path, original_bytes, created_backups, backup_dir, backup_dir_existed
+        )
+        if not silent:
+            detail = "已回滚原稿" if restored else "回滚失败，请依据备份人工恢复"
+            safe_console_print(
+                f"[错误] 保存回写协调状态失败: {e}，{detail}。", file=sys.stderr
+            )
+        return 3
+
+    if not silent:
+        safe_console_print(f"成功安全回写第 {target_chapter.index} 章，已生成原子备份。")
+        safe_console_print(
+            f"已登记补丁事件 {patch_id}，待复审章节：第 {target_chapter.index} 章"
+            + (f" 与第 {next_chapter.index} 章接缝" if next_chapter is not None else "")
+        )
+    return 0
 
 
 def run_foreshadowing_adjudication(
@@ -2262,6 +2513,271 @@ def run_archive_expert_results(
     return 0, summary_path
 
 
+def _chapter_matches(left: Any, right: Any) -> bool:
+    try:
+        return abs(float(left) - float(right)) < 1e-4
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _chapter_current_text_version(project_dir: Path, chapter: float) -> str:
+    """读取某章当前正文指纹；章节缺失或无法读取时返回空字符串。"""
+    try:
+        chapters = ChapterResolver().discover_chapters(project_dir)
+        target = _select_unique_chapter(chapters, chapter)
+    except (OSError, ValueError):
+        return ""
+    if target is None:
+        return ""
+    try:
+        text, _, _ = read_file_safe(target.path)
+    except Exception:
+        return ""
+    return _text_content_version(text)
+
+
+def run_get_pending_rechecks(
+    project_dir: Path,
+    include_resolved: bool = False,
+    include_events: bool = False,
+    silent: bool = False,
+) -> Tuple[int, Dict[str, Any]]:
+    """查询待办复审：按当前正文重算“当前版本是否已审”，供宿主决定重扫范围。"""
+    try:
+        _validate_boolean_options(
+            include_resolved=include_resolved, include_events=include_events, silent=silent
+        )
+    except ValueError as e:
+        _report_api_error(e, silent)
+        return 3, {}
+    try:
+        audit_state = load_audit_state(project_dir / "reports")
+    except Exception as e:
+        _report_api_error(e, silent)
+        return 3, {}
+
+    pending: List[Dict[str, Any]] = []
+    resolved: List[Dict[str, Any]] = []
+    for entry in collect_pending_rechecks(audit_state, include_resolved=True):
+        enriched = dict(entry)
+        chapter = enriched.get("chapter")
+        current_version = (
+            _chapter_current_text_version(project_dir, float(chapter))
+            if chapter is not None
+            else ""
+        )
+        enriched["current_text_version"] = current_version
+        enriched["current_version_audited"] = bool(
+            current_version
+            and is_chapter_version_audited(audit_state, chapter, current_version)
+        )
+        # 待办即待复审；current_version_audited 只说明该章自身版本是否仍是最新已审版本。
+        enriched["needs_reaudit"] = enriched.get("status") == "pending"
+        if enriched.get("status") == "pending":
+            pending.append(enriched)
+        else:
+            resolved.append(enriched)
+
+    payload = {
+        "pending": pending,
+        "resolved": resolved if include_resolved else [],
+        "events": list(audit_state.version_events) if include_events else [],
+        "counts": {
+            "pending": len(pending),
+            "resolved": len(resolved),
+            "events": len(audit_state.version_events),
+        },
+        "affected_chapters": sorted({float(item["chapter"]) for item in pending}),
+        "chapter_versions": dict(audit_state.chapter_versions),
+    }
+    return 0, payload
+
+
+def run_resolve_recheck(
+    project_dir: Path,
+    chapter: Optional[float],
+    scope: str = "",
+    reason: str = "",
+    source: str = "author",
+    silent: bool = False,
+) -> Tuple[int, Path]:
+    """手工解除待办复审项（作者或实际审查结论），保留解除依据与事件记录。"""
+    try:
+        _validate_boolean_options(silent=silent)
+        _validate_chapter_index(chapter)
+        if chapter is None:
+            raise ValueError("必须提供章号 (chapter)")
+        if not isinstance(scope, str):
+            raise ValueError("作用域 (scope) 必须为字符串")
+        scope_value = scope.strip()
+        if scope_value and scope_value not in VALID_RECHECK_SCOPES:
+            raise ValueError("作用域 (scope) 只能是 ''、chapter 或 seam")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("必须提供解除原因 (reason)")
+        if not isinstance(source, str) or source.strip().lower() not in VALID_COORDINATION_SOURCES:
+            raise ValueError("解除来源 (source) 只能是 author 或 expert")
+    except ValueError as e:
+        _report_api_error(e, silent)
+        return 3, Path("")
+
+    reports_dir = project_dir / "reports"
+    try:
+        audit_state = load_audit_state(reports_dir)
+    except Exception as e:
+        _report_api_error(e, silent)
+        return 3, Path("")
+
+    def matches(item: Dict[str, Any], only_pending: bool) -> bool:
+        if only_pending and item.get("status") != "pending":
+            return False
+        if not _chapter_matches(item.get("chapter"), chapter):
+            return False
+        return not scope_value or str(item.get("scope") or "") == scope_value
+
+    if not any(matches(item, True) for item in collect_pending_rechecks(audit_state)):
+        # 已解除过的同目标视为幂等；完全没有记录则属于非法目标。
+        if any(matches(item, False) for item in collect_pending_rechecks(audit_state, include_resolved=True)):
+            return 0, get_audit_state_path(reports_dir)
+        if not silent:
+            safe_console_print(
+                f"[错误] 未找到匹配的待办复审项: 第 {chapter:g} 章 scope={scope_value or '全部'}",
+                file=sys.stderr,
+            )
+        return 3, Path("")
+
+    text_version = _chapter_current_text_version(project_dir, chapter)
+    resolved_items = resolve_pending_rechecks(
+        audit_state,
+        chapter=chapter,
+        scope=scope_value or None,
+        reason=reason.strip(),
+        source=source.strip().lower(),
+        resolution="manual_close",
+        text_version=text_version,
+    )
+    for item in resolved_items:
+        append_version_event(
+            audit_state,
+            {
+                "type": "recheck_resolved",
+                "chapter": float(item.get("chapter")),
+                "scope": str(item.get("scope") or ""),
+                "recheck_id": str(item.get("id") or ""),
+                "trigger_chapter": item.get("trigger_chapter"),
+                "previous_text_version": str(item.get("text_version") or ""),
+                "text_version": text_version,
+                "resolution": "manual_close",
+                "reason": reason.strip(),
+                "source": source.strip().lower(),
+            },
+        )
+    try:
+        state_path = save_audit_state(audit_state, reports_dir)
+    except Exception as e:
+        if not silent:
+            safe_console_print(f"[错误] 保存复审解除记录失败: {e}", file=sys.stderr)
+        return 3, Path("")
+    if not silent:
+        safe_console_print(f"已解除 {len(resolved_items)} 项待办复审：第 {chapter:g} 章")
+    return 0, state_path
+
+
+def run_record_issue_closure(
+    project_dir: Path,
+    chapter: Optional[float],
+    issue: str,
+    reason: str,
+    source: str = "author",
+    silent: bool = False,
+) -> Tuple[int, Path]:
+    """单独登记“问题经复核关闭”事件；命中开放缺陷时同步移入历史，不涉及补丁。"""
+    try:
+        _validate_boolean_options(silent=silent)
+        _validate_chapter_index(chapter)
+        if chapter is None:
+            raise ValueError("必须提供章号 (chapter)")
+        if not isinstance(issue, str) or not issue.strip():
+            raise ValueError("必须提供问题陈述 (issue)")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("必须提供关闭原因 (reason)")
+        if not isinstance(source, str) or source.strip().lower() not in VALID_COORDINATION_SOURCES:
+            raise ValueError("关闭来源 (source) 只能是 author 或 expert")
+    except ValueError as e:
+        _report_api_error(e, silent)
+        return 3, Path("")
+
+    reports_dir = project_dir / "reports"
+    try:
+        audit_state = load_audit_state(reports_dir)
+    except Exception as e:
+        _report_api_error(e, silent)
+        return 3, Path("")
+
+    issue_value = issue.strip()
+    source_value = source.strip().lower()
+    reason_value = reason.strip()
+    for event in audit_state.version_events:
+        if not isinstance(event, dict) or event.get("type") != "issue_closed":
+            continue
+        if (
+            _chapter_matches(event.get("chapter"), chapter)
+            and str(event.get("issue") or "") == issue_value
+            and str(event.get("reason") or "") == reason_value
+            and str(event.get("source") or "") == source_value
+        ):
+            # 重复登记同一关闭事件：幂等空操作，不改写状态文件。
+            return 0, get_audit_state_path(reports_dir)
+
+    text_version = _chapter_current_text_version(project_dir, chapter)
+    timestamp = datetime.now(timezone.utc).isoformat()
+    matched: List[Dict[str, Any]] = []
+    remaining: List[Any] = []
+    for item in audit_state.open_defects:
+        if (
+            isinstance(item, dict)
+            and _chapter_matches(item.get("chapter"), chapter)
+            and str(item.get("issue") or "") == issue_value
+        ):
+            matched.append(item)
+            continue
+        remaining.append(item)
+    if matched:
+        audit_state.open_defects = remaining
+        for item in matched:
+            resolved = dict(item)
+            resolved["status"] = "resolved"
+            resolved["resolution_reason"] = reason_value
+            resolved["resolution_source"] = source_value
+            resolved["resolved_at"] = timestamp
+            if text_version:
+                resolved["text_version"] = text_version
+            audit_state.resolved_items.append(resolved)
+    append_version_event(
+        audit_state,
+        {
+            "type": "issue_closed",
+            "chapter": float(chapter),
+            "issue": issue_value,
+            "reason": reason_value,
+            "source": source_value,
+            "text_version": text_version,
+            "closed_defects": len(matched),
+            "at": timestamp,
+        },
+    )
+    try:
+        state_path = save_audit_state(audit_state, reports_dir)
+    except Exception as e:
+        if not silent:
+            safe_console_print(f"[错误] 保存问题关闭事件失败: {e}", file=sys.stderr)
+        return 3, Path("")
+    if not silent:
+        safe_console_print(
+            f"已登记问题关闭事件：第 {chapter:g} 章 {issue_value}（联动关闭缺陷 {len(matched)} 项）"
+        )
+    return 0, state_path
+
+
 def audit_chapter(
     project_dir: Union[str, Path] = ".",
     chapter_index: Optional[float] = None,
@@ -2614,6 +3130,133 @@ def archive_expert_results(
         return 3, Path("")
 
 
+def get_pending_rechecks(
+    project_dir: Union[str, Path] = ".",
+    include_resolved: bool = False,
+    include_events: bool = False,
+    silent: bool = False,
+) -> Tuple[int, Dict[str, Any]]:
+    """待办复审查询纯 Python API
+
+    返回结构：
+        - ``pending``: 待办复审项（按当前正文重算 ``current_version_audited`` /
+          ``needs_reaudit``，宿主据此决定重扫范围）
+        - ``resolved``: 已解除的复审历史（``include_resolved=True`` 时返回）
+        - ``events``: 版本事件（``include_events=True`` 时返回）
+        - ``counts`` / ``affected_chapters`` / ``chapter_versions``: 统计与版本快照
+
+    Args:
+        project_dir: 小说项目根目录（Path 或 str，默认当前目录）
+        include_resolved: 是否同时返回已解除的复审历史
+        include_events: 是否同时返回补丁/关闭/解除事件
+        silent: 是否静默输出
+
+    Returns:
+        Tuple[int, Dict[str, Any]]: (状态码, 查询结果)；失败时返回 ``(3, {})``
+    """
+    try:
+        p_dir = _resolve_project_dir(project_dir)
+    except (OSError, TypeError, ValueError) as e:
+        _report_api_error(e, silent)
+        return 3, {}
+    try:
+        return run_get_pending_rechecks(
+            project_dir=p_dir,
+            include_resolved=include_resolved,
+            include_events=include_events,
+            silent=silent,
+        )
+    except (OSError, SafeIOError, TypeError, ValueError) as e:
+        _report_api_error(e, silent)
+        return 3, {}
+
+
+def resolve_recheck(
+    project_dir: Union[str, Path] = ".",
+    chapter: Optional[float] = None,
+    scope: str = "",
+    reason: str = "",
+    source: str = "author",
+    silent: bool = False,
+) -> Tuple[int, Path]:
+    """手工解除待办复审纯 Python API
+
+    与审查自动解除（按当前版本完成审查）互为补充：作者或实际审查结论也可以显式解除，
+    解除依据、来源与当时正文版本会写入复审历史与版本事件，重复调用幂等。
+
+    Args:
+        project_dir: 小说项目根目录（Path 或 str，默认当前目录）
+        chapter: 目标章号
+        scope: 作用域，``''``（该章全部）、``chapter``（本章报告）或 ``seam``（接缝检查）
+        reason: 解除原因（必填）
+        source: 解除来源，``author`` 或 ``expert``
+        silent: 是否静默输出
+
+    Returns:
+        Tuple[int, Path]: (状态码, 审计状态文件路径)；失败时返回 ``(3, Path(""))``
+    """
+    try:
+        p_dir = _resolve_project_dir(project_dir)
+    except (OSError, TypeError, ValueError) as e:
+        _report_api_error(e, silent)
+        return 3, Path("")
+    try:
+        return run_resolve_recheck(
+            project_dir=p_dir,
+            chapter=chapter,
+            scope=scope,
+            reason=reason,
+            source=source,
+            silent=silent,
+        )
+    except (OSError, SafeIOError, TypeError, ValueError) as e:
+        _report_api_error(e, silent)
+        return 3, Path("")
+
+
+def record_issue_closure(
+    project_dir: Union[str, Path] = ".",
+    chapter: Optional[float] = None,
+    issue: str = "",
+    reason: str = "",
+    source: str = "author",
+    silent: bool = False,
+) -> Tuple[int, Path]:
+    """登记“问题经复核关闭”事件纯 Python API
+
+    与补丁事件分离：只登记复核结论，不触发回写。若匹配到同章的开放缺陷，会把该缺陷
+    移入 ``resolved_items`` 历史并保留关闭依据；重复登记同一事件幂等。
+
+    Args:
+        project_dir: 小说项目根目录（Path 或 str，默认当前目录）
+        chapter: 关联章号
+        issue: 问题陈述（与开放缺陷的 issue 对齐时联动关闭）
+        reason: 关闭原因（必填）
+        source: 关闭来源，``author`` 或 ``expert``
+        silent: 是否静默输出
+
+    Returns:
+        Tuple[int, Path]: (状态码, 审计状态文件路径)；失败时返回 ``(3, Path(""))``
+    """
+    try:
+        p_dir = _resolve_project_dir(project_dir)
+    except (OSError, TypeError, ValueError) as e:
+        _report_api_error(e, silent)
+        return 3, Path("")
+    try:
+        return run_record_issue_closure(
+            project_dir=p_dir,
+            chapter=chapter,
+            issue=issue,
+            reason=reason,
+            source=source,
+            silent=silent,
+        )
+    except (OSError, SafeIOError, TypeError, ValueError) as e:
+        _report_api_error(e, silent)
+        return 3, Path("")
+
+
 __all__ = [
     # 核心纯 Python API
     "audit_chapter",
@@ -2630,6 +3273,13 @@ __all__ = [
     "load_expert_result_records",
     "get_expert_result_store_path",
     "get_expert_summary_path",
+    # F05 版本感知与复审协调入口
+    "get_pending_rechecks",
+    "resolve_recheck",
+    "record_issue_closure",
+    "is_chapter_version_audited",
+    "get_chapter_version",
+    "get_report_history_path",
     # 底层执行管线与别名兼容
     "run_audit",
     "run_scope_audit",
@@ -2639,6 +3289,9 @@ __all__ = [
     "run_apply_fix",
     "run_foreshadowing_adjudication",
     "run_archive_expert_results",
+    "run_get_pending_rechecks",
+    "run_resolve_recheck",
+    "run_record_issue_closure",
     # 预审包与报告生成
     "build_pre_audit_bundle",
     "render_audit_report",
