@@ -20,7 +20,35 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from scripts.expert_results import (
+    EXPERT_STATUS_COMPLETED,
+    EXPERT_STATUS_FAILED,
+    EXPERT_STATUS_NOT_EXECUTED,
+    render_expert_status_table,
+    summarize_expert_records,
+)
+
 STATE_SCHEMA_VERSION = 1
+
+# F03：伏笔显式裁决动作与合法来源。存储层只登记作者或实际审查结果的裁决，
+# 不根据正文标签或规则命中自行判定伏笔是否已回收。
+VALID_FORESHADOWING_ACTIONS = ("confirm", "close", "reopen")
+VALID_FORESHADOWING_SOURCES = ("author", "expert")
+# 已生效裁决状态：命中后条目不得被旧标签或重复扫描重新激活。
+ADJUDICATED_COMMITMENT_STATUSES = (
+    "resolved",
+    "closed",
+    "confirmed",
+    "done",
+    "已确认",
+    "已关闭",
+    "已回收",
+)
+REOPENED_COMMITMENT_STATUS = "reopened"
+
+
+class ForeshadowingAdjudicationError(ValueError):
+    """伏笔裁决无法执行：参数非法或目标条目不存在。"""
 
 
 @dataclass
@@ -282,19 +310,344 @@ def merge_defect_scan(
     state.open_defects = remaining
 
 
+def _commitment_name(item: Any) -> str:
+    if not isinstance(item, dict):
+        return ""
+    return str(item.get("tag") or "").strip()
+
+
+def _commitment_chapter(item: Any) -> Optional[float]:
+    if not isinstance(item, dict):
+        return None
+    chapter = item.get("origin_chapter")
+    if chapter is None or isinstance(chapter, bool):
+        return None
+    try:
+        value = float(chapter)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _matches_chapter_filter(item: Any, chapter: Optional[float]) -> bool:
+    """章号过滤：来源章号未知的条目视为可匹配任意章号。"""
+    if chapter is None:
+        return True
+    item_chapter = _commitment_chapter(item)
+    return item_chapter is None or _same_chapter(item_chapter, chapter)
+
+
+def is_foreshadowing_adjudicated(
+    state: AuditState,
+    name: str,
+    origin_chapter: Optional[float] = None,
+) -> bool:
+    """判断某伏笔是否已有生效的人工裁决（已确认/已关闭）。
+
+    已裁决条目必须压制正文旧标签与重复扫描：同一名称且来源章号一致（或来源未知）时
+    不得重新进入待办池。重新开启会把历史记录状态改为 reopened，从而解除压制。
+    """
+    target = str(name or "").strip()
+    if not target:
+        return False
+    for item in list(state.resolved_items) + list(state.foreshadowing_commitments):
+        if _commitment_name(item) != target:
+            continue
+        status = str(item.get("status") or "").strip().lower()
+        if status not in ADJUDICATED_COMMITMENT_STATUSES:
+            continue
+        if origin_chapter is None:
+            return True
+        if _matches_chapter_filter(item, float(origin_chapter)):
+            return True
+    return False
+
+
+def _find_adjudication_record(
+    state: AuditState,
+    name: str,
+    origin_chapter: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
+    """按名称与来源章号严格匹配历史裁决记录（来源未知的记录视为可匹配）。"""
+    target = str(name or "").strip()
+    for item in reversed(state.resolved_items):
+        if not isinstance(item, dict) or _commitment_name(item) != target:
+            continue
+        if _matches_chapter_filter(item, origin_chapter):
+            return item
+    return None
+
+
+def _latest_adjudication_record(state: AuditState, name: str) -> Optional[Dict[str, Any]]:
+    """取同名伏笔中最近一次登记的历史裁决记录（重新开启时用于回退定位）。"""
+    target = str(name or "").strip()
+    for item in reversed(state.resolved_items):
+        if isinstance(item, dict) and _commitment_name(item) == target:
+            return item
+    return None
+
+
+def _append_adjudication_event(record: Dict[str, Any], event: Dict[str, Any]) -> None:
+    history = record.get("adjudication_history")
+    if not isinstance(history, list):
+        history = []
+    history.append(event)
+    record["adjudication_history"] = history
+
+
+def apply_foreshadowing_adjudication(
+    state: AuditState,
+    name: str,
+    action: str,
+    reason: str,
+    evidence: str = "",
+    source: str = "author",
+    chapter: Optional[float] = None,
+    text_version: Optional[str] = None,
+    at: Optional[str] = None,
+) -> Dict[str, Any]:
+    """执行伏笔显式裁决：confirm 确认回收、close 关闭追踪、reopen 重新开启。
+
+    返回结果字典：changed 为 False 表示幂等空操作；found 为 False 表示目标不存在。
+    全部参数在改动状态前完成校验，非法输入不会留下半成品记录。
+    """
+    if not isinstance(name, str) or not name.strip():
+        raise ForeshadowingAdjudicationError("伏笔名称 (name) 必须为非空字符串")
+    if not isinstance(action, str) or action.strip().lower() not in VALID_FORESHADOWING_ACTIONS:
+        raise ForeshadowingAdjudicationError(
+            "伏笔动作 (action) 必须是 confirm/close/reopen 之一"
+        )
+    if not isinstance(reason, str) or not reason.strip():
+        raise ForeshadowingAdjudicationError("必须提供裁决原因 (reason)，存储层不接受无依据的自动裁决")
+    if not isinstance(source, str) or source.strip().lower() not in VALID_FORESHADOWING_SOURCES:
+        raise ForeshadowingAdjudicationError("裁决来源 (source) 只能是 author 或 expert")
+    if not isinstance(evidence, str):
+        raise ForeshadowingAdjudicationError("裁决证据 (evidence) 必须为字符串")
+    chapter_value: Optional[float] = None
+    if chapter is not None:
+        if isinstance(chapter, bool) or not isinstance(chapter, (int, float)):
+            raise ForeshadowingAdjudicationError("章号 (chapter) 必须为有限非负数值或 None")
+        chapter_value = float(chapter)
+        if not math.isfinite(chapter_value) or chapter_value < 0:
+            raise ForeshadowingAdjudicationError("章号 (chapter) 必须为有限非负数值或 None")
+    if action.strip().lower() == "reopen":
+        if chapter_value is None:
+            raise ForeshadowingAdjudicationError("重新开启必须提供 chapter 以记录正文版本")
+        if not isinstance(text_version, str) or not text_version.strip():
+            raise ForeshadowingAdjudicationError("重新开启必须提供正文版本指纹 (text_version)")
+
+    action = action.strip().lower()
+    source = source.strip().lower()
+    target_name = name.strip()
+    timestamp = at or datetime.now(timezone.utc).isoformat()
+    version = text_version.strip() if isinstance(text_version, str) else ""
+
+    pending_all = [
+        item
+        for item in state.foreshadowing_commitments
+        if isinstance(item, dict) and _commitment_name(item) == target_name
+    ]
+    pending = pending_all
+
+    if action in ("confirm", "close"):
+        status = "resolved" if action == "confirm" else "closed"
+        known_origins: List[float] = []
+        for item in pending:
+            item_chapter = _commitment_chapter(item)
+            if item_chapter is not None and not any(
+                _same_chapter(item_chapter, known) for known in known_origins
+            ):
+                known_origins.append(item_chapter)
+        if len(known_origins) > 1:
+            # 同名伏笔来自多个章号时，必须用 chapter 指定要裁决的来源条目。
+            if chapter_value is None or not any(
+                _same_chapter(known, chapter_value) for known in known_origins
+            ):
+                raise ForeshadowingAdjudicationError(
+                    "同名伏笔存在多个来源章号，请提供 chapter 指定要裁决的条目"
+                )
+            pending = [
+                item
+                for item in pending
+                if _commitment_chapter(item) is None
+                or _same_chapter(_commitment_chapter(item), chapter_value)
+            ]
+        origin: Optional[float] = next(
+            (
+                item_chapter
+                for item_chapter in (_commitment_chapter(item) for item in pending)
+                if item_chapter is not None
+            ),
+            chapter_value,
+        )
+
+        record = _find_adjudication_record(state, target_name, origin)
+        if not pending:
+            # 已经登记过同名裁决时，重复确认/关闭一律幂等返回，不重复写历史。
+            existing_record = record or _latest_adjudication_record(state, target_name)
+            if existing_record is not None:
+                # 重复确认/关闭：幂等空操作，不重复计数、不重复写历史、不改写状态文件。
+                return {
+                    "name": target_name,
+                    "action": action,
+                    "changed": False,
+                    "found": True,
+                    "idempotent": True,
+                    "removed": 0,
+                    "record": existing_record,
+                }
+            # 作者或实际审查结果可以对尚未登记的伏笔直接裁决；依据与来源必须完整。
+            record = {
+                "tag": target_name,
+                "origin_chapter": origin,
+                "status": status,
+                "note": "人工裁决关闭追踪，未发现正文标签登记。",
+            }
+            state.resolved_items.append(record)
+            created = True
+        else:
+            created = record is None
+            if record is None:
+                record = {
+                    "tag": target_name,
+                    "origin_chapter": origin,
+                    "status": status,
+                    "note": str(pending[0].get("note") or "").strip()
+                    or "人工裁决关闭追踪。",
+                }
+                state.resolved_items.append(record)
+
+        event = {
+            "action": action,
+            "at": timestamp,
+            "reason": reason.strip(),
+            "source": source,
+            "evidence": evidence.strip(),
+            "chapter": chapter_value,
+            "text_version": version,
+        }
+        _append_adjudication_event(record, event)
+        record["tag"] = target_name
+        if record.get("origin_chapter") is None and origin is not None:
+            record["origin_chapter"] = origin
+        record["status"] = status
+        record["adjudicated_at"] = timestamp
+        record["resolution_source"] = source
+        record["resolution_reason"] = reason.strip()
+        record["resolution_evidence"] = evidence.strip()
+        if version:
+            record["text_version"] = version
+        state.foreshadowing_commitments = [
+            item for item in state.foreshadowing_commitments if item not in pending
+        ]
+        return {
+            "name": target_name,
+            "action": action,
+            "changed": True,
+            "found": True,
+            "idempotent": False,
+            "created": created,
+            "removed": len(pending),
+            "record": record,
+        }
+
+    # action == "reopen"
+    record = _find_adjudication_record(state, target_name, chapter_value)
+    if record is None:
+        # 来源章号与本次关联章号不同（例如按新章节线索重新开启）时回退到最近一次裁决记录。
+        record = _latest_adjudication_record(state, target_name)
+    if record is None:
+        return {
+            "name": target_name,
+            "action": action,
+            "changed": False,
+            "found": False,
+            "idempotent": False,
+            "removed": 0,
+            "record": None,
+        }
+    already_pending = bool(pending_all)
+    if already_pending and record.get("status") == REOPENED_COMMITMENT_STATUS:
+        return {
+            "name": target_name,
+            "action": action,
+            "changed": False,
+            "found": True,
+            "idempotent": True,
+            "removed": 0,
+            "record": record,
+        }
+
+    event = {
+        "action": "reopen",
+        "at": timestamp,
+        "reason": reason.strip(),
+        "source": source,
+        "evidence": evidence.strip(),
+        "chapter": chapter_value,
+        "text_version": version,
+    }
+    _append_adjudication_event(record, event)
+    record["status"] = REOPENED_COMMITMENT_STATUS
+    record["reopened_at"] = timestamp
+    record["reopen_reason"] = reason.strip()
+    record["reopen_source"] = source
+    record["reopen_chapter"] = chapter_value
+    record["reopen_text_version"] = version
+
+    if not already_pending:
+        origin = _commitment_chapter(record)
+        history = record.get("adjudication_history")
+        state.foreshadowing_commitments.append(
+            {
+                "tag": target_name,
+                "origin_chapter": origin,
+                "status": "pending",
+                "note": str(record.get("note") or "").strip() or "人工裁决重新开启追踪。",
+                "reopened_at": timestamp,
+                "reopen_reason": reason.strip(),
+                "reopen_source": source,
+                "reopen_chapter": chapter_value,
+                "reopen_text_version": version,
+                "adjudication_history": list(history) if isinstance(history, list) else [],
+            }
+        )
+    return {
+        "name": target_name,
+        "action": action,
+        "changed": True,
+        "found": True,
+        "idempotent": False,
+        "removed": 0,
+        "record": record,
+    }
+
+
 def render_inherited_items_section(inherited: Dict[str, Any]) -> str:
     """渲染 Markdown 格式的跨批因果继承栏目"""
     defects = inherited.get("open_defects", [])
     commitments = inherited.get("foreshadowing_commitments", [])
+    expert_results = inherited.get("expert_results", []) or []
     last_scope = inherited.get("last_scope") or "无"
 
+    header = (
+        f"> 承接前序批次：`{last_scope}` | 继承开放缺陷：{len(defects)} 项 "
+        f"| 监控中伏笔：{len(commitments)} 个"
+    )
+    if expert_results:
+        counts = summarize_expert_records(expert_results)
+        header += (
+            f" | 专家结果：完成 {counts[EXPERT_STATUS_COMPLETED]} / "
+            f"失败 {counts[EXPERT_STATUS_FAILED]} / "
+            f"未执行 {counts[EXPERT_STATUS_NOT_EXECUTED]}"
+        )
     lines = [
         "## 🔄 跨批因果继承与未解决缺陷 (Inherited Items)",
-        f"> 承接前序批次：`{last_scope}` | 继承开放缺陷：{len(defects)} 项 | 监控中伏笔：{len(commitments)} 个",
+        header,
         "",
     ]
 
-    if not defects and not commitments:
+    if not defects and not commitments and not expert_results:
         lines.append("无已记录的开放缺陷或伏笔承诺；未执行语义核验。\n")
         return "\n".join(lines)
 
@@ -322,6 +675,11 @@ def render_inherited_items_section(inherited: Dict[str, Any]) -> str:
             st = c.get("status", "pending")
             note = c.get("note", "待后文呼应")
             lines.append(f"| {tag} | {origin_text} | {st} | {note} |")
+        lines.append("")
+
+    if expert_results:
+        lines.append("### 🧑‍🔬 专家执行状态 (Expert Execution Status)")
+        lines.extend(render_expert_status_table(expert_results))
         lines.append("")
 
     return "\n".join(lines)

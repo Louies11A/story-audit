@@ -16,7 +16,7 @@ import os
 import re
 import sys
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -57,13 +57,30 @@ from scripts.runtime_detector import VALID_MODES, detect_runtime, is_subagent_co
 from scripts.platform_rubrics import evaluate_platform_rubric, VALID_PLATFORMS
 from scripts.audit_state import (
     AuditState,
+    VALID_FORESHADOWING_ACTIONS,
+    VALID_FORESHADOWING_SOURCES,
+    apply_foreshadowing_adjudication,
     get_audit_state_path,
+    is_foreshadowing_adjudicated,
     load_audit_state,
     save_audit_state,
     get_inherited_items,
     make_defect_id,
     merge_defect_scan,
     render_inherited_items_section,
+)
+from scripts.expert_results import (
+    EXPERT_STATUS_COMPLETED,
+    ExpertResult,
+    STORE_SCHEMA_VERSION,
+    build_expert_result_record,
+    compute_text_fingerprint,
+    expert_result_summary_entries,
+    get_expert_result_store_path,
+    get_expert_summary_path,
+    load_expert_result_records,
+    merge_expert_result_records,
+    render_expert_summary_markdown,
 )
 from scripts.types import BoundaryContext, ChapterItem, Finding, FormatFinding, PatchSpec, format_factual_fix
 
@@ -545,7 +562,11 @@ def render_audit_report(
         ])
 
     # 跨批因果继承与开放缺陷
-    if inherited_items and (inherited_items.get("open_defects") or inherited_items.get("foreshadowing_commitments")):
+    if inherited_items and (
+        inherited_items.get("open_defects")
+        or inherited_items.get("foreshadowing_commitments")
+        or inherited_items.get("expert_results")
+    ):
         lines.extend([
             "",
             "---",
@@ -709,18 +730,37 @@ def _collect_foreshadowing_commitments(stash: List[Dict[str, Any]]) -> List[Dict
 
 
 def _merge_foreshadowing_commitments(state: AuditState, commitments: List[Dict[str, Any]]) -> None:
-    """按标签与来源去重，保留手工承诺和已解决记录，不自行判断回收。"""
-    def key(item: Dict[str, Any]) -> Tuple[str, Optional[float], str]:
-        chapter = item.get("origin_chapter")
-        return (item.get("tag", ""), float(chapter) if chapter is not None else None,
-                item.get("note", "") if chapter is None else "")
+    """按标签与来源去重合并承诺，不自行判断剧情是否已回收。
 
-    known = {key(item) for item in state.foreshadowing_commitments + state.resolved_items}
+    已关闭/已确认（含重新开启后的历史记录）的人工裁决优先于正文标签：旧标签与重复扫描
+    都不能重新激活已裁决条目，只有显式的 reopen 动作能把条目放回待办池。
+    """
+    def key(item: Dict[str, Any]) -> Tuple[str, str]:
+        chapter = item.get("origin_chapter")
+        try:
+            chapter_key = f"{float(chapter):g}" if chapter is not None else ""
+        except (TypeError, ValueError, OverflowError):
+            chapter_key = str(chapter)
+        return (str(item.get("tag", "")).strip(), chapter_key)
+
+    known = {
+        key(item)
+        for item in state.foreshadowing_commitments
+        if isinstance(item, dict)
+    }
     for item in commitments:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("tag", "")).strip()
+        if not name:
+            continue
         item_key = key(item)
-        if item_key not in known:
-            known.add(item_key)
-            state.foreshadowing_commitments.append(dict(item))
+        if item_key in known:
+            continue
+        if is_foreshadowing_adjudicated(state, name, item.get("origin_chapter")):
+            continue
+        known.add(item_key)
+        state.foreshadowing_commitments.append(dict(item))
 
 
 def run_audit(
@@ -962,7 +1002,15 @@ def run_audit(
         text_versions=chapter_text_versions,
     )
     _merge_foreshadowing_commitments(audit_state, foreshadowing_commitments)
-    inherited_items = get_inherited_items(audit_state)
+    try:
+        # 已归档的专家执行状态随继承栏目进入报告与预审包。
+        inherited_items = _attach_expert_summaries(
+            get_inherited_items(audit_state), reports_dir
+        )
+    except Exception as e:
+        if not silent:
+            print(f"[错误] 读取专家结果归档失败: {e}", file=sys.stderr)
+        return 3
 
     # 10.5 构建预审包（问题列表与合并后的持久状态一致）
     bundle = build_pre_audit_bundle(
@@ -1373,7 +1421,11 @@ def render_scope_batch_summary(
         "",
     ]
 
-    if inherited_items and (inherited_items.get("open_defects") or inherited_items.get("foreshadowing_commitments")):
+    if inherited_items and (
+        inherited_items.get("open_defects")
+        or inherited_items.get("foreshadowing_commitments")
+        or inherited_items.get("expert_results")
+    ):
         lines.append(render_inherited_items_section(inherited_items))
         lines.extend(["", "---", ""])
 
@@ -1652,7 +1704,9 @@ def run_scope_audit(
         fallback_reason=fallback_reason,
         platform=platform,
         run_id=run_id,
-        inherited_items=get_inherited_items(audit_state),
+        inherited_items=_attach_expert_summaries(
+            get_inherited_items(audit_state), reports_dir
+        ),
     )
 
     scope_clean = scope_str.replace(" ", "")
@@ -1812,6 +1866,326 @@ def run_apply_fix(
         if not silent:
             safe_console_print(f"[系统异常] 安全回写失败: {e}", file=sys.stderr)
         return 3
+
+
+def run_foreshadowing_adjudication(
+    project_dir: Path,
+    name: str,
+    action: str,
+    reason: str,
+    evidence: str = "",
+    source: str = "author",
+    chapter: Optional[float] = None,
+    silent: bool = False,
+) -> Tuple[int, Path]:
+    """执行伏笔显式裁决管线：确认、关闭或重新开启，并登记可追溯历史。"""
+    try:
+        _validate_boolean_options(silent=silent)
+        _validate_chapter_index(chapter)
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("伏笔名称 (name) 必须为非空字符串")
+        if not isinstance(action, str) or action.strip().lower() not in VALID_FORESHADOWING_ACTIONS:
+            raise ValueError("伏笔动作 (action) 必须是 confirm/close/reopen 之一")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("必须提供裁决原因 (reason)")
+        if not isinstance(evidence, str):
+            raise ValueError("裁决证据 (evidence) 必须为字符串")
+        if not isinstance(source, str) or source.strip().lower() not in VALID_FORESHADOWING_SOURCES:
+            raise ValueError("裁决来源 (source) 只能是 author 或 expert")
+    except ValueError as e:
+        _report_api_error(e, silent)
+        return 3, Path("")
+
+    reports_dir = project_dir / "reports"
+    try:
+        audit_state = load_audit_state(reports_dir)
+    except Exception as e:
+        if not silent:
+            safe_console_print(f"[错误] 读取持久化状态失败: {e}", file=sys.stderr)
+        return 3, Path("")
+
+    text_version = ""
+    if chapter is not None:
+        try:
+            chapters = ChapterResolver().discover_chapters(project_dir)
+            target_chapter = _select_unique_chapter(chapters, chapter)
+        except (OSError, ValueError) as e:
+            _report_api_error(e, silent)
+            return 3, Path("")
+        if target_chapter is None:
+            if not silent:
+                safe_console_print(
+                    f"[错误] 未找到第 {chapter:g} 章正文，无法登记裁决正文版本。", file=sys.stderr
+                )
+            return 3, Path("")
+        try:
+            chapter_text, _, _ = read_file_safe(target_chapter.path)
+        except Exception as e:
+            if not silent:
+                safe_console_print(
+                    f"[错误] 读取章节失败: {target_chapter.path}, {e}", file=sys.stderr
+                )
+            return 3, Path("")
+        text_version = _text_content_version(chapter_text)
+
+    try:
+        outcome = apply_foreshadowing_adjudication(
+            audit_state,
+            name=name,
+            action=action,
+            reason=reason,
+            evidence=evidence,
+            source=source,
+            chapter=chapter,
+            text_version=text_version,
+        )
+    except ValueError as e:
+        _report_api_error(e, silent)
+        return 3, Path("")
+
+    if not outcome.get("changed"):
+        if not outcome.get("found", True):
+            if not silent:
+                safe_console_print(
+                    f"[错误] 未找到可裁决的伏笔「{name}」历史记录，无法重新开启。",
+                    file=sys.stderr,
+                )
+            return 3, Path("")
+        return 0, get_audit_state_path(reports_dir)
+
+    try:
+        state_path = save_audit_state(audit_state, reports_dir)
+    except Exception as e:
+        if not silent:
+            safe_console_print(f"[错误] 保存伏笔裁决失败: {e}", file=sys.stderr)
+        return 3, Path("")
+    if not silent:
+        safe_console_print(
+            f"成功登记伏笔裁决：{name} -> {outcome.get('action')}，历史已写入 {state_path}"
+        )
+    return 0, state_path
+
+
+def _load_scope_chapter_texts(
+    project_dir: Path,
+    results: List[ExpertResult],
+) -> List[Dict[float, Optional[str]]]:
+    """按专家结果范围读取当前正文文本；章号歧义直接报错，缺失章号记为 None。"""
+    chapters = ChapterResolver().discover_chapters(project_dir)
+    if not chapters:
+        raise ValueError("未发现任何章节文件，无法核对专家结果正文指纹")
+    cache: Dict[float, Optional[str]] = {}
+
+    def current_text(chapter: float) -> Optional[str]:
+        key = round(float(chapter), 6)
+        if key not in cache:
+            target = _select_unique_chapter(chapters, chapter)
+            if target is None:
+                cache[key] = None
+            else:
+                text, _, _ = read_file_safe(target.path)
+                cache[key] = text
+        return cache[key]
+
+    scoped: List[Dict[float, Optional[str]]] = []
+    for result in results:
+        texts: Dict[float, Optional[str]] = {}
+        for chapter in result.chapters:
+            value = float(chapter)
+            texts[value] = current_text(value)
+        scoped.append(texts)
+    return scoped
+
+
+def _merge_expert_defects(
+    audit_state: AuditState,
+    records: List[Dict[str, Any]],
+    platform: str,
+) -> int:
+    """把未过期、已完成专家结果的 P0/P1 发现写入持久开放缺陷（专家来源）。"""
+    existing_ids = {
+        str(item.get("id"))
+        for item in audit_state.open_defects
+        if isinstance(item, dict) and item.get("id")
+    }
+    added = 0
+    for record in records:
+        if not isinstance(record, dict) or record.get("status") != EXPERT_STATUS_COMPLETED:
+            continue
+        if record.get("stale"):
+            # 过期结果不得覆盖当前裁决。
+            continue
+        chapters = record.get("chapters") or []
+        if not chapters:
+            continue
+        chapter = float(chapters[0])
+        for finding in record.get("findings") or []:
+            if not isinstance(finding, dict):
+                continue
+            severity = str(finding.get("severity") or "")
+            if severity not in ("P0", "P1"):
+                continue
+            issue = str(finding.get("issue") or "")
+            defect_id = make_defect_id(
+                "expert", str(record.get("expert") or ""), platform, chapter, issue
+            )
+            if defect_id in existing_ids:
+                continue
+            existing_ids.add(defect_id)
+            audit_state.open_defects.append({
+                "id": defect_id,
+                "chapter": chapter,
+                "severity": severity,
+                "category": str(finding.get("category") or "consistency"),
+                "location": str(finding.get("location") or record.get("scope") or ""),
+                "evidence": str(finding.get("evidence") or ""),
+                "issue": issue,
+                "fix": str(finding.get("fix") or ""),
+                "line_number": finding.get("line_number"),
+                "flaw_type": finding.get("flaw_type"),
+                "source": "expert",
+                "checker": f"expert:{record.get('expert') or ''}",
+                "platform": platform,
+                "status": "open",
+                "expert": str(record.get("expert") or ""),
+                "expert_result_id": str(record.get("id") or ""),
+                "scope": str(record.get("scope") or ""),
+                "text_version": str(record.get("text_fingerprint") or ""),
+            })
+            added += 1
+    return added
+
+
+def _attach_expert_summaries(
+    inherited_items: Dict[str, Any],
+    reports_dir: Path,
+) -> Dict[str, Any]:
+    """把已归档的专家执行状态挂入继承栏目，供报告与预审包呈现。"""
+    records = load_expert_result_records(get_expert_result_store_path(reports_dir))
+    if not records:
+        return inherited_items
+    attached = dict(inherited_items or {})
+    attached["expert_results"] = expert_result_summary_entries(records)
+    return attached
+
+
+def _coerce_expert_result(raw: Any) -> ExpertResult:
+    if isinstance(raw, ExpertResult):
+        return raw
+    if isinstance(raw, dict):
+        return ExpertResult.from_dict(raw)
+    raise ValueError("专家结果必须是 ExpertResult 实例或字段字典")
+
+
+def run_archive_expert_results(
+    project_dir: Path,
+    results: Any,
+    platform: str = "generic",
+    silent: bool = False,
+) -> Tuple[int, Path]:
+    """接收宿主实际执行的专家结果，幂等归档并渲染 Markdown 汇总。"""
+    try:
+        _validate_boolean_options(silent=silent)
+        platform, _, _ = _normalize_audit_options(platform, "solo", "auto")
+    except ValueError as e:
+        _report_api_error(e, silent)
+        return 3, Path("")
+
+    if isinstance(results, (str, bytes, bytearray)) or not isinstance(results, (list, tuple)):
+        _report_api_error(ValueError("results 必须是专家结果列表"), silent)
+        return 3, Path("")
+    if not results:
+        _report_api_error(
+            ValueError("results 不能为空：底层只接收宿主实际执行的专家结果"), silent
+        )
+        return 3, Path("")
+    try:
+        parsed = [_coerce_expert_result(item) for item in results]
+    except ValueError as e:
+        _report_api_error(e, silent)
+        return 3, Path("")
+
+    reports_dir = project_dir / "reports"
+    store_path = get_expert_result_store_path(reports_dir)
+    summary_path = get_expert_summary_path(reports_dir)
+    try:
+        existing_records = load_expert_result_records(store_path)
+        scoped_texts = _load_scope_chapter_texts(project_dir, parsed)
+    except (OSError, ValueError) as e:
+        _report_api_error(e, silent)
+        return 3, Path("")
+
+    timestamp = datetime.now(timezone.utc).isoformat()
+    incoming: List[Dict[str, Any]] = []
+    for result, texts in zip(parsed, scoped_texts):
+        missing = any(text is None for text in texts.values())
+        current_fingerprint = ""
+        if not missing:
+            current_fingerprint = compute_text_fingerprint(
+                {chapter: text for chapter, text in texts.items()}
+            )
+        stale = False
+        stale_reason = ""
+        if result.text_fingerprint:
+            if missing:
+                stale, stale_reason = True, "无法读取该范围的正文文件，无法核对指纹"
+            elif current_fingerprint != result.text_fingerprint:
+                stale, stale_reason = True, "正文指纹与当前章节不一致"
+        incoming.append(
+            build_expert_result_record(
+                result,
+                current_fingerprint=current_fingerprint,
+                stale=stale,
+                stale_reason=stale_reason,
+                platform=platform,
+                recorded_at=timestamp,
+            )
+        )
+
+    try:
+        merged_records, record_changes = merge_expert_result_records(existing_records, incoming)
+    except ValueError as e:
+        _report_api_error(e, silent)
+        return 3, Path("")
+
+    try:
+        audit_state = load_audit_state(reports_dir)
+    except Exception as e:
+        _report_api_error(e, silent)
+        return 3, Path("")
+    defect_changes = _merge_expert_defects(audit_state, incoming, platform)
+
+    if not record_changes and not defect_changes:
+        # 幂等：重复提交不重复计数，也不重写任何产物或状态。
+        return 0, summary_path
+
+    store_content = json.dumps(
+        {
+            "schema_version": STORE_SCHEMA_VERSION,
+            "generated_at": timestamp,
+            "results": merged_records,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    summary_content = render_expert_summary_markdown(merged_records, generated_at=timestamp)
+    staged_writes = {store_path: store_content, summary_path: summary_content}
+    state_path = get_audit_state_path(reports_dir)
+    original_state = _read_optional_bytes(state_path)
+    original_artifacts = {path: _read_optional_bytes(path) for path in staged_writes}
+    try:
+        save_audit_state(audit_state, reports_dir)
+        _flush_staged_writes_with_rollback(
+            staged_writes, state_path, original_state, original_artifacts
+        )
+    except Exception as e:
+        if not silent:
+            safe_console_print(f"[错误] 专家结果归档失败: {e}", file=sys.stderr)
+        return 3, Path("")
+    if not silent:
+        safe_console_print(f"专家结果 JSON 归档已写入：{store_path}")
+        safe_console_print(f"专家结果汇总报告已写入：{summary_path}")
+    return 0, summary_path
 
 
 def audit_chapter(
@@ -2079,6 +2453,93 @@ def apply_fix(
         return 3
 
 
+def adjudicate_foreshadowing(
+    project_dir: Union[str, Path] = ".",
+    name: str = "",
+    action: str = "",
+    reason: str = "",
+    evidence: str = "",
+    source: str = "author",
+    chapter: Optional[float] = None,
+    silent: bool = False,
+) -> Tuple[int, Path]:
+    """伏笔显式确认 / 关闭 / 重新开启纯 Python API
+
+    受控裁决入口：只登记作者或实际专家审查结果给出的裁决，存储层不自行判断剧情是否已回收。
+
+    Args:
+        project_dir: 小说项目根目录（Path 或 str，默认当前目录）
+        name: 伏笔标签名称（对应正文 ``audit:stash`` 标签的 name）
+        action: 裁决动作，``confirm``（确认已回收）/``close``（关闭追踪）/``reopen``（重新开启）
+        reason: 裁决原因（必填，用于历史追溯）
+        evidence: 裁决证据（原文切片或审查结论摘要，可选）
+        source: 裁决来源，``author`` 或 ``expert``
+        chapter: 关联章号；``reopen`` 必填，用于登记当时的正文版本指纹
+        silent: 是否静默输出
+
+    Returns:
+        Tuple[int, Path]: (状态码, 审计状态文件路径)；参数非法、目标缺失或写入失败时返回 ``(3, Path(""))``
+    """
+    try:
+        p_dir = _resolve_project_dir(project_dir)
+    except (OSError, TypeError, ValueError) as e:
+        _report_api_error(e, silent)
+        return 3, Path("")
+    try:
+        return run_foreshadowing_adjudication(
+            project_dir=p_dir,
+            name=name,
+            action=action,
+            reason=reason,
+            evidence=evidence,
+            source=source,
+            chapter=chapter,
+            silent=silent,
+        )
+    except (OSError, SafeIOError, TypeError, ValueError) as e:
+        _report_api_error(e, silent)
+        return 3, Path("")
+
+
+def archive_expert_results(
+    project_dir: Union[str, Path] = ".",
+    results: Optional[Any] = None,
+    platform: str = "generic",
+    silent: bool = False,
+) -> Tuple[int, Path]:
+    """专家执行结果汇总归档纯 Python API
+
+    只接收宿主实际执行的专家结果：按“专家 + 范围 + 正文指纹 + 发现身份”幂等归档，
+    写入 ``reports/专家审查/expert_results.json`` 与 ``EXPERT_SUMMARY.md``，
+    并把未过期、已完成专家结果的 P0/P1 发现并入持久开放缺陷（source=expert）。
+    指纹与当前正文不一致的结果会被标记为过期，不参与当前裁决；未执行的审查不会被标记为完成。
+
+    Args:
+        project_dir: 小说项目根目录（Path 或 str，默认当前目录）
+        results: ``ExpertResult`` 实例或字段字典组成的列表（至少一条）
+        platform: 本次审查对应的平台卡尺（fanqie/qidian/zhihu/generic）
+        silent: 是否静默输出
+
+    Returns:
+        Tuple[int, Path]: (状态码, 专家结果 Markdown 汇总路径)；失败时返回 ``(3, Path(""))``
+    """
+    try:
+        p_dir = _resolve_project_dir(project_dir)
+    except (OSError, TypeError, ValueError) as e:
+        _report_api_error(e, silent)
+        return 3, Path("")
+    try:
+        return run_archive_expert_results(
+            project_dir=p_dir,
+            results=results,
+            platform=platform,
+            silent=silent,
+        )
+    except (OSError, SafeIOError, TypeError, ValueError) as e:
+        _report_api_error(e, silent)
+        return 3, Path("")
+
+
 __all__ = [
     # 核心纯 Python API
     "audit_chapter",
@@ -2087,6 +2548,14 @@ __all__ = [
     "checkpoint_volume",
     "sync_ledger_from_md",
     "apply_fix",
+    # F03/F04 新增受控入口
+    "adjudicate_foreshadowing",
+    "archive_expert_results",
+    "ExpertResult",
+    "compute_text_fingerprint",
+    "load_expert_result_records",
+    "get_expert_result_store_path",
+    "get_expert_summary_path",
     # 底层执行管线与别名兼容
     "run_audit",
     "run_scope_audit",
@@ -2094,6 +2563,8 @@ __all__ = [
     "run_sync_from_md",
     "run_init_mode",
     "run_apply_fix",
+    "run_foreshadowing_adjudication",
+    "run_archive_expert_results",
     # 预审包与报告生成
     "build_pre_audit_bundle",
     "render_audit_report",
