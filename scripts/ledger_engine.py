@@ -122,6 +122,10 @@ HEURISTIC_CONSUMPTION_VERBS: Set[str] = {
     "消耗", "用掉", "用去", "耗费", "花费", "支付", "失去", "损失", "损坏",
     "焚毁", "烧毁", "服用", "吃掉", "扣除", "支出", "耗尽", "报销",
 }
+# 余额陈述动词：这类句子只是复述当前余额，不是变更事件，预览直接排除。
+HEURISTIC_BALANCE_VERBS: Set[str] = {
+    "剩余", "还剩", "只剩", "仅剩", "尚余", "余额", "结余", "余下", "余量", "所剩",
+}
 
 class LedgerDirtyError(Exception):
     """防脏写拦截器异常：Markdown 编辑时间晚于 JSON 数据源"""
@@ -312,17 +316,22 @@ class LedgerState:
             raise ValueError("账本 asset_events 必须为对象列表")
         for event in raw_events:
             for text_key in (
-                "event_id", "name", "owner", "current_holder", "category", "unit",
+                "event_id", "supplied_event_id", "name", "owner", "current_holder", "category", "unit",
                 "direction", "evidence", "decision", "source", "reason", "decided_at",
             ):
                 if text_key in event and not isinstance(event[text_key], str):
                     raise ValueError(f"资产事件 {text_key} 必须为字符串")
-            for num_key in ("chapter", "quantity", "line_number", "column", "quantity_before", "quantity_after"):
+            for num_key in (
+                "chapter", "quantity", "line_number", "column",
+                "quantity_before", "quantity_after", "actual_quantity",
+            ):
                 value = event.get(num_key)
                 if value is None:
                     continue
                 if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
                     raise ValueError(f"资产事件 {num_key} 必须为有限数值或 null")
+            if "over_consume" in event and not isinstance(event["over_consume"], bool):
+                raise ValueError("资产事件 over_consume 必须为布尔值")
         for item in stash:
             for text_key in ("name", "origin", "status"):
                 if text_key in item and not isinstance(item[text_key], str):
@@ -687,6 +696,12 @@ def extract_heuristic_asset_changes(
 
     预览只做启发式标注：数量 + 单位 + 物资名称同现时给出候选，方向由同一小句内的
     消耗动词判定；是否属于真实变更始终由宿主或作者裁决，本函数不会改动账本。
+
+    已知边界（使用方必须逐条复核）：
+    1. 余额陈述（剩余/还剩/只剩/余额等）只复述现状，预览直接排除，不产出候选；
+    2. 消耗动词出现在数量之后（如“灵石消耗 2 枚”“他花掉灵石 2 枚”）时，方向可能被
+       判为 gain，需要宿主人工纠正或改用宿主自建事件；
+    3. 归属所有者无法从正文可靠推断，默认取传入的 owner（缺省“主角”）。
     """
     if not text:
         return []
@@ -718,6 +733,9 @@ def extract_heuristic_asset_changes(
             # 方向判定只看同一小句前缀，避免“先获得后消耗”整行串味。
             segment_start = max(line.rfind(delimiter, 0, match.start()) for delimiter in "，,。！？；;、") + 1
             prefix = line[segment_start:match.start()]
+            if any(verb in prefix for verb in HEURISTIC_BALANCE_VERBS):
+                # 余额陈述只复述现状，不是获取或消耗事件。
+                continue
             direction = "consume" if any(verb in prefix for verb in HEURISTIC_CONSUMPTION_VERBS) else "gain"
             results.append({
                 "event_id": make_asset_event_id(
@@ -892,6 +910,13 @@ def _parse_constraints(c_str: str) -> Dict[str, Any]:
     return res
 
 
+def _md_cell(value: Any) -> str:
+    """Markdown 表格单元格取值：转义竖线与换行，避免破坏表格结构。"""
+    text = "" if value is None else str(value)
+    text = text.replace("|", "｜").replace("\r", " ").replace("\n", " ").strip()
+    return text or "-"
+
+
 def render_ledger_markdown(state: LedgerState) -> str:
     """冷热资产分层渲染 Markdown 账本文档
 
@@ -963,6 +988,39 @@ def render_ledger_markdown(state: LedgerState) -> str:
             s_origin = stash.get("origin", "-") or "-"
             s_status = stash.get("status", "-") or "-"
             lines.append(f"| {s_name} | {s_origin} | {s_status} |")
+        lines.append("")
+        lines.append("</details>")
+
+    if state.asset_events:
+        # F06/F08：裁决流水小节。表头刻意不含“资产ID/名称+数量”，避免被
+        # sync_from_markdown 误判为资产表；完整字段仍以 JSON 为准。
+        lines.append("")
+        lines.append("<details>")
+        lines.append("<summary>裁决流水（候选变更确认记录）</summary>")
+        lines.append("")
+        lines.append("| 事件ID | 裁决 | 方向 | 申请数量 | 实际变动 | 章号 | 行号 | 来源 | 理由 | 裁决时间 |")
+        lines.append("| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
+        for event in state.asset_events:
+            direction = "获取" if event.get("direction") == "gain" else "消耗"
+            decision = "接受" if event.get("decision") == "accept" else "否决"
+            actual = event.get("actual_quantity")
+            actual_text = "-" if actual is None else str(actual)
+            if event.get("over_consume"):
+                actual_text += "（超扣钳制）"
+            lines.append(
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |".format(
+                    _md_cell(event.get("event_id")),
+                    decision,
+                    direction,
+                    _md_cell(event.get("quantity")),
+                    _md_cell(actual_text),
+                    _md_cell(event.get("chapter")),
+                    _md_cell(event.get("line_number")),
+                    _md_cell(event.get("source")),
+                    _md_cell(event.get("reason")),
+                    _md_cell(event.get("decided_at")),
+                )
+            )
         lines.append("")
         lines.append("</details>")
 

@@ -426,6 +426,120 @@ def test_f06_confirm_rejects_dirty_markdown_without_side_effects(project):
     assert _snapshot(project) == before
 
 
+def test_a1_owner_override_recomputes_event_identity(project):
+    """A1：owner 覆盖后事件编号按 (名称, 所有者) 重算，不得出现静默 no-op。"""
+    candidate = _preview(project, chapter_index=1)["candidates"][0]
+    assert story_audit.confirm_asset_event(
+        project,
+        event=candidate,
+        decision="accept",
+        owner="配角",
+        reason="作者确认配角获得",
+        silent=True,
+    )[0] == 0
+    state, _ = _ledger(project)
+    assert _asset_by_identity(state, "灵石", "配角")["quantity"] == 5
+    event = state["asset_events"][0]
+    assert event["owner"] == "配角"
+    assert event["event_id"] != candidate["event_id"]
+    assert event["supplied_event_id"] == candidate["event_id"]
+
+    # 再以同一候选按主角提交：必须真正入账，而不是命中配角的幂等。
+    before = _snapshot(project)
+    assert story_audit.confirm_asset_event(
+        project, event=candidate, decision="accept", reason="作者确认主角获得", silent=True
+    )[0] == 0
+    assert _snapshot(project) != before
+    state, _ = _ledger(project)
+    assert _asset_by_identity(state, "灵石", "主角")["quantity"] == 5
+    assert _asset_by_identity(state, "灵石", "配角")["quantity"] == 5
+    assert len(state["asset_events"]) == 2
+
+    # 按主角重复提交仍幂等
+    before = _snapshot(project)
+    assert story_audit.confirm_asset_event(
+        project, event=candidate, decision="accept", reason="作者确认主角获得", silent=True
+    )[0] == 0
+    assert _snapshot(project) == before
+
+
+def test_a2_over_consume_records_actual_quantity_and_flag(project):
+    """A2：越界消耗被钳制时，事件流水必须记录实际扣减量与 over_consume。"""
+    gain = _host_event("聚气丹", "主角", "gain", 2, unit="枚")
+    assert story_audit.confirm_asset_event(
+        project, event=gain, decision="accept", reason="作者确认获得", silent=True
+    )[0] == 0
+    consume = _host_event("聚气丹", "主角", "consume", 5, unit="枚", chapter=2.0)
+    assert story_audit.confirm_asset_event(
+        project, event=consume, decision="accept", reason="作者确认服用", silent=True
+    )[0] == 0
+
+    state, _ = _ledger(project)
+    asset = _asset_by_identity(state, "聚气丹", "主角")
+    assert asset["quantity"] == 0
+    event = state["asset_events"][-1]
+    assert event["quantity"] == 5
+    assert event["quantity_before"] == 2 and event["quantity_after"] == 0
+    assert event["actual_quantity"] == 2
+    assert event["over_consume"] is True
+    assert state["asset_events"][0]["over_consume"] is False
+
+    # 事件求和与账面一致：2 获得 - 2 实际扣减 = 0
+    applied = sum(
+        item["actual_quantity"] if item["direction"] == "gain" else -item["actual_quantity"]
+        for item in state["asset_events"]
+        if item["decision"] == "accept"
+    )
+    assert applied == asset["quantity"] == 0
+
+
+def test_a3_ledger_markdown_renders_decision_log_and_round_trips(project):
+    """A3：账本 Markdown 渲染裁决流水，且 sync_ledger_from_md 往返不丢事件。"""
+    gain = _host_event("聚气丹", "主角", "gain", 2, unit="枚")
+    assert story_audit.confirm_asset_event(
+        project, event=gain, decision="accept", reason="作者确认获得", silent=True
+    )[0] == 0
+    consume = _host_event("聚气丹", "主角", "consume", 5, unit="枚", chapter=2.0)
+    assert story_audit.confirm_asset_event(
+        project, event=consume, decision="accept", reason="作者确认服用", silent=True
+    )[0] == 0
+    _, md_path = story_audit.locate_ledger_paths(project)
+    ledger_md = md_path.read_text(encoding="utf-8")
+    state, _ = _ledger(project)
+    assert "裁决流水" in ledger_md
+    for event in state["asset_events"]:
+        assert event["event_id"] in ledger_md
+    assert "实际变动" in ledger_md
+    assert "超扣钳制" in ledger_md
+    assert "作者确认服用" in ledger_md
+
+    before_events = state["asset_events"]
+    assert story_audit.sync_ledger_from_md(project, silent=True) == 0
+    reloaded, _ = _ledger(project)
+    assert reloaded["asset_events"] == before_events
+    assert _asset_by_identity(reloaded, "聚气丹", "主角")["quantity"] == 0
+    # 往返后 Markdown 仍保留裁决流水小节
+    assert "裁决流水" in md_path.read_text(encoding="utf-8")
+
+
+def test_a4_balance_statements_are_not_previewed_as_gain(project):
+    """A4：余额陈述不得被误判为获取候选。"""
+    (project / "正文" / "第003章.txt").write_text(
+        "第三章\n剩余 3 枚灵石。\n他还只剩 2 枚灵石。\n", encoding="utf-8"
+    )
+    payload = _preview(project, scope_str="3-3")
+    assert payload["counts"]["total"] == 0
+
+    # 对照：真实获取仍然要给候选
+    (project / "正文" / "第003章.txt").write_text(
+        "第三章\n陆离获得 3 枚灵石。\n他还只剩 2 枚灵石。\n", encoding="utf-8"
+    )
+    payload = _preview(project, scope_str="3-3")
+    assert payload["counts"]["total"] == 1
+    assert payload["candidates"][0]["direction"] == "gain"
+    assert payload["candidates"][0]["quantity"] == 3
+
+
 def test_batch_audit_failure_rolls_back_ledger_writes(project):
     """批量审查失败（中途失败或最终保存失败）时账本文件必须回滚。"""
     tag = '<!-- audit:stash name="海门钥匙" origin="第1章" status="pending" -->'

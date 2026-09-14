@@ -2910,14 +2910,17 @@ def _normalize_asset_event(event: Any, owner: Optional[str] = None) -> Dict[str,
         raise ValueError("资产类别 (category) 必须为字符串或 null")
 
     candidate_source = "heuristic" if str(event.get("source") or "") == "heuristic" else "host"
-    event_id = event.get("event_id")
-    if not isinstance(event_id, str) or not event_id.strip():
-        event_id = make_asset_event_id(
-            chapter, line_number, column, name_value, owner_value, direction_value, quantity, unit
-        )
+    supplied_event_id = event.get("event_id")
+    supplied_event_id = supplied_event_id.strip() if isinstance(supplied_event_id, str) else ""
+    # 身份与事件编号必须同源：规整（含 owner 覆盖）后一律重算 event_id，
+    # 原编号仅作为 supplied_event_id 留痕，避免"返回 0 但未入账"的静默 no-op。
+    event_id = make_asset_event_id(
+        chapter, line_number, column, name_value, owner_value, direction_value, quantity, unit
+    )
 
     return {
-        "event_id": event_id.strip(),
+        "event_id": event_id,
+        "supplied_event_id": supplied_event_id,
         "name": name_value,
         "owner": owner_value.strip(),
         "direction": direction_value,
@@ -3072,6 +3075,8 @@ def run_confirm_asset_event(
     )
     before: Optional[Union[int, float]] = None
     after: Optional[Union[int, float]] = None
+    actual_quantity: Union[int, float] = 0
+    over_consume = False
     if decision_value == "reject":
         # 否决只留裁决记录，不改动任何数量。
         pass
@@ -3110,9 +3115,14 @@ def run_confirm_asset_event(
         # 复用既有数量语义（含归零与丹药耗材耗尽自动流转 CONSUMED）。
         asset.modify_quantity(delta, chapter=payload["chapter"], reason=f"{reason_value}（事件 {event_id}）")
         after = asset.quantity
+        # 记录实际变动量：底层对越界消耗会钳制到 0，事件流水必须与账面一致。
+        applied = after - before
+        actual_quantity = abs(applied) if isinstance(applied, (int, float)) else 0
+        over_consume = payload["direction"] == "consume" and payload["quantity"] > before
 
     state.asset_events.append({
         "event_id": event_id,
+        "supplied_event_id": payload["supplied_event_id"],
         "name": payload["name"],
         "owner": payload["owner"],
         "current_holder": asset.current_holder if asset is not None else payload["owner"],
@@ -3132,6 +3142,8 @@ def run_confirm_asset_event(
         "asset_id": asset.id if asset is not None else "",
         "quantity_before": before,
         "quantity_after": after,
+        "actual_quantity": actual_quantity,
+        "over_consume": bool(over_consume),
         "status_after": asset.status if asset is not None else "",
     })
     state.last_updated_chapter = max(
