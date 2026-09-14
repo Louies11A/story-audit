@@ -107,6 +107,8 @@ class FormatFinding:
     evidence: str = ""
     issue: str = ""
     fix: str = ""
+    finding_id: str = ""                       # F08：稳定问题编号（规则+章号+行号+证据哈希）
+    rule: Optional[Dict[str, Any]] = None      # F08：规则元数据（id/版本/阈值/命中条件/上下文）
 
     def __post_init__(self) -> None:
         if not self.location:
@@ -134,7 +136,7 @@ class FormatFinding:
         )
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        payload = {
             "severity": self.severity,
             "category": self.category,
             "location": self.location or f"行 {self.line_number}",
@@ -147,6 +149,11 @@ class FormatFinding:
             "message": self.message,
             "suggestion": self.suggestion,
         }
+        if self.finding_id:
+            payload["finding_id"] = self.finding_id
+        if self.rule:
+            payload["rule"] = dict(self.rule)
+        return payload
 
 
 @dataclass

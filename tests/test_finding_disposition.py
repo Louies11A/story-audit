@@ -81,6 +81,159 @@ def _platform_defect(finding_id: str = "defect-platform-1"):
     }
 
 
+def _long_paragraph_chapter(project: Path) -> str:
+    line = "他走进庭院。" * 21
+    (project / "正文" / "第002章.txt").write_text(
+        "第二章\n" + line + "\n", encoding="utf-8"
+    )
+    return line
+
+
+def _format_finding(project: Path, chapter: int = 2) -> dict:
+    items = list(
+        story_audit.iter_audit_scope(project, scope_str=f"{chapter}-{chapter}", mode="solo", silent=True)
+    )
+    chapter_item = next(item for item in items if item["kind"] == "chapter")
+    return next(item for item in chapter_item["findings"] if item["flaw_type"] == "LONG_PARAGRAPH")
+
+
+def test_a1_format_findings_expose_ids_rules_and_dispositions(project):
+    """A1：排版阈值类发现可查询规则元数据与编号，并可登记处置。"""
+    _long_paragraph_chapter(project)
+    finding = _format_finding(project)
+    assert finding["chapter"] == 2.0
+    assert finding["finding_id"].startswith("finding-")
+    rule = finding["rule"]
+    assert rule["rule_id"] == "LONG_PARAGRAPH"
+    assert rule["rule_version"] == story_audit.RULE_METADATA_VERSION
+    assert "120" in rule["threshold"]
+    assert rule["condition"]
+    assert rule["context"]
+
+    assert story_audit.record_finding_disposition(
+        project,
+        finding_id=finding["finding_id"],
+        decision="false_positive",
+        reason="作者刻意保留长段节奏",
+        source="author",
+        finding=finding,
+        silent=True,
+    )[0] == 0
+    code, payload = story_audit.get_finding_dispositions(project, silent=True)
+    assert code == 0
+    record = payload["dispositions"][0]
+    assert record["finding_id"] == finding["finding_id"]
+    assert record["severity"] == "P2" and record["category"] == "format"
+    assert record["exempt"] is True and record["persisted"] is False
+    assert record["finding_status"] == "report_only"
+    assert record["line_number"] == finding["line_number"]
+    assert record["needs_reverification"] is False
+
+    # 报告按当前正文版本应用处置：误报移入“已处置”小节
+    assert story_audit.audit_chapter(project, chapter_index=2, mode="solo", silent=True)[0] == 0
+    report_path = project / "reports" / "单章审查" / "001-100章" / "第002章_审查报告.md"
+    report = report_path.read_text(encoding="utf-8")
+    assert "已处置（误报免除跟踪）规则发现" in report
+    assert "处置：误报" in report
+
+    # 正文变化后处置不自动生效：标记需重新核验并回到待处理清单
+    (project / "正文" / "第002章.txt").write_text(
+        "第二章\n" + ("他走进庭院。" * 21) + "\n雪落无声。\n", encoding="utf-8"
+    )
+    code, payload = story_audit.get_finding_dispositions(project, silent=True)
+    assert code == 0
+    assert payload["dispositions"][0]["needs_reverification"] is True
+    assert story_audit.audit_chapter(project, chapter_index=2, mode="solo", silent=True)[0] == 0
+    report = report_path.read_text(encoding="utf-8")
+    assert "需重新核验（处置不自动生效）" in report
+    assert "**规则**：LONG_PARAGRAPH@" in report
+
+
+def test_a1_format_findings_report_rule_metadata_and_platform_protection(project):
+    """A1：报告展示规则阈值/命中条件；平台建议类发现仍不可被作者偏好免除。"""
+    _long_paragraph_chapter(project)
+    assert story_audit.audit_chapter(project, chapter_index=2, mode="solo", silent=True)[0] == 0
+    report = (
+        project / "reports" / "单章审查" / "001-100章" / "第002章_审查报告.md"
+    ).read_text(encoding="utf-8")
+    assert "**问题编号**：finding-" in report
+    assert "**规则**：LONG_PARAGRAPH@" in report
+    assert "阈值：" in report and "命中条件：" in report
+
+    # 平台建议项（P2/P3 卡尺建议）属于门禁类，不得被误报免除
+    platform_finding = {
+        "id": "finding-platform-demo",
+        "chapter": 2.0,
+        "severity": "P2",
+        "category": "platform",
+        "issue": "番茄开篇钩子不足（建议项）",
+        "flaw_type": "PLATFORM_FANQIE",
+        "line_number": 1,
+        "rule": {
+            "rule_id": "platform_rubric:fanqie",
+            "rule_version": story_audit.RULE_METADATA_VERSION,
+            "threshold": "前 3 段需有钩子",
+            "condition": "番茄卡尺建议项命中",
+            "context": "他走进庭院。",
+        },
+    }
+    assert story_audit.record_finding_disposition(
+        project,
+        finding_id="finding-platform-demo",
+        decision="false_positive",
+        reason="作者认为无影响",
+        source="author",
+        finding=platform_finding,
+        silent=True,
+    )[0] == 0
+    code, payload = story_audit.get_finding_dispositions(project, silent=True)
+    assert code == 0
+    record = next(item for item in payload["dispositions"] if item["finding_id"] == "finding-platform-demo")
+    assert record["exempt"] is False
+    assert record["retained_in_open_defects"] is False
+
+
+def test_a5_rejudging_dismissed_finding_restores_open_defect(project):
+    """A5：误报免除后改判为非免除结论，缺陷必须回到 open_defects 且字段一致。"""
+    _seed(project, [_expert_defect()])
+    assert story_audit.record_finding_disposition(
+        project,
+        finding_id="defect-expert-1",
+        decision="false_positive",
+        reason="作者判断为风格偏好",
+        source="author",
+        silent=True,
+    )[0] == 0
+    assert _state(project)["open_defects"] == []
+
+    assert story_audit.record_finding_disposition(
+        project,
+        finding_id="defect-expert-1",
+        decision="accepted",
+        reason="复核后确认需要修改",
+        source="author",
+        silent=True,
+    )[0] == 0
+    state = _state(project)
+    restored = [item for item in state["open_defects"] if item.get("id") == "defect-expert-1"]
+    assert len(restored) == 1
+    assert restored[0]["status"] == "open"
+    assert restored[0]["severity"] == "P2" and restored[0]["category"] == "prose"
+    assert not [item for item in state["resolved_items"] if item.get("id") == "defect-expert-1"]
+
+    record = state["finding_dispositions"][0]
+    assert record["decision"] == "accepted"
+    assert record["exempt"] is False
+    assert record["retained_in_open_defects"] is True
+    assert record["restored_to_open_defects"] is True
+    assert record["finding_location"] == "open_defects"
+    assert record["history"][0]["decision"] == "false_positive"
+
+    code, payload = story_audit.get_finding_dispositions(project, silent=True)
+    assert code == 0
+    assert payload["dispositions"][0]["finding_status"] == "open_defects"
+
+
 def test_f08_deterministic_findings_carry_ids_and_rule_metadata(project):
     """确定性发现带稳定问题编号与规则 id/版本/阈值/命中条件/上下文。"""
     assert story_audit.audit_chapter(project, chapter_index=1, mode="solo", silent=True)[0] == 0

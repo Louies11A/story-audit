@@ -540,6 +540,25 @@ def test_a4_balance_statements_are_not_previewed_as_gain(project):
     assert payload["candidates"][0]["quantity"] == 3
 
 
+def test_a4_real_consumption_with_balance_wording_is_kept(project):
+    """A4：同一小句出现消耗动词时，余额词不得导致真实消耗被漏检。"""
+    (project / "正文" / "第003章.txt").write_text(
+        "第三章\n他消耗了剩余的2枚灵石。\n", encoding="utf-8"
+    )
+    payload = _preview(project, scope_str="3-3")
+    assert payload["counts"]["total"] == 1
+    candidate = payload["candidates"][0]
+    assert candidate["name"] == "灵石"
+    assert candidate["direction"] == "consume"
+    assert candidate["quantity"] == 2
+
+    # 纯余额陈述仍然不产出候选
+    (project / "正文" / "第003章.txt").write_text(
+        "第三章\n剩余 3 枚灵石。\n", encoding="utf-8"
+    )
+    assert _preview(project, scope_str="3-3")["counts"]["total"] == 0
+
+
 def test_batch_audit_failure_rolls_back_ledger_writes(project):
     """批量审查失败（中途失败或最终保存失败）时账本文件必须回滚。"""
     tag = '<!-- audit:stash name="海门钥匙" origin="第1章" status="pending" -->'

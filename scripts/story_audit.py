@@ -323,6 +323,104 @@ def _platform_rubric_rule(platform: str, location: str, evidence: str) -> Dict[s
     }
 
 
+# F08：排版/AI 句式阈值类规则的元数据（规则 id、版本、阈值、命中条件）。
+FORMAT_RULE_SPECS: Dict[str, Dict[str, str]] = {
+    "LONG_PARAGRAPH": {
+        "threshold": "单段连续字数 >= 120（段内 >= 3 个感叹号降级 P3）",
+        "condition": "整段连续字数超过阈值，手机端阅读形成大黑块",
+    },
+    "DRAGGING_SENTENCE": {
+        "threshold": "句内逗号 >= 4；单分句无标点 >= 45 字；台词 >= 8 逗号且平均分句 > 18 字",
+        "condition": "单句或单分句拖沓超阈值",
+    },
+    "DIALOGUE_MIXED": {
+        "threshold": "对话闭引号后紧塞 >= 80 字描写且不分行",
+        "condition": "台词与外貌/动作/心理描写混排不分行",
+    },
+    "AI_CONJUNCTION": {
+        "threshold": "命中典型 AI 翻译腔连词表（然而/与此同时/不可否认的是 等）",
+        "condition": "高频 AI 连词出现在正文叙述中",
+    },
+    "AI_NOT_IS": {
+        "threshold": "命中“不是……而是……”对仗句式（含反序对比）",
+        "condition": "AI 对仗对比句式",
+    },
+    "AI_EM_DASH": {
+        "threshold": "正文残留“——”硬停顿",
+        "condition": "破折号硬停顿影响短句化阅读",
+    },
+    "AI_VOICE_CONTRAST": {
+        "threshold": "命中音量/神态反差句式",
+        "condition": "“声音不大，却让所有人心中一凛”类反差腔",
+    },
+    "AI_NEGATION_PARADE": {
+        "threshold": "连续否定排比（没有X，没有Y……）",
+        "condition": "否定排比堆叠",
+    },
+    "AI_TRAILER_ENDING": {
+        "threshold": "章末预告式收尾（“他不知道的是……”）",
+        "condition": "章末出戏预告句式",
+    },
+    "AI_TRAILER_SUMMARY": {
+        "threshold": "章末状态总结体（“这一夜注定无人入眠”）",
+        "condition": "章末总结替读者下结论",
+    },
+    "AI_GOD_VIEW_EXPOSITION": {
+        "threshold": "上帝解释腔或单段 5+ 连续通用动词清单",
+        "condition": "替读者划重点或监控摄像头式动作堆叠",
+    },
+}
+FORMAT_RULE_FALLBACK: Dict[str, str] = {
+    "threshold": "见 scripts/format_scanner.py 与 scripts/ai_patterns_checker.py 规则实现",
+    "condition": "排版/AI 句式规则命中",
+}
+
+
+def build_format_finding_rule(flaw_type: str, snippet: str) -> Dict[str, Any]:
+    """排版/AI 句式类发现的规则元数据（含平台建议项）。"""
+    key = str(flaw_type or "").strip().upper()
+    context = _clip_event_text(snippet, 120)
+    if key.startswith("PLATFORM_"):
+        platform = key[len("PLATFORM_"):].lower() or "generic"
+        return {
+            "rule_id": f"platform_rubric:{platform}",
+            "rule_version": RULE_METADATA_VERSION,
+            "threshold": f"见 references/rubrics/{platform}.md 对应建议阈值",
+            "condition": f"{platform} 平台卡尺 P2/P3 建议项命中",
+            "context": context,
+        }
+    spec = FORMAT_RULE_SPECS.get(key) or FORMAT_RULE_FALLBACK
+    return {
+        "rule_id": key or "format_unknown",
+        "rule_version": RULE_METADATA_VERSION,
+        "threshold": spec["threshold"],
+        "condition": spec["condition"],
+        "context": context,
+    }
+
+
+def make_format_finding_id(
+    chapter: Any,
+    line_number: Any,
+    flaw_type: str,
+    evidence: str,
+) -> str:
+    """排版/AI 句式发现的稳定编号：规则 + 章号 + 行号 + 证据片段。"""
+    try:
+        chapter_token = f"{float(chapter):g}"
+    except (TypeError, ValueError, OverflowError):
+        chapter_token = str(chapter)
+    basis = "|".join(
+        [
+            str(flaw_type or "").strip().upper(),
+            chapter_token,
+            str(line_number if line_number is not None else ""),
+            _clip_event_text(evidence, 60),
+        ]
+    )
+    return "finding-" + hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
+
+
 def _rollback_chapter_write(
     chapter_path: Path,
     original_bytes: Optional[bytes],
@@ -613,6 +711,8 @@ def render_audit_report(
     author_memory_text: Optional[str] = None,
     platform_data: Optional[Dict[str, Any]] = None,
     inherited_items: Optional[Dict[str, Any]] = None,
+    finding_dispositions: Optional[List[Dict[str, Any]]] = None,
+    text_version: str = "",
 ) -> str:
     """渲染符合统一审查报告 Schema (Markdown) 的报告内容"""
     effective_mode, fallback_reason = _resolve_precheck_mode(requested_mode, fallback_reason)
@@ -762,14 +862,84 @@ def render_audit_report(
         "## 📝 五、排版与句式规则扫描",
     ])
 
-    if findings:
-        for i, f in enumerate(findings, 1):
+    disposition_map: Dict[str, Dict[str, Any]] = {}
+    for record in finding_dispositions or []:
+        if not isinstance(record, dict) or not record.get("finding_id"):
+            continue
+        view = dict(record)
+        recorded = str(record.get("text_version") or "")
+        view["needs_reverification"] = bool(recorded) and (text_version or "") != recorded
+        disposition_map[str(record["finding_id"])] = view
+
+    pending_findings: List[FormatFinding] = []
+    dismissed_findings: List[FormatFinding] = []
+    for finding in findings:
+        view = disposition_map.get(getattr(finding, "finding_id", "") or "")
+        if (
+            view is not None
+            and view.get("decision") == "false_positive"
+            and view.get("exempt")
+            and not view.get("needs_reverification")
+        ):
+            dismissed_findings.append(finding)
+        else:
+            pending_findings.append(finding)
+
+    if pending_findings:
+        for i, f in enumerate(pending_findings, 1):
             lines.append(f"### {i}. [{f.severity} {f.flaw_type}] 行号: {f.line_number}")
+            if getattr(f, "finding_id", ""):
+                lines.append(f"* **问题编号**：{f.finding_id}")
+            rule = getattr(f, "rule", None)
+            if isinstance(rule, dict):
+                lines.append(
+                    "* **规则**：{}@{}｜阈值：{}｜命中条件：{}".format(
+                        rule.get("rule_id") or "-",
+                        rule.get("rule_version") or "-",
+                        rule.get("threshold") or "-",
+                        rule.get("condition") or "-",
+                    )
+                )
             lines.append(f"* **片段**：`{f.snippet}`")
             lines.append(f"* **问题**：{f.message}")
             lines.append(f"* **建议**：{f.suggestion}")
+            view = disposition_map.get(getattr(f, "finding_id", "") or "")
+            if view is not None:
+                label = {
+                    "accepted": "接受",
+                    "deferred": "暂缓",
+                    "false_positive": "误报",
+                }.get(str(view.get("decision") or ""), str(view.get("decision") or "-"))
+                if view.get("needs_reverification"):
+                    state_text = "正文已变化，需重新核验（处置不自动生效）"
+                elif view.get("exempt"):
+                    state_text = "已免除跟踪"
+                else:
+                    state_text = "仍保留在待处理清单"
+                lines.append(
+                    "* **处置**：{}（{}；{}）".format(
+                        label, str(view.get("source") or "-"), state_text
+                    )
+                )
+    elif dismissed_findings:
+        lines.append("本轮待处理排版规则已清零；以下条目经作者处置为误报。")
     else:
         lines.append("本轮确定性排版规则未命中问题。")
+
+    if dismissed_findings:
+        lines.extend(["", "### 已处置（误报免除跟踪）规则发现"])
+        for f in dismissed_findings:
+            view = disposition_map.get(getattr(f, "finding_id", "") or "", {})
+            lines.append(
+                "* [{sev} {kind}] 行 {line}：{issue}（处置：误报，{source}，理由：{reason}）".format(
+                    sev=f.severity,
+                    kind=f.flaw_type,
+                    line=f.line_number,
+                    issue=f.message,
+                    source=str(view.get("source") or "-"),
+                    reason=str(view.get("reason") or "-"),
+                )
+            )
 
     lines.extend([
         "",
@@ -1108,6 +1278,20 @@ def run_audit(
             ))
 
     # 9. 违规与严重度统计（预审包将在与持久状态合并后构建）
+    # F08：为排版/AI 句式/平台建议类发现补充稳定编号与规则元数据（不写入账本事实）。
+    for finding in findings:
+        if not getattr(finding, "finding_id", ""):
+            finding.finding_id = make_format_finding_id(
+                curr_chapter.index,
+                finding.line_number,
+                finding.flaw_type,
+                finding.snippet or finding.evidence,
+            )
+        if not getattr(finding, "rule", None):
+            finding.rule = build_format_finding_rule(
+                finding.flaw_type, finding.snippet or finding.evidence
+            )
+
     p0_list: List[str] = []
     p1_list: List[str] = []
     detected_defects: List[Dict[str, Any]] = []
@@ -1250,6 +1434,8 @@ def run_audit(
         author_memory_text=author_mem_text,
         platform_data=platform_data,
         inherited_items=inherited_items,
+        finding_dispositions=audit_state.finding_dispositions,
+        text_version=curr_text_version,
     )
 
     latest_report_path = reports_dir / "LATEST_REPORT.md"
@@ -3219,11 +3405,63 @@ def _find_finding_entry(
     return None, ""
 
 
+def _normalize_report_finding(finding: Any, finding_id: str) -> Dict[str, Any]:
+    """校验报告级规则发现（排版/AI 句式/平台建议类），构造处置载体。"""
+    if not isinstance(finding, dict):
+        raise ValueError("finding 必须是包含 id/章号/严重度/类别/问题/规则元数据的对象")
+    raw_id = finding.get("id", finding.get("finding_id", ""))
+    if str(raw_id or "").strip() and str(raw_id).strip() != finding_id:
+        raise ValueError("finding.id 与 finding_id 不一致")
+    chapter = finding.get("chapter")
+    if (
+        isinstance(chapter, bool)
+        or not isinstance(chapter, (int, float))
+        or not math.isfinite(float(chapter))
+        or chapter < 0
+    ):
+        raise ValueError("finding.chapter 必须是有限的非负数值")
+    severity = finding.get("severity")
+    if not isinstance(severity, str) or not severity.strip():
+        raise ValueError("finding.severity 必须为非空字符串")
+    category = finding.get("category")
+    if not isinstance(category, str) or not category.strip():
+        raise ValueError("finding.category 必须为非空字符串")
+    issue = finding.get("issue") or finding.get("message")
+    if not isinstance(issue, str) or not issue.strip():
+        raise ValueError("finding.issue 必须为非空字符串")
+    rule = finding.get("rule")
+    if rule is not None and not isinstance(rule, dict):
+        raise ValueError("finding.rule 必须为对象或 null")
+    line_number = finding.get("line_number")
+    if line_number is not None and (
+        isinstance(line_number, bool) or not isinstance(line_number, int) or line_number <= 0
+    ):
+        raise ValueError("finding.line_number 必须是正整数或 null")
+    return {
+        "id": finding_id,
+        "chapter": float(chapter),
+        "severity": severity.strip(),
+        "category": category.strip(),
+        "issue": issue.strip(),
+        "rule": dict(rule) if isinstance(rule, dict) else {},
+        "line_number": line_number,
+        "flaw_type": str(finding.get("flaw_type") or ""),
+        "source": str(finding.get("source") or "report"),
+    }
+
+
 def _is_disposition_protected(entry: Dict[str, Any]) -> bool:
     """事实冲突类与平台门禁发现不得由作者偏好自动免除。"""
     category = str(entry.get("category") or "")
     checker = str(entry.get("checker") or "")
-    return category in PROTECTED_DISPOSITION_CATEGORIES or checker in PROTECTED_DISPOSITION_CHECKERS
+    rule = entry.get("rule") if isinstance(entry.get("rule"), dict) else {}
+    rule_id = str(rule.get("rule_id") or "")
+    return (
+        category in PROTECTED_DISPOSITION_CATEGORIES
+        or category == "platform"
+        or checker in PROTECTED_DISPOSITION_CHECKERS
+        or rule_id.startswith("platform_rubric")
+    )
 
 
 def _disposition_view(record: Dict[str, Any], current_version: str) -> Dict[str, Any]:
@@ -3278,9 +3516,15 @@ def run_record_finding_disposition(
     decision: str = "accepted",
     reason: str = "",
     source: str = "author",
+    finding: Optional[Any] = None,
     silent: bool = False,
 ) -> Tuple[int, Path]:
-    """登记问题处置（接受/暂缓/误报），记录处置时的正文版本。"""
+    """登记问题处置（接受/暂缓/误报），记录处置时的正文版本。
+
+    既支持持久化缺陷（open_defects/resolved_items 中的 id），也支持报告级规则发现
+    （排版/AI 句式/平台建议类）。后者不在账本事实中，需通过 ``finding`` 传入发现
+    字段（id/章号/严重度/类别/问题/规则元数据），处置记录独立存储。
+    """
     try:
         _validate_boolean_options(silent=silent)
         if not isinstance(finding_id, str) or not finding_id.strip():
@@ -3307,9 +3551,20 @@ def run_record_finding_disposition(
         return 3, Path("")
 
     entry, location = _find_finding_entry(audit_state, target_id)
+    persisted = entry is not None
+    if entry is None and finding is not None:
+        try:
+            entry = _normalize_report_finding(finding, target_id)
+        except ValueError as e:
+            _report_api_error(e, silent)
+            return 3, Path("")
+        location = ""
     if entry is None:
         _report_api_error(
-            ValueError(f"未找到问题编号 {target_id}（处置只针对持久化缺陷记录）"), silent
+            ValueError(
+                f"未找到问题编号 {target_id}（持久化缺陷之外需通过 finding 传入发现字段）"
+            ),
+            silent,
         )
         return 3, Path("")
 
@@ -3340,6 +3595,46 @@ def run_record_finding_disposition(
         return 0, get_audit_state_path(reports_dir)
 
     timestamp = datetime.now(timezone.utc).isoformat()
+    final_location = location
+    restored_to_open_defects = False
+    if exempt and persisted and location == "open_defects":
+        # 误报且非事实/门禁类：移出开放缺陷，但保留原始发现与严重度作为历史。
+        audit_state.open_defects = [
+            item for item in audit_state.open_defects if item is not entry
+        ]
+        resolved = dict(entry)
+        resolved["status"] = "resolved"
+        resolved["resolution"] = "false_positive_dismissed"
+        resolved["resolution_reason"] = reason_value
+        resolved["resolution_source"] = source_value
+        resolved["resolution_text_version"] = current_version
+        resolved["resolved_at"] = timestamp
+        audit_state.resolved_items.append(resolved)
+        final_location = "resolved_items"
+    elif (
+        persisted
+        and not exempt
+        and location == "resolved_items"
+        and str(entry.get("resolution") or "") == "false_positive_dismissed"
+    ):
+        # A5：改判为非免除结论时，先前被误报免除的缺陷必须回到开放缺陷。
+        audit_state.resolved_items = [
+            item for item in audit_state.resolved_items if item is not entry
+        ]
+        reopened = dict(entry)
+        for key in (
+            "resolution",
+            "resolution_reason",
+            "resolution_source",
+            "resolution_text_version",
+            "resolved_at",
+        ):
+            reopened.pop(key, None)
+        reopened["status"] = "open"
+        audit_state.open_defects.append(reopened)
+        final_location = "open_defects"
+        restored_to_open_defects = True
+
     record = {
         "finding_id": target_id,
         "chapter": float(chapter) if isinstance(chapter, (int, float)) and not isinstance(chapter, bool) else None,
@@ -3347,14 +3642,17 @@ def run_record_finding_disposition(
         "category": str(entry.get("category") or ""),
         "issue": str(entry.get("issue") or ""),
         "rule": dict(entry.get("rule")) if isinstance(entry.get("rule"), dict) else {},
+        "line_number": entry.get("line_number") if isinstance(entry.get("line_number"), int) else None,
+        "persisted": bool(persisted),
         "decision": decision_value,
         "source": source_value,
         "reason": reason_value,
         "decided_at": timestamp,
         "text_version": current_version,
         "exempt": exempt,
-        "retained_in_open_defects": not exempt,
-        "finding_location": location,
+        "retained_in_open_defects": final_location == "open_defects",
+        "restored_to_open_defects": restored_to_open_defects,
+        "finding_location": final_location,
     }
     if existing is not None:
         history = existing.get("history")
@@ -3375,20 +3673,6 @@ def run_record_finding_disposition(
     else:
         record["history"] = []
         audit_state.finding_dispositions.append(record)
-
-    if exempt and location == "open_defects":
-        # 误报且非事实/门禁类：移出开放缺陷，但保留原始发现与严重度作为历史。
-        audit_state.open_defects = [
-            item for item in audit_state.open_defects if item is not entry
-        ]
-        resolved = dict(entry)
-        resolved["status"] = "resolved"
-        resolved["resolution"] = "false_positive_dismissed"
-        resolved["resolution_reason"] = reason_value
-        resolved["resolution_source"] = source_value
-        resolved["resolution_text_version"] = current_version
-        resolved["resolved_at"] = timestamp
-        audit_state.resolved_items.append(resolved)
 
     try:
         state_path = save_audit_state(audit_state, reports_dir)
@@ -3434,8 +3718,14 @@ def run_get_finding_dispositions(
             else ""
         )
         view = _disposition_view(record, current_version)
-        _entry, location = _find_finding_entry(audit_state, str(record.get("finding_id") or ""))
-        view["finding_status"] = location or "missing"
+        if not bool(record.get("persisted", True)):
+            # 报告级规则发现（排版/AI 句式/平台建议）不在账本事实中，独立存储处置。
+            view["finding_status"] = "report_only"
+        else:
+            _entry, location = _find_finding_entry(
+                audit_state, str(record.get("finding_id") or "")
+            )
+            view["finding_status"] = location or "missing"
         dispositions.append(view)
     return 0, {
         "dispositions": dispositions,
@@ -3479,6 +3769,14 @@ def iter_audit_scope(
     章节报告与预审包沿用既有发布规则（状态优先 + 暂存回滚）：中途失败时已完成章节的
     结果仍会逐章返回供宿主继续专家处理，但报告不会发布，清单会显式标注
     ``run_status="failed"`` 并区分已完成/失败/未执行章节。
+
+    预审包字段说明：``bundle`` 是该章预审包内容（逐章权威来源），
+    ``shared_bundle_cache_path`` 是既有单文件缓存
+    ``reports/.cache/pre_audit_bundle.json``（仅保存最后一次审查内容，
+    30 章运行会指向同一路径）。
+
+    运行成功时还会产出与 ``audit_scope`` 一致的 ``LATEST_REPORT.md``、
+    ``BATCH_SUMMARY_SCOPE_{scope}.md`` 与批量历史归档；失败运行只保留运行清单。
 
     Args:
         project_dir: 小说项目根目录（Path 或 str，默认当前目录）
@@ -3595,6 +3893,7 @@ def iter_audit_scope(
             pass
 
     staged_writes: Dict[Path, Union[str, bytes]] = {}
+    chapter_summaries: List[Dict[str, Any]] = []
     has_p0 = False
     has_p1 = False
     for sequence, chap in enumerate(target_chapters, 1):
@@ -3633,7 +3932,10 @@ def iter_audit_scope(
             "status": "completed" if code != 3 else "failed",
             "error": "" if code != 3 else f"第 {chap.index:g} 章审查失败（exit_code=3）",
             "findings": [
-                finding.to_dict() if hasattr(finding, "to_dict") else finding
+                {
+                    **(finding.to_dict() if hasattr(finding, "to_dict") else dict(finding)),
+                    "chapter": float(chap.index),
+                }
                 for finding in (summary.get("findings") or [])
             ],
             "p0_list": list(summary.get("p0_list") or []),
@@ -3644,7 +3946,8 @@ def iter_audit_scope(
             "word_count": int(summary.get("word_count") or 0),
             "paragraph_count": int(summary.get("paragraph_count") or 0),
             "bundle": bundle,
-            "bundle_path": str(summary.get("pre_bundle_path") or ""),
+            # 共享预审包缓存路径（单文件缓存，仅最后一次审查内容；逐章内容以 bundle 为准）。
+            "shared_bundle_cache_path": str(summary.get("pre_bundle_path") or ""),
             "report_path": str(summary.get("archived_report_path") or ""),
             "report_published": False,
             "started_at": item_started,
@@ -3659,7 +3962,7 @@ def iter_audit_scope(
                 "text_version": item["text_version"],
                 "report_path": item["report_path"],
                 "report_published": False,
-                "bundle_path": item["bundle_path"],
+                "shared_bundle_cache_path": item["shared_bundle_cache_path"],
                 "exit_code": 3,
                 "started_at": item_started,
                 "finished_at": item_finished,
@@ -3674,7 +3977,7 @@ def iter_audit_scope(
                     "text_version": "",
                     "report_path": "",
                     "report_published": False,
-                    "bundle_path": "",
+                    "shared_bundle_cache_path": "",
                     "exit_code": None,
                     "started_at": "",
                     "finished_at": "",
@@ -3713,6 +4016,7 @@ def iter_audit_scope(
             has_p0 = True
         elif code == 1:
             has_p1 = True
+        chapter_summaries.append(summary)
         manifest["chapters"].append({
             "chapter": float(chap.index),
             "sequence": sequence,
@@ -3721,7 +4025,7 @@ def iter_audit_scope(
             "text_version": item["text_version"],
             "report_path": item["report_path"],
             "report_published": False,
-            "bundle_path": item["bundle_path"],
+            "shared_bundle_cache_path": item["shared_bundle_cache_path"],
             "exit_code": code,
             "started_at": item_started,
             "finished_at": item_finished,
@@ -3747,6 +4051,45 @@ def iter_audit_scope(
         if chap.index not in audit_state.completed_chapters:
             audit_state.completed_chapters.append(chap.index)
     audit_state.completed_chapters.sort()
+    # F07/A3：成功路径补齐与 audit_scope 一致的批量汇总产物（失败运行仍只保留运行清单）。
+    effective_mode, fallback_reason = _resolve_precheck_mode(mode)
+    batch_dir = reports_dir / "批量审查"
+    today = datetime.now().strftime("%Y-%m-%d")
+    s_fmt = _format_history_chapter_number(s_min)
+    e_fmt = _format_history_chapter_number(s_max)
+    history_run_id, batch_report_file = _resolve_batch_history_path(
+        batch_dir, today, s_fmt, e_fmt, run_id
+    )
+    scope_clean_name = scope_clean
+    scope_summary_path = reports_dir / f"BATCH_SUMMARY_SCOPE_{scope_clean_name}.md"
+    latest_report_path = reports_dir / "LATEST_REPORT.md"
+    batch_summary_content = ""
+    try:
+        expert_view = _refresh_expert_records(
+            load_expert_result_records(get_expert_result_store_path(reports_dir)), p_dir
+        )
+        batch_summary_content = render_scope_batch_summary(
+            scope_str=scope_clean,
+            s_min=s_min,
+            s_max=s_max,
+            chapter_summaries=chapter_summaries,
+            strict=strict,
+            requested_mode=mode,
+            effective_mode=effective_mode,
+            fallback_reason=fallback_reason,
+            platform=platform,
+            run_id=history_run_id,
+            inherited_items=_attach_disposition_states(
+                _attach_expert_summaries(get_inherited_items(audit_state), expert_view),
+                p_dir,
+            ),
+        )
+    except Exception as e:
+        summary_item["error"] = f"批量汇总报告生成失败: {e}"
+    if batch_summary_content:
+        staged_writes[scope_summary_path] = batch_summary_content
+        staged_writes[batch_report_file] = batch_summary_content
+        staged_writes[latest_report_path] = batch_summary_content
     state_path = get_audit_state_path(reports_dir)
     original_state = _read_optional_bytes(state_path)
     original_artifacts = {path: _read_optional_bytes(path) for path in staged_writes}
@@ -3780,6 +4123,9 @@ def iter_audit_scope(
         "not_executed": 0,
         "reports_published": run_status == "completed",
         "report_paths": {str(entry["chapter"]): entry["report_path"] for entry in manifest["chapters"]},
+        "batch_summary_path": str(scope_summary_path) if batch_summary_content else "",
+        "batch_archive_path": str(batch_report_file) if batch_summary_content else "",
+        "latest_report_path": str(latest_report_path) if batch_summary_content else "",
         "error": publish_error,
         "finished_at": datetime.now(timezone.utc).isoformat(),
     })
@@ -4360,6 +4706,7 @@ def record_finding_disposition(
     decision: str = "accepted",
     reason: str = "",
     source: str = "author",
+    finding: Optional[Any] = None,
     silent: bool = False,
 ) -> Tuple[int, Path]:
     """问题处置登记纯 Python API（F08）
@@ -4373,6 +4720,8 @@ def record_finding_disposition(
     Args:
         project_dir: 小说项目根目录（Path 或 str，默认当前目录）
         finding_id: 持久化缺陷的稳定编号（``open_defects``/``resolved_items`` 中的 ``id``）
+        finding: 报告级规则发现字段（id/章号/严重度/类别/问题/规则元数据），
+            用于排版/AI 句式/平台建议类发现（不写入账本事实）的处置
         decision: ``accepted`` / ``deferred`` / ``false_positive``
         reason: 处置原因（必填）
         source: 处置来源，``author`` 或 ``expert``
@@ -4393,6 +4742,7 @@ def record_finding_disposition(
             decision=decision,
             reason=reason,
             source=source,
+            finding=finding,
             silent=silent,
         )
     except (OSError, SafeIOError, TypeError, ValueError) as e:

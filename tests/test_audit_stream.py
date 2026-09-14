@@ -55,9 +55,13 @@ def test_f07_stream_returns_distinct_results_and_manifest(project):
     first = chapters[0]
     assert first["chapter"] == 1.0
     assert first["bundle"]["meta"]["target_chapter"] == 1.0
-    assert first["bundle_path"].endswith("pre_audit_bundle.json")
+    assert first["shared_bundle_cache_path"].endswith("pre_audit_bundle.json")
     assert first["report_path"].endswith("第001章_审查报告.md")
     assert isinstance(first["findings"], list)
+    # 共享缓存路径只有一份；逐章内容以返回值 bundle 为准
+    cache_paths = {item["shared_bundle_cache_path"] for item in chapters}
+    assert len(cache_paths) == 1
+    assert len({item["bundle"]["meta"]["target_chapter"] for item in chapters}) == 30
 
     assert summary["run_status"] == "completed"
     assert summary["exit_code"] == 0
@@ -79,6 +83,14 @@ def test_f07_stream_returns_distinct_results_and_manifest(project):
     # 发布成功后报告与状态都已落盘
     assert (project / "reports" / "单章审查" / "001-100章" / "第001章_审查报告.md").is_file()
     assert get_audit_state_path(project / "reports").is_file()
+    # A3：成功路径同时产出与 audit_scope 一致的批量汇总产物
+    assert summary["batch_summary_path"].endswith("BATCH_SUMMARY_SCOPE_1-30.md")
+    assert (project / "reports" / "BATCH_SUMMARY_SCOPE_1-30.md").is_file()
+    latest = project / "reports" / "LATEST_REPORT.md"
+    assert latest.is_file() and "批量连审大盘汇总报告" in latest.read_text(encoding="utf-8")
+    history = sorted((project / "reports" / "批量审查").glob("*_批量审查_第001-030章.md"))
+    assert len(history) >= 1
+    assert history[0].read_text(encoding="utf-8").startswith("=== story-audit 深度审查报告 ===")
 
 
 def test_f07_stream_marks_failed_and_not_executed(project):
@@ -106,6 +118,10 @@ def test_f07_stream_marks_failed_and_not_executed(project):
     # 失败运行不得发布任何章节报告
     archive_dir = project / "reports" / "单章审查"
     assert not list(archive_dir.rglob("*_审查报告.md"))
+    # A3：失败运行也不产生批量汇总产物
+    assert not (project / "reports" / "LATEST_REPORT.md").exists()
+    assert not list((project / "reports").glob("BATCH_SUMMARY_SCOPE_*.md"))
+    assert not list((project / "reports" / "批量审查").glob("*_批量审查_第001-003章.md"))
 
 
 def test_f07_stream_marks_failed_when_state_save_fails(project):

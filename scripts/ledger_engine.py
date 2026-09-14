@@ -733,10 +733,12 @@ def extract_heuristic_asset_changes(
             # 方向判定只看同一小句前缀，避免“先获得后消耗”整行串味。
             segment_start = max(line.rfind(delimiter, 0, match.start()) for delimiter in "，,。！？；;、") + 1
             prefix = line[segment_start:match.start()]
-            if any(verb in prefix for verb in HEURISTIC_BALANCE_VERBS):
-                # 余额陈述只复述现状，不是获取或消耗事件。
+            has_consumption = any(verb in prefix for verb in HEURISTIC_CONSUMPTION_VERBS)
+            if any(verb in prefix for verb in HEURISTIC_BALANCE_VERBS) and not has_consumption:
+                # 仅当同一小句没有消耗动作时才按余额陈述排除：
+                # “剩余 3 枚灵石”只是复述现状；“消耗了剩余的 2 枚灵石”是真实消耗。
                 continue
-            direction = "consume" if any(verb in prefix for verb in HEURISTIC_CONSUMPTION_VERBS) else "gain"
+            direction = "consume" if has_consumption else "gain"
             results.append({
                 "event_id": make_asset_event_id(
                     chapter_index, line_number, match.start() + 1, name, owner_value, direction, quantity, unit
