@@ -389,6 +389,25 @@ def parse_chinese_or_arabic_number(s: str) -> Union[int, float]:
         if clean_s.endswith(sfx) and len(clean_s) > 1:
             clean_s = clean_s[:-len(sfx)]
 
+    # 支持“半”：若清洗后为“半”或以“半”结尾且前面无其他数字，解析为 0.5（P2-05）
+    if clean_s == "半" or (clean_s.endswith("半") and not any(c in "0123456789零一二两三四五六七八九十百千万亿" for c in clean_s[:-1])):
+        return 0.5
+
+    # 支持省略尾随单位的民间口语数词：如“两千五”->2500，“三万五”->35000，“四百八”->480，“一千二”->1200（P2-05）
+    m_colloquial = re.match(r'^(.+[万千百])([一二两三四五六七八九])$', clean_s)
+    if m_colloquial:
+        prefix = m_colloquial.group(1)
+        last_digit_char = m_colloquial.group(2)
+        unit = prefix[-1]
+        sub_unit_multipliers = {"万": 1000, "千": 100, "百": 10}
+        if unit in sub_unit_multipliers:
+            base_val = parse_chinese_or_arabic_number(prefix)
+            digit_map = {
+                "零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+                "五": 5, "六": 6, "七": 7, "八": 8, "九": 9,
+            }
+            return base_val + digit_map.get(last_digit_char, 0) * sub_unit_multipliers[unit]
+
     cn_digits = {
         "零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
         "五": 5, "六": 6, "七": 7, "八": 8, "九": 9,

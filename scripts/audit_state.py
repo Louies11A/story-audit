@@ -360,11 +360,13 @@ def _commitment_chapter(item: Any) -> Optional[float]:
 
 
 def _matches_chapter_filter(item: Any, chapter: Optional[float]) -> bool:
-    """章号过滤：来源章号未知的条目视为可匹配任意章号。"""
+    """章号过滤：当前检测项无章号时泛匹配；当前项有明确章号时，历史项无明确章号不再通配。"""
     if chapter is None:
         return True
     item_chapter = _commitment_chapter(item)
-    return item_chapter is None or _same_chapter(item_chapter, chapter)
+    if item_chapter is None:
+        return False
+    return _same_chapter(item_chapter, chapter)
 
 
 def is_foreshadowing_adjudicated(

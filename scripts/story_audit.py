@@ -2154,6 +2154,7 @@ def run_scope_audit(
             load_expert_result_records(get_expert_result_store_path(reports_dir)), project_dir
         )
     except Exception as e:
+        _rollback_batch_ledger()
         if not silent:
             safe_console_print(f"[错误] 读取专家结果归档失败: {e}", file=sys.stderr)
         return 3
@@ -2450,6 +2451,34 @@ def run_apply_fix(
     return 0
 
 
+def _extract_stash_item_chapter(item: Dict[str, Any]) -> Optional[float]:
+    """提取账本伏笔条目的章号（兼容数字键与 origin 自由文本中的章号）。"""
+    if not isinstance(item, dict):
+        return None
+    for key in ("chapter", "origin_chapter", "source_chapter"):
+        val = item.get(key)
+        if val is not None and not isinstance(val, bool):
+            try:
+                num = float(val)
+                if math.isfinite(num):
+                    return num
+            except (TypeError, ValueError, OverflowError):
+                pass
+    origin = str(item.get("origin") or "")
+    explicit_chapter = re.match(
+        r"^\s*(?:第\s*)?([0-9]+(?:\.[0-9]+)?|[〇零一二两三四五六七八九十百千万]+)\s*(?:章|$)",
+        origin,
+    )
+    if explicit_chapter:
+        try:
+            num = float(parse_chinese_or_arabic_number(explicit_chapter.group(1)))
+            if math.isfinite(num):
+                return num
+        except (ValueError, OverflowError):
+            pass
+    return None
+
+
 def run_foreshadowing_adjudication(
     project_dir: Path,
     name: str,
@@ -2541,6 +2570,56 @@ def run_foreshadowing_adjudication(
         if not silent:
             safe_console_print(f"[错误] 保存伏笔裁决失败: {e}", file=sys.stderr)
         return 3, Path("")
+
+    # 伏笔显式裁决双轨同步（P0-02）
+    try:
+        json_path, md_path = locate_ledger_paths(project_dir)
+        if json_path.is_file():
+            ledger = load_ledger_state(json_path)
+            matching_stash = [
+                item
+                for item in ledger.foreshadowing_stash
+                if isinstance(item, dict) and str(item.get("name") or "").strip() == name.strip()
+            ]
+            if matching_stash:
+                target_items = []
+                if chapter is not None:
+                    target_ch = float(chapter)
+                    exact = [
+                        item
+                        for item in matching_stash
+                        if _extract_stash_item_chapter(item) is not None
+                        and abs(_extract_stash_item_chapter(item) - target_ch) < 1e-4
+                    ]
+                    if exact:
+                        target_items = exact
+                    else:
+                        no_ch = [
+                            item
+                            for item in matching_stash
+                            if _extract_stash_item_chapter(item) is None
+                        ]
+                        if no_ch:
+                            target_items = no_ch
+                else:
+                    target_items = matching_stash
+
+                if target_items:
+                    status_map = {
+                        "confirm": "RESOLVED",
+                        "close": "CLOSED",
+                        "reopen": "PENDING",
+                    }
+                    new_status = status_map.get(action.strip().lower(), action.upper())
+                    adjudicated_time = datetime.now(timezone.utc).isoformat()
+                    for item in target_items:
+                        item["status"] = new_status
+                        item["adjudicated_at"] = adjudicated_time
+                    save_ledger_state(ledger, json_path, md_path, force=True)
+    except Exception as e:
+        if not silent:
+            safe_console_print(f"[警告] 同步账本伏笔状态失败: {e}", file=sys.stderr)
+
     if not silent:
         safe_console_print(
             f"成功登记伏笔裁决：{name} -> {outcome.get('action')}，历史已写入 {state_path}"
@@ -4510,6 +4589,8 @@ def run_query_asset_history(
             raise ValueError("offset 必须是大于等于 0 的整数")
         bounds: Optional[Tuple[float, float]] = None
         if chapter_range is not None:
+            if isinstance(chapter_range, (list, tuple)) and any(isinstance(x, bool) for x in chapter_range):
+                raise ValueError("chapter_range 范围元素不能是布尔值")
             if isinstance(chapter_range, str):
                 bounds = parse_scope_range(chapter_range)
             elif isinstance(chapter_range, (list, tuple)) and len(chapter_range) == 2:
@@ -4533,21 +4614,36 @@ def run_query_asset_history(
 
     if owner:
         asset = find_asset_by_identity(state, name.strip(), owner.strip())
+        matching_assets = [asset] if asset else []
     else:
         # 未指定所有者时按名称匹配（按资产 id 排序取第一条，保持确定性）。
-        asset = next(
-            (
-                state.assets[asset_id]
-                for asset_id in sorted(state.assets)
-                if state.assets[asset_id].name.strip() == name.strip()
-            ),
-            None,
-        )
+        matching_assets = [
+            state.assets[asset_id]
+            for asset_id in sorted(state.assets)
+            if state.assets[asset_id].name.strip() == name.strip()
+        ]
+        asset = matching_assets[0] if matching_assets else None
     if asset is None:
         _report_api_error(
             ValueError(f"未找到资产 {name}（owner={owner or '未指定'}）"), silent
         )
         return 3, {}
+
+    is_ambiguous = bool(owner is None and len(matching_assets) > 1)
+    candidates: List[Dict[str, Any]] = []
+    if is_ambiguous:
+        for item in matching_assets:
+            candidates.append(
+                {
+                    "asset_id": item.id,
+                    "name": item.name,
+                    "owner": item.owner,
+                    "current_holder": item.current_holder,
+                    "quantity": item.quantity,
+                    "unit": item.unit,
+                    "status": item.status,
+                }
+            )
 
     history = asset.history if isinstance(asset.history, list) else []
     located: List[Dict[str, Any]] = []
@@ -4583,7 +4679,7 @@ def run_query_asset_history(
     # 默认按时间倒序返回：offset=0 为最近一条，offset 越大越早。
     ordered = list(reversed(located))
     page = ordered[offset:offset + limit]
-    return 0, {
+    payload: Dict[str, Any] = {
         "asset_id": asset.id,
         "name": asset.name,
         "owner": asset.owner,
@@ -4599,10 +4695,23 @@ def run_query_asset_history(
         "has_more": offset + len(page) < total,
         "chapter_range": list(bounds) if bounds else None,
         "entries": page,
+        "ambiguous": is_ambiguous,
+        "candidates": candidates,
         "warning": (
             "这是账本流水原始记录；预审包默认只携带最近 5 条，更早证据需要按本入口检索后才能判断是否存在冲突。"
         ),
     }
+    if is_ambiguous:
+        hint = (
+            f"检测到存在 {len(matching_assets)} 个同名资产 '{name.strip()}'（归属者: "
+            f"{', '.join(a.owner for a in matching_assets)}），已默认展示首个候选资产 "
+            f"'{asset.id}' 的流水。建议传入 owner 参数消除歧义。"
+        )
+        payload["ambiguity_message"] = hint
+        payload["warning"] += f" [提示: {hint}]"
+        if not silent:
+            safe_console_print(f"[提示] {hint}", file=sys.stderr)
+    return 0, payload
 
 
 def audit_chapter(
