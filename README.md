@@ -2,7 +2,7 @@
 
 [![Python Version](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
-![Tests](https://img.shields.io/badge/tests-617%20passed-brightgreen.svg)
+![Tests](https://img.shields.io/badge/tests-751%20passed-brightgreen.svg)
 ![Coverage](https://img.shields.io/badge/coverage-92%25-brightgreen.svg)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-zero%20external-orange.svg)]()
 
@@ -32,6 +32,13 @@
   - [3. 作者画像与偏好联动 (`AuthorMemory`)](#3-作者画像与偏好联动-authormemory)
   - [4. 资源账本生命周期管理 (`init_ledger`, `checkpoint_volume`, `sync_ledger_from_md`)](#4-资源账本生命周期管理-init_ledger-checkpoint_volume-sync_ledger_from_md)
   - [5. 短句化补丁安全回写 (`apply_fix`)](#5-短句化补丁安全回写-apply_fix)
+  - [6. 伏笔显式裁决 (`adjudicate_foreshadowing`)](#6-伏笔显式裁决-adjudicate_foreshadowing)
+  - [7. 专家结果接入与汇总 (`ExpertResult`, `archive_expert_results`)](#7-专家结果接入与汇总-expertresult-archive_expert_results)
+  - [8. 回写后的复审协调 (`get_pending_rechecks`, `resolve_recheck`, `record_issue_closure`)](#8-回写后的复审协调-get_pending_rechecks-resolve_recheck-record_issue_closure)
+  - [9. 资产事件预览与幂等提交 (`preview_asset_changes`, `confirm_asset_event`)](#9-资产事件预览与幂等提交-preview_asset_changes-confirm_asset_event)
+  - [10. 逐章流式审查与运行清单 (`iter_audit_scope`)](#10-逐章流式审查与运行清单-iter_audit_scope)
+  - [11. 问题处置与规则解释 (`record_finding_disposition`)](#11-问题处置与规则解释-record_finding_disposition)
+  - [12. 上下文预算与按需检索 (`build_context_package`, `query_asset_history`)](#12-上下文预算与按需检索-build_context_package-query_asset_history)
 - [六、状态码 (Status Codes) 规范](#六状态码-status-codes-规范)
 - [七、缺陷分级体系 (P0 ~ P3)](#七缺陷分级体系-p0--p3)
 - [八、测试套件与工程验证](#八测试套件与工程验证)
@@ -273,6 +280,153 @@ status_code = apply_fix(
 )
 ```
 
+### 6. 伏笔显式裁决 (`adjudicate_foreshadowing`)
+
+```python
+from scripts.story_audit import adjudicate_foreshadowing
+
+# 关闭一条伏笔承诺：记录原因、证据与正文版本，条目进入历史并停止跟踪
+status_code, state_path = adjudicate_foreshadowing(
+    project_dir=project_dir,
+    name="海门钥匙",
+    action="close",
+    reason="第 12 章已明确回收",
+    evidence="第12章 钥匙插入海门锁孔。",
+    source="author",
+    chapter=12,
+)
+
+# 重新开启：必须说明原因并给出章节，记录重新开启的正文版本
+status_code, state_path = adjudicate_foreshadowing(
+    project_dir=project_dir,
+    name="海门钥匙",
+    action="reopen",
+    reason="新增支线再次启用该伏笔",
+    chapter=18,
+)
+```
+
+已确认或已关闭的条目不会被正文旧标签重新激活；重复确认是幂等空操作；同名伏笔按来源章号分别登记裁决。
+
+### 7. 专家结果接入与汇总 (`ExpertResult`, `archive_expert_results`)
+
+宿主执行完语义审查后，用统一契约回传实际结果；底层只接收真实执行结果，不代为调用专家。
+
+```python
+from scripts.story_audit import ExpertResult, archive_expert_results, compute_text_fingerprint
+
+result = ExpertResult(
+    expert="因果审查员",
+    status="completed",              # completed / failed / not_executed
+    chapters=[1],
+    text_fingerprint=compute_text_fingerprint(project_dir, 1),
+    findings=[{"severity": "P1", "category": "causal", "issue": "钥匙来源缺失", "fix": "统一来源"}],
+)
+
+status_code, summary_path = archive_expert_results(project_dir, [result])
+```
+
+完成、失败、未执行三种状态在汇总与报告中分别呈现；重复提交按身份幂等；正文指纹与当前章节不一致的结果标记为过期且不覆盖当前裁决；专家 P0/P1 以专家来源并入开放缺陷，后续确定性复审不会清除。
+
+### 8. 回写后的复审协调 (`get_pending_rechecks`, `resolve_recheck`, `record_issue_closure`)
+
+`apply_fix` 写回成功后会登记补丁事件，并把第 N 章报告与第 N+1 章接缝检查登记为待复审项：
+
+```python
+from scripts.story_audit import get_pending_rechecks, is_chapter_version_audited, record_issue_closure, resolve_recheck
+
+status_code, pending = get_pending_rechecks(project_dir)
+# pending["pending"] 每项含 chapter、scope（chapter/seam）、当前正文版本与 needs_reaudit
+
+# 人工解除某条待办（留原因与来源），或单独登记"问题经复核关闭"事件
+resolve_recheck(project_dir, chapter=1, scope="chapter", resolution="已人工复核", source="author")
+record_issue_closure(project_dir, chapter=1, issue="钥匙来源缺失", reason="已统一来源", source="author")
+
+# 完成章号不再等于当前版本已审：用指纹判断
+current = is_chapter_version_audited(project_dir, chapter=1)
+```
+
+正文版本变化后旧归档报告会被保存到 `reports/单章审查/历史/`，不会被静默覆盖。
+
+### 9. 资产事件预览与幂等提交 (`preview_asset_changes`, `confirm_asset_event`)
+
+候选变更只做预览，必须经作者或宿主确认后才进入账本：
+
+```python
+from scripts.story_audit import confirm_asset_event, preview_asset_changes
+
+status_code, preview = preview_asset_changes(project_dir, chapter_index=3)
+for candidate in preview["candidates"]:
+    # 逐条复核：方向、数量、所有者均可能被启发式误判
+    confirm_asset_event(
+        project_dir,
+        event=candidate,
+        decision="accept",
+        owner="主角",
+        reason="第 3 章明确获得",
+        source="author",
+    )
+```
+
+同一事件重复提交不会重复加账或扣账；改判会被拒绝；消耗未入账资产会被拒绝，避免制造负事实；两位角色的同名装备各自独立记账；裁决流水与证据保留在账本 JSON 与 Markdown。
+
+### 10. 逐章流式审查与运行清单 (`iter_audit_scope`)
+
+需要逐章结果（而不是一次拿到大盘报告）时使用流式入口，宿主可以边产出边组织专家审查：
+
+```python
+from scripts.story_audit import iter_audit_scope
+
+for item in iter_audit_scope(project_dir, scope_str="1-30", platform="qidian"):
+    if item["kind"] == "chapter":
+        # item["chapter"] / item["text_version"] / item["findings"] /
+        # item["bundle"]（该章预审包） / item["report_path"]
+        ...
+    else:
+        # item["kind"] == "run_summary"：completed / failed / not_executed 与产物路径
+        ...
+```
+
+每次运行写出 `reports/批量审查/运行清单/{run_id}.json`；中途失败时清单区分已完成、失败与未执行章节，失败运行不发布章节报告与预审包。运行成功时会同时产出与 `audit_scope` 一致的 `LATEST_REPORT.md`、范围汇总与历史归档。生成器必须消费到底，提前中断会让清单停留在 `running`。
+
+### 11. 问题处置与规则解释 (`record_finding_disposition`)
+
+确定性发现带稳定问题编号与规则元数据（规则 id、版本、阈值、命中条件、上下文），作者可以对规则建议登记处置：
+
+```python
+from scripts.story_audit import get_finding_dispositions, record_finding_disposition
+
+record_finding_disposition(
+    project_dir,
+    finding_id="finding-...",     # 也可用 finding= 传入报告中的发现对象
+    decision="false_positive",    # accepted / deferred / false_positive
+    reason="该长段为刻意留白的排版效果",
+    source="author",
+)
+
+status_code, data = get_finding_dispositions(project_dir)
+```
+
+处置带正文版本：正文变化后查询会返回 `needs_reverification`，处置不再自动生效。因果、事实、一致性问题与平台门禁发现不会被作者偏好免除，仍然保留在开放缺陷中。
+
+### 12. 上下文预算与按需检索 (`build_context_package`, `query_asset_history`)
+
+长篇连载的账本会持续增长，预审包默认只携带每项资产最近 5 条流水：
+
+```python
+from scripts.story_audit import build_context_package, query_asset_history
+
+status_code, data = build_context_package(project_dir, chapter_index=42, budget=60_000)
+# data["budget"]            预算口径、实际用量、固定开销、是否超限
+# data["omissions"]         省略了什么、原因、完整证据定位与检索提示
+# data["insufficient_context"]  历史被截断等上下文不足标记
+
+# 关键证据在更早历史时按需展开（offset 越大越早）
+status_code, history = query_asset_history(project_dir, name="灵石", limit=20, offset=5)
+```
+
+被省略的条目代表"本轮未携带"，不能据此推断不存在冲突；`omissions` 中给出账本相对路径与 JSON Pointer，可按需取回完整证据。
+
 ---
 
 ## 六、状态码 (Status Codes) 规范
@@ -324,12 +478,12 @@ pytest --cov=scripts --cov-report=term-missing
 
 ### 测试指标
 
-2026-09-08 在 Windows、Python 3.11.15 上执行 `python -X utf8 -m pytest -q --cov=scripts --cov-report=term-missing`：
+2026-09-14 在 Windows、Python 3.11.15 上执行 `python -B -X utf8 -m pytest -q -p no:cacheprovider`：
 
-- **结果**：617 项测试、12 项子测试全部通过。
-- **语句覆盖率**：92%（3346 条语句，274 条未覆盖）。
-- **本次耗时**：13.50 秒，包含覆盖率采集；用时受机器和文件系统负载影响。
-- **覆盖范围**：账本与状态校验、损坏数据保护、双轨失败恢复、章节消歧、补丁字节保真、扫描边界、跨批继承及报告真实性。
+- **结果**：751 项测试、12 项子测试全部通过。
+- **语句覆盖率**：617 项版本时为 92%；本轮未重新采集覆盖率，不把旧数值当作当前实测。
+- **本次耗时**：约 15 秒，受机器和文件系统负载影响。
+- **覆盖范围**：账本与状态校验、损坏数据保护、双轨失败恢复、章节消歧、补丁字节保真、扫描边界、跨批继承、伏笔裁决、专家结果接入、复审协调、资产事件、流式运行清单、问题处置与上下文预算。
 - **完整流程**：`test_workflow_quality.py` 覆盖建账、单章审查、批量审查、正文回写、Markdown 同步和分卷快照，分别验证两种账本布局及 UTF-8/LF、GB18030/CRLF。
 
 另外通过字节码编译、15 个生产模块的 Python 3.8 语法检查及官方技能元数据校验。Python 3.8 的兼容检查使用 `ast.parse(..., feature_version=(3, 8))`，未在 Python 3.8 解释器上运行全套测试。
