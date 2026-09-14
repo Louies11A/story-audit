@@ -20,7 +20,7 @@ from collections.abc import Iterable as IterableABC
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from scripts.types import Finding
 
@@ -404,6 +404,68 @@ def summarize_expert_records(records: Sequence[Dict[str, Any]]) -> Dict[str, int
     return summary
 
 
+def refresh_expert_records_staleness(
+    records: Sequence[Dict[str, Any]],
+    fingerprint_lookup,
+) -> List[Dict[str, Any]]:
+    """按当前正文重新判定过期状态，返回呈现副本（不改写归档记录本身）。
+
+    指纹缺失（失败/未执行）的记录维持登记时的状态；无法核对当前正文时一律视为过期，
+    避免把无法复现的旧结论继续呈现为“完成”。归档 JSON 只由提交路径写入。
+    """
+    refreshed: List[Dict[str, Any]] = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        item = dict(record)
+        submitted = str(item.get("text_fingerprint") or "")
+        if submitted:
+            try:
+                chapters = [float(value) for value in (item.get("chapters") or [])]
+            except (TypeError, ValueError, OverflowError):
+                chapters = []
+            current: Optional[str] = None
+            if chapters:
+                try:
+                    current = fingerprint_lookup(chapters)
+                except Exception:
+                    current = None
+            if current is None:
+                item["stale"] = True
+                item["stale_reason"] = "无法核对当前正文指纹，需重新执行专家审查"
+                item["current_fingerprint"] = ""
+            elif current == submitted:
+                item["stale"] = False
+                item["stale_reason"] = ""
+                item["current_fingerprint"] = current
+            else:
+                item["stale"] = True
+                item["stale_reason"] = "正文指纹与当前正文不一致，需重新执行专家审查"
+                item["current_fingerprint"] = current
+        refreshed.append(item)
+    return refreshed
+
+
+def expert_summary_signature(records: Sequence[Dict[str, Any]]) -> str:
+    """专家汇总内容签名：只由执行状态、范围、发现统计与过期判定决定，忽略生成时间。"""
+    basis: List[str] = []
+    for record in _sorted_records(records):
+        basis.append(
+            "|".join(
+                [
+                    str(record.get("id") or ""),
+                    str(record.get("expert") or ""),
+                    str(record.get("status") or ""),
+                    str(record.get("scope") or ""),
+                    "1" if record.get("stale") else "0",
+                    str(record.get("stale_reason") or ""),
+                    str(record.get("finding_count") or 0),
+                ]
+            )
+        )
+    return hashlib.sha256("\n".join(basis).encode("utf-8")).hexdigest()
+
+
 def _sorted_records(records: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(
         (item for item in records if isinstance(item, dict)),
@@ -421,6 +483,13 @@ def _status_label(record: Dict[str, Any]) -> str:
         return label
     status = str(record.get("status") or "")
     return EXPERT_STATUS_LABELS.get(status, status or "状态未记录")
+
+
+def _display_status(record: Dict[str, Any]) -> str:
+    """状态栏展示：过期结果必须显示为已过期，而不是沿用登记时的完成状态。"""
+    if record.get("stale"):
+        return "已过期（需重新执行专家审查）"
+    return _status_label(record)
 
 
 def _severity_counts(record: Dict[str, Any]) -> Dict[str, int]:
@@ -468,7 +537,7 @@ def render_expert_status_table(records: Sequence[Dict[str, Any]]) -> List[str]:
         lines.append(
             "| {} | {} | {} | {} | {} |".format(
                 str(record.get("expert") or "-"),
-                _status_label(record),
+                _display_status(record),
                 str(record.get("scope") or "范围未记录"),
                 _finding_summary(record),
                 _record_note(record),
@@ -512,11 +581,11 @@ def render_expert_summary_markdown(
     for record in _sorted_records(records):
         heading = "### {} · {} · {}".format(
             str(record.get("expert") or "-"),
-            _status_label(record),
+            _display_status(record),
             str(record.get("scope") or "范围未记录"),
         )
         if record.get("stale"):
-            heading += " · ⚠️ 已过期（不参与当前裁决）"
+            heading += " · ⚠️ 不参与当前裁决"
         detail_blocks.append(heading)
         reason = str(record.get("reason") or "").strip()
         evidence = str(record.get("evidence") or "").strip()
@@ -602,6 +671,8 @@ __all__ = [
     "build_expert_result_record",
     "merge_expert_result_records",
     "summarize_expert_records",
+    "refresh_expert_records_staleness",
+    "expert_summary_signature",
     "render_expert_status_table",
     "render_expert_summary_markdown",
     "expert_result_summary_entries",

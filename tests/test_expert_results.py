@@ -333,3 +333,98 @@ def test_f04_invalid_project_dir_is_controlled(project, bad_project):
         target, results=[_result(text_fingerprint="abc")], silent=True
     ) == (3, Path(""))
     assert _snapshot(project) == before
+
+
+def test_f04_staleness_is_recomputed_in_reports_and_summary(project):
+    """P2-2：正文变更后，读取/呈现路径按当前正文重新判定过期状态。"""
+    old_version = _fingerprint(project, 1)
+    result = _result(text_fingerprint=old_version, findings=[_finding("首次提交的专家结论")])
+    assert story_audit.archive_expert_results(project, results=[result], silent=True)[0] == 0
+    store = get_expert_result_store_path(project / "reports")
+    store_before = store.read_bytes()
+    summary_path = get_expert_summary_path(project / "reports")
+    summary_before = summary_path.read_text(encoding="utf-8")
+    assert "需重新执行专家审查" not in summary_before
+    assert "已过期：0" in summary_before
+
+    (project / "正文" / "第001章.txt").write_text(CHAPTER_ONE + "他合上了箱盖。\n", encoding="utf-8")
+    code, report = story_audit.audit_chapter(project, chapter_index=1, silent=True)
+    assert code == 0
+    report_text = report.read_text(encoding="utf-8")
+    assert "需重新执行专家审查" in report_text
+    assert "已过期" in report_text
+
+    # 批量大盘报告走同一读取/呈现路径，同样按当前正文重新判定。
+    code_scope, scope_report = story_audit.audit_scope(project, "1-2", silent=True)
+    assert code_scope == 0
+    assert "需重新执行专家审查" in scope_report.read_text(encoding="utf-8")
+
+    summary_after = summary_path.read_text(encoding="utf-8")
+    assert "需重新执行专家审查" in summary_after
+    assert "已过期：1" in summary_after
+    # 读取/呈现路径不得改写归档 JSON。
+    assert store.read_bytes() == store_before
+    # 呈现层刷新不会二次注入缺陷：原记录只保留一份。
+    assert _issues(project).count("首次提交的专家结论") == 1
+
+    stale_submit = _result(
+        text_fingerprint=old_version, findings=[_finding("过期结论不得进入持久状态")]
+    )
+    assert story_audit.archive_expert_results(project, results=[stale_submit], silent=True)[0] == 0
+    assert "过期结论不得进入持久状态" not in _issues(project)
+
+
+def test_f04_corrupt_store_blocks_audit_before_any_write(project):
+    """P3-1：专家归档损坏时必须在账本等任何写入之前失败。"""
+    (project / "正文" / "第001章.txt").write_text(
+        CHAPTER_ONE
+        + '<!-- audit:stash name="海门钥匙" origin="第1章" status="pending" -->\n',
+        encoding="utf-8",
+    )
+    store = get_expert_result_store_path(project / "reports")
+    store.parent.mkdir(parents=True)
+    store.write_text("{broken", encoding="utf-8")
+    before = _snapshot(project)
+
+    code, report = story_audit.audit_chapter(project, chapter_index=1, silent=True)
+    assert (code, report) == (3, Path(""))
+    assert _snapshot(project) == before
+    assert not (project / "设定" / "资源账本.json").exists()
+    assert not (project / "资源账本.json").exists()
+    assert not (project / "reports" / ".audit_state.json").exists()
+
+
+def test_f04_expert_defect_identity_includes_platform(project):
+    """P3-3：专家缺陷身份包含平台，跨平台记录可区分，同平台重复归档仍幂等。"""
+    result = _result(
+        text_fingerprint=_fingerprint(project, 1),
+        findings=[_finding("平台相关专家结论", severity="P0", category="platform")],
+    )
+    assert story_audit.archive_expert_results(
+        project, results=[result], platform="generic", silent=True
+    )[0] == 0
+    assert story_audit.archive_expert_results(
+        project, results=[result], platform="zhihu", silent=True
+    )[0] == 0
+
+    def platform_defects():
+        return [
+            item
+            for item in _state(project)["open_defects"]
+            if item.get("issue") == "平台相关专家结论"
+        ]
+
+    defects = platform_defects()
+    assert sorted(item["platform"] for item in defects) == ["generic", "zhihu"]
+    assert len({item["id"] for item in defects}) == 2
+
+    assert story_audit.archive_expert_results(
+        project, results=[result], platform="zhihu", silent=True
+    )[0] == 0
+    assert len(platform_defects()) == 2
+
+    code, report = story_audit.audit_chapter(project, chapter_index=2, silent=True)
+    assert code == 0
+    report_text = report.read_text(encoding="utf-8")
+    assert "专家：generic" in report_text
+    assert "专家：zhihu" in report_text

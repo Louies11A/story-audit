@@ -483,9 +483,9 @@ def apply_foreshadowing_adjudication(
 
         record = _find_adjudication_record(state, target_name, origin)
         if not pending:
-            # 已经登记过同名裁决时，重复确认/关闭一律幂等返回，不重复写历史。
-            existing_record = record or _latest_adjudication_record(state, target_name)
-            if existing_record is not None:
+            # 只有 (name, 指定章号) 确有条目时才幂等；否则必须为该章号登记独立裁决记录，
+            # 避免该章旧标签在后续复审中以新的 origin 重新进入待办池。
+            if record is not None:
                 # 重复确认/关闭：幂等空操作，不重复计数、不重复写历史、不改写状态文件。
                 return {
                     "name": target_name,
@@ -494,7 +494,7 @@ def apply_foreshadowing_adjudication(
                     "found": True,
                     "idempotent": True,
                     "removed": 0,
-                    "record": existing_record,
+                    "record": record,
                 }
             # 作者或实际审查结果可以对尚未登记的伏笔直接裁决；依据与来源必须完整。
             record = {
@@ -659,6 +659,11 @@ def render_inherited_items_section(inherited: Dict[str, Any]) -> str:
             chap = d.get("chapter", "-")
             sev = d.get("severity", "P1")
             cat = d.get("category", "causal")
+            # 专家缺陷身份包含平台（与确定性缺陷约定一致），跨平台归档会保留多条记录，
+            # 此处标注平台，避免读者把同一发现的不同平台裁决误读为重复条目。
+            if str(d.get("source") or "") == "expert":
+                platform = str(d.get("platform") or "")
+                cat = f"{cat}（专家：{platform}）" if platform else f"{cat}（专家）"
             issue = d.get("issue", "").replace("|", "｜")
             fix = d.get("fix", "严格依事实对齐").replace("|", "｜")
             lines.append(f"| {idx} | 第{chap}章 | {sev} | {cat} | {issue} | {fix} |")

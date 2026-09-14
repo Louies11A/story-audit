@@ -75,11 +75,13 @@ from scripts.expert_results import (
     STORE_SCHEMA_VERSION,
     build_expert_result_record,
     compute_text_fingerprint,
+    expert_summary_signature,
     expert_result_summary_entries,
     get_expert_result_store_path,
     get_expert_summary_path,
     load_expert_result_records,
     merge_expert_result_records,
+    refresh_expert_records_staleness,
     render_expert_summary_markdown,
 )
 from scripts.types import BoundaryContext, ChapterItem, Finding, FormatFinding, PatchSpec, format_factual_fix
@@ -735,13 +737,19 @@ def _merge_foreshadowing_commitments(state: AuditState, commitments: List[Dict[s
     已关闭/已确认（含重新开启后的历史记录）的人工裁决优先于正文标签：旧标签与重复扫描
     都不能重新激活已裁决条目，只有显式的 reopen 动作能把条目放回待办池。
     """
-    def key(item: Dict[str, Any]) -> Tuple[str, str]:
+    def key(item: Dict[str, Any]) -> Tuple[str, Optional[float], str]:
+        """章号可解析时按 (tag, 章号) 去重；章号不可用时保留来源自由文本参与身份。"""
+        tag = str(item.get("tag", "")).strip()
         chapter = item.get("origin_chapter")
+        if chapter is None or isinstance(chapter, bool):
+            return (tag, None, str(item.get("note", "")))
         try:
-            chapter_key = f"{float(chapter):g}" if chapter is not None else ""
+            value = float(chapter)
         except (TypeError, ValueError, OverflowError):
-            chapter_key = str(chapter)
-        return (str(item.get("tag", "")).strip(), chapter_key)
+            return (tag, None, str(item.get("note", "")))
+        if not math.isfinite(value):
+            return (tag, None, str(item.get("note", "")))
+        return (tag, value, "")
 
     known = {
         key(item)
@@ -886,6 +894,8 @@ def run_audit(
             audit_state = load_audit_state(reports_dir)
         if audit_state is not None and inherited_items is None:
             inherited_items = get_inherited_items(audit_state)
+        # 专家归档必须在账本与报告写入之前完成读取与结构校验：损坏时不得留下半写产物。
+        expert_records = load_expert_result_records(get_expert_result_store_path(reports_dir))
     except Exception as e:
         if not silent:
             print(f"[错误] 读取持久化状态失败: {e}", file=sys.stderr)
@@ -1003,9 +1013,10 @@ def run_audit(
     )
     _merge_foreshadowing_commitments(audit_state, foreshadowing_commitments)
     try:
-        # 已归档的专家执行状态随继承栏目进入报告与预审包。
+        # 已归档的专家执行状态按当前正文重新判定过期后随继承栏目进入报告与预审包。
+        expert_view = _refresh_expert_records(expert_records, project_dir)
         inherited_items = _attach_expert_summaries(
-            get_inherited_items(audit_state), reports_dir
+            get_inherited_items(audit_state), expert_view
         )
     except Exception as e:
         if not silent:
@@ -1062,6 +1073,12 @@ def run_audit(
         bundle_path: bundle_content,
         archived_report_path: report_content,
     }
+    # 过期判定视图发生变化时，随本轮产物原子刷新专家汇总渲染（归档 JSON 保持不变）。
+    summary_stale = expert_summary_signature(expert_view) != expert_summary_signature(expert_records)
+    if expert_view and summary_stale:
+        pending_writes[get_expert_summary_path(reports_dir)] = render_expert_summary_markdown(
+            expert_view, generated_at=datetime.now(timezone.utc).isoformat()
+        )
     if write_latest_report:
         pending_writes[latest_report_path] = report_content
 
@@ -1693,6 +1710,14 @@ def run_scope_audit(
     )
 
     # 生成聚合大盘报告 Markdown 内容
+    try:
+        expert_view = _refresh_expert_records(
+            load_expert_result_records(get_expert_result_store_path(reports_dir)), project_dir
+        )
+    except Exception as e:
+        if not silent:
+            safe_console_print(f"[错误] 读取专家结果归档失败: {e}", file=sys.stderr)
+        return 3
     batch_summary_content = render_scope_batch_summary(
         scope_str=scope_str,
         s_min=s_min,
@@ -1705,7 +1730,7 @@ def run_scope_audit(
         platform=platform,
         run_id=run_id,
         inherited_items=_attach_expert_summaries(
-            get_inherited_items(audit_state), reports_dir
+            get_inherited_items(audit_state), expert_view
         ),
     )
 
@@ -2026,6 +2051,8 @@ def _merge_expert_defects(
             if severity not in ("P0", "P1"):
                 continue
             issue = str(finding.get("issue") or "")
+            # 缺陷身份与确定性缺陷保持同一约定：包含平台。同一专家发现跨平台归档会保留
+            # 多条带各自平台标记的记录，用于区分不同平台门禁下的裁决，不是重复计数。
             defect_id = make_defect_id(
                 "expert", str(record.get("expert") or ""), platform, chapter, issue
             )
@@ -2056,16 +2083,63 @@ def _merge_expert_defects(
     return added
 
 
+def _build_chapter_fingerprint_lookup(project_dir: Path):
+    """构造按当前正文计算范围指纹的查询函数；章节缺失或无法唯一定位时返回 None。"""
+    try:
+        chapters = ChapterResolver().discover_chapters(project_dir)
+    except Exception:
+        chapters = []
+    cache: Dict[float, Optional[str]] = {}
+
+    def lookup(scope: List[float]) -> Optional[str]:
+        scoped: Dict[float, str] = {}
+        for chapter in scope:
+            key = round(float(chapter), 6)
+            if key not in cache:
+                try:
+                    target = _select_unique_chapter(chapters, float(chapter))
+                except ValueError:
+                    target = None
+                if target is None:
+                    cache[key] = None
+                else:
+                    try:
+                        text, _, _ = read_file_safe(target.path)
+                    except Exception:
+                        text = None
+                    cache[key] = text
+            text = cache[key]
+            if text is None:
+                return None
+            scoped[float(chapter)] = text
+        if not scoped:
+            return None
+        return compute_text_fingerprint(scoped)
+
+    return lookup
+
+
+def _refresh_expert_records(
+    records: List[Dict[str, Any]],
+    project_dir: Path,
+) -> List[Dict[str, Any]]:
+    """按当前正文重新判定专家结果过期状态，返回呈现副本（不改写归档 JSON）。"""
+    if not records:
+        return []
+    return refresh_expert_records_staleness(
+        records, _build_chapter_fingerprint_lookup(project_dir)
+    )
+
+
 def _attach_expert_summaries(
     inherited_items: Dict[str, Any],
-    reports_dir: Path,
+    expert_records: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """把已归档的专家执行状态挂入继承栏目，供报告与预审包呈现。"""
-    records = load_expert_result_records(get_expert_result_store_path(reports_dir))
-    if not records:
+    """把按当前正文判定过期的专家执行状态挂入继承栏目，供报告与预审包呈现。"""
+    if not expert_records:
         return inherited_items
     attached = dict(inherited_items or {})
-    attached["expert_results"] = expert_result_summary_entries(records)
+    attached["expert_results"] = expert_result_summary_entries(expert_records)
     return attached
 
 
