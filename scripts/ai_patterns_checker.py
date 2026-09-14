@@ -111,7 +111,8 @@ NEGATION_PARADE_2 = re.compile(
 
 # 3. 反序对比 (reverse not-is: “是A，不是B”)
 REVERSE_NOT_IS_PATTERN = re.compile(
-    r'(?<![还是只是可是但是于是倒是像是若是要是在是便是老是总是更是最是算怕凡或即自竟原本当仍许净光单尽不])'
+    r'(?<!(?:还是|只是|可是|但是|于是|倒是|像是|若是|要是|便是|老是|总是|更是|最是|原本))'
+    r'(?<![还只可但于倒像若要便老总更最当仍许净单尽不])'
     r'是([^，,。！？!?\n]{1,15})[，,]\s*(?:而)?不是([^。！？!?\n]{1,25})'
 )
 
@@ -195,13 +196,14 @@ def scan_ai_patterns(text: str) -> List[FormatFinding]:
     for line_idx, orig_line in enumerate(lines):
         line_num = line_idx + 1
         line_len = len(orig_line) + 1  # 包含 \n
-        clean_orig = orig_line.rstrip("\r").strip()
+        raw_line = orig_line.rstrip("\r\n")
+        clean_orig = raw_line.strip()
         if not clean_orig:
             current_char_offset += line_len
             continue
 
-        # 引号外正文掩码
-        masked_line = mask_quotes_in_line(orig_line.rstrip("\r"))
+        # 引号外正文掩码（保持与 raw_line 等长索引）
+        masked_line = mask_quotes_in_line(raw_line)
         tail_start = max(0, char_offset_threshold - current_char_offset)
         is_in_tail_window = (
             line_idx > opening_line_limit and tail_start < len(masked_line)
@@ -227,7 +229,7 @@ def scan_ai_patterns(text: str) -> List[FormatFinding]:
         # -------------------------------------------------------------
         m_vc = VOICE_CONTRAST_PATTERN.search(masked_line)
         if m_vc:
-            hit_text = clean_orig[max(0, m_vc.start() - 5):min(len(clean_orig), m_vc.end() + 15)]
+            hit_text = raw_line[max(0, m_vc.start() - 5):min(len(raw_line), m_vc.end() + 15)]
             findings.append(FormatFinding(
                 line_number=line_num,
                 flaw_type="AI_VOICE_CONTRAST",
@@ -247,7 +249,7 @@ def scan_ai_patterns(text: str) -> List[FormatFinding]:
                 line_number=line_num,
                 flaw_type="AI_NEGATION_PARADE",
                 severity="P2",
-                snippet=_make_snippet(clean_orig[m_np1.start():m_np1.end() + 10]),
+                snippet=_make_snippet(raw_line[m_np1.start():m_np1.end() + 10]),
                 message="检测到连续否定排比句式（没有X，没有Y……）",
                 suggestion="建议精简连续否定排比，直接描写当下核心在场事实或具象画面。"
             ))
@@ -256,7 +258,7 @@ def scan_ai_patterns(text: str) -> List[FormatFinding]:
                 line_number=line_num,
                 flaw_type="AI_NEGATION_PARADE",
                 severity="P2",
-                snippet=_make_snippet(clean_orig[m_np2.start():m_np2.end() + 10]),
+                snippet=_make_snippet(raw_line[m_np2.start():m_np2.end() + 10]),
                 message="检测到先否定后肯定模板句式（没X，没Y……只是Z）",
                 suggestion="建议删去多余否定铺垫，直接陈述肯定事实与核心动作。"
             ))
@@ -273,7 +275,7 @@ def scan_ai_patterns(text: str) -> List[FormatFinding]:
                     line_number=line_num,
                     flaw_type="AI_NOT_IS",
                     severity="P2",
-                    snippet=_make_snippet(clean_orig[m_not_is_1.start():m_not_is_1.end()]),
+                    snippet=_make_snippet(raw_line[m_not_is_1.start():m_not_is_1.end()]),
                     message="检测到典型 AI 对仗句式「不是……而是……」",
                     suggestion="建议删去否定前置铺垫，直接陈述肯定事实或通过具体动作细节展现。"
                 ))
@@ -289,7 +291,7 @@ def scan_ai_patterns(text: str) -> List[FormatFinding]:
                         line_number=line_num,
                         flaw_type="AI_NOT_IS",
                         severity="P2",
-                        snippet=_make_snippet(clean_orig[m_not_is_2.start():m_not_is_2.end()]),
+                        snippet=_make_snippet(raw_line[m_not_is_2.start():m_not_is_2.end()]),
                         message="检测到典型 AI 对仗句式「不是……是……」",
                         suggestion="建议删去否定前置铺垫，直接陈述肯定事实或展开行动描写。"
                     ))
@@ -303,7 +305,7 @@ def scan_ai_patterns(text: str) -> List[FormatFinding]:
                     line_number=line_num,
                     flaw_type="AI_NOT_IS",
                     severity="P2",
-                    snippet=_make_snippet(clean_orig[m_rev.start():m_rev.end()]),
+                    snippet=_make_snippet(raw_line[m_rev.start():m_rev.end()]),
                     message="检测到典型 AI 反序对比句式「是……而不是……」",
                     suggestion="建议删去冗余的否定尾巴，保留主干陈述，精炼叙事。"
                 ))
@@ -312,24 +314,29 @@ def scan_ai_patterns(text: str) -> List[FormatFinding]:
         # 5. 检测 trailer-ending 与 trailer-summary (仅在章末窗口)
         # -------------------------------------------------------------
         if is_in_tail_window:
-            m_te = TRAILER_ENDING_PATTERN.search(masked_line, tail_start)
+            # 优先在 tail_start 之后搜索；若未命中且该行属于前 75% 边界过渡行 (tail_start <= 120)，在整行上运行搜索防漏检 (P0-03)
+            m_te = TRAILER_ENDING_PATTERN.search(masked_line, tail_start) or (
+                TRAILER_ENDING_PATTERN.search(masked_line) if tail_start <= 120 else None
+            )
             if m_te:
                 findings.append(FormatFinding(
                     line_number=line_num,
                     flaw_type="AI_TRAILER_ENDING",
                     severity="P2",
-                    snippet=_make_snippet(orig_line[m_te.start():m_te.end() + 20]),
+                    snippet=_make_snippet(raw_line[m_te.start():m_te.end() + 20]),
                     message="检测到章末预告式总结收尾（没人知道/殊不知/才刚刚开始等）",
                     suggestion="建议删去全知叙述者的剧透预告，将视角锁定在角色当下体验，留白让读者自然翻页。"
                 ))
 
-            m_ts = TRAILER_SUMMARY_PATTERN.search(masked_line, tail_start)
+            m_ts = TRAILER_SUMMARY_PATTERN.search(masked_line, tail_start) or (
+                TRAILER_SUMMARY_PATTERN.search(masked_line) if tail_start <= 120 else None
+            )
             if m_ts:
                 findings.append(FormatFinding(
                     line_number=line_num,
                     flaw_type="AI_TRAILER_SUMMARY",
                     severity="P2",
-                    snippet=_make_snippet(orig_line[m_ts.start():m_ts.end() + 20]),
+                    snippet=_make_snippet(raw_line[m_ts.start():m_ts.end() + 20]),
                     message="检测到章末状态总结体（这一夜注定……/这一切都结束了/命运的齿轮等）",
                     suggestion="建议删去机械的状态盖章句，以角色具体的动作、环境定格或事件余波收尾。"
                 ))
@@ -337,18 +344,19 @@ def scan_ai_patterns(text: str) -> List[FormatFinding]:
         # -------------------------------------------------------------
         # 6. 检测 god-view-exposition (动作清单 / 上帝解释腔)
         # -------------------------------------------------------------
-        # 6.1 监控摄像头式动作清单
-        action_hits = list(ACTION_VERB_RE.finditer(masked_line))
+        # 6.1 监控摄像头式动作清单（在调用正则前先检查逗号短路）
         comma_count = masked_line.count("，") + masked_line.count(",") + masked_line.count("、")
-        if len(action_hits) >= 5 and comma_count >= 4:
-            findings.append(FormatFinding(
-                line_number=line_num,
-                flaw_type="AI_GOD_VIEW_EXPOSITION",
-                severity="P2",
-                snippet=_make_snippet(clean_orig),
-                message=f"检测到监控摄像头式纯动作清单（单段堆叠 {len(action_hits)} 个通用动词且缺少视线焦点）",
-                suggestion="建议融入人物主观视线与心理反应，注入动作意图，避免机械动作步骤流水账罗列。"
-            ))
+        if comma_count >= 4:
+            action_hits = list(ACTION_VERB_RE.finditer(masked_line))
+            if len(action_hits) >= 5:
+                findings.append(FormatFinding(
+                    line_number=line_num,
+                    flaw_type="AI_GOD_VIEW_EXPOSITION",
+                    severity="P2",
+                    snippet=_make_snippet(clean_orig),
+                    message=f"检测到监控摄像头式纯动作清单（单段堆叠 {len(action_hits)} 个通用动词且缺少视线焦点）",
+                    suggestion="建议融入人物主观视线与心理反应，注入动作意图，避免机械动作步骤流水账罗列。"
+                ))
 
         # 6.2 上帝解释腔
         m_gv = GOD_VIEW_EXPOSITION_PATTERN.search(masked_line)
@@ -357,7 +365,7 @@ def scan_ai_patterns(text: str) -> List[FormatFinding]:
                 line_number=line_num,
                 flaw_type="AI_GOD_VIEW_EXPOSITION",
                 severity="P2",
-                snippet=_make_snippet(clean_orig[m_gv.start():m_gv.end() + 20]),
+                snippet=_make_snippet(raw_line[m_gv.start():m_gv.end() + 20]),
                 message="检测到 Gate G 上帝解释腔/替读者划重点句式",
                 suggestion="建议撤回全知作者视角解说，通过场内客观事实呈现，交由读者自行领会。"
             ))

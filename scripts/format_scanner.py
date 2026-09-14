@@ -559,17 +559,18 @@ def _is_military_data_report(sentence: str) -> bool:
 
 
 def _find_quote_intervals(line: str, closed_only: bool = False) -> List[Tuple[int, int]]:
-    """查找对话区间；closed_only 仅返回含台词的闭合区间，不反复扫描无闭合后缀。"""
+    """查找对话区间；closed_only 仅返回含台词的闭合区间，不反复扫描无闭合后缀。支持 “” "" 「」 『』"""
     intervals: List[Tuple[int, int]] = []
     missing_closers = set()
     i = 0
     n = len(line)
+    quote_map = {'“': '”', '"': '"', '「': '」', '『': '』'}
     while i < n:
         opening = line[i]
-        if opening not in ('“', '"') or opening in missing_closers:
+        if opening not in quote_map or opening in missing_closers:
             i += 1
             continue
-        closing = '”' if opening == '“' else '"'
+        closing = quote_map[opening]
         q_end = line.find(closing, i + 1)
         if q_end == -1:
             if not closed_only:
@@ -825,9 +826,21 @@ def scan_typography_flaws(text: str, original_text: str = "", genre: Optional[st
         # -------------------------------------------------------------
         # 4. 检测 AI_CONJUNCTION (P3)
         # -------------------------------------------------------------
+        quote_intervals = _find_quote_intervals(clean_masked, closed_only=True)
         for m in AI_CONJUNCTION_PATTERN.finditer(clean_masked):
             conj = m.group(0)
             pos = m.start()
+
+            # P1-02: 人物台词内部（引号区间内）放行，避免对话中连词被误报
+            if any(q_start <= pos and m.end() <= q_end for q_start, q_end in quote_intervals):
+                continue
+
+            # P1-01: 与 chapter_linker 规则协同：若“与此同时”出现在章节开篇前 3 行且作为段首转场连词时放行
+            if conj == "与此同时" and line_number <= 3 and pos == 0:
+                rem = clean_masked[m.end():]
+                if not rem or rem[0] in ("，", ",", "—", " ", "	") or rem.startswith("——"):
+                    continue
+
             snippet_start = max(0, pos - 15)
             stripped_line = orig_line.strip()
             snippet_text = stripped_line[snippet_start:snippet_start + 60]

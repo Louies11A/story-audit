@@ -249,15 +249,15 @@ def _extract_split_marker(text: str) -> Tuple[float, str]:
     return 0.0, text
 
 
-# 前缀标签正则（支持各种括号标签以及分卷标签，如 【加更】、[加更]、正文卷、VIP卷、第一卷、卷一 等）
+# 前缀标签正则（支持各种括号标签以及分卷标签，要求分卷标记后必须有非空分隔符或结尾，防误吞正文如“卷土重来”）
 _PREFIX_LABEL_PATTERN = re.compile(
     rf"^(?:"
-    rf"【[^】]+】"
-    rf"|\[[^\]]+\]"
-    rf"|(?:第?\s*([0-9零〇一二两三四五六七八九十百千万壹贰叁肆伍陆柒捌玖拾佰仟萬]+)\s*卷)"
-    rf"|(?:卷\s*([0-9零〇一二两三四五六七八九十百千万壹贰叁肆伍陆柒捌玖拾佰仟萬]+))"
-    rf"|\S+?卷"
-    rf")[{_DELIM_CHARS}]*"
+    rf"【[^】]+】[{_DELIM_CHARS}]*"
+    rf"|\[[^\]]+\][{_DELIM_CHARS}]*"
+    rf"|(?:第?\s*([0-9零〇一二两三四五六七八九十百千万壹贰叁肆伍陆柒捌玖拾佰仟萬]+)\s*卷)(?:[{_DELIM_CHARS}]+|$)"
+    rf"|(?:卷\s*([0-9零〇一二两三四五六七八九十百千万壹贰叁肆伍陆柒捌玖拾佰仟萬]+))(?:[{_DELIM_CHARS}]+|$)"
+    rf"|(?:\S+?卷)(?:[{_DELIM_CHARS}]+|$)"
+    rf")"
 )
 
 
@@ -322,12 +322,13 @@ def _parse_chapter_info(filename_or_text: str) -> Tuple[Optional[float], str]:
             title = _strip_delimiters(remains)
             return idx, title
 
-    # 4. 次优先：前缀标签剥离后以阿拉伯数字开头（如 "031_绝处逢生", "01——决战", "【加更】031 破局"）
+    # 4. 次优先：前缀标签剥离后以阿拉伯数字开头（支持浮点章号，如 "3.1 破局", "031_绝处逢生", "01——决战", "【加更】031 破局"）
     stripped_text, found_vol = _strip_prefix_labels(clean_text)
-    m_num = re.match(rf"^(\d+)(?:[{_DELIM_CHARS}]|$)(.*)$", stripped_text)
+    m_num = re.match(rf"^(\d+(?:\.\d+)?)(?:[{_DELIM_CHARS}]|$)(.*)$", stripped_text)
     if m_num:
-        num = int(m_num.group(1))
-        idx = round(float(num) + split_offset, 2)
+        raw_num = m_num.group(1)
+        num = float(raw_num)
+        idx = round(num + split_offset, 2)
         remains = m_num.group(2)
         title = _strip_delimiters(remains)
         return idx, title
@@ -343,6 +344,11 @@ def _parse_chapter_info(filename_or_text: str) -> Tuple[Optional[float], str]:
     # 6. 纯数字主干
     if clean_text.isdigit():
         return round(float(int(clean_text)) + split_offset, 2), ""
+    try:
+        pure_num = float(clean_text)
+        return round(pure_num + split_offset, 2), ""
+    except ValueError:
+        pass
 
     # 非章节文档，返回 None 与原始文件名主干
     return None, stem

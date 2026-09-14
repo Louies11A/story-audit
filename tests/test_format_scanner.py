@@ -355,7 +355,9 @@ class TestFormatScanner(unittest.TestCase):
     def test_scan_ai_conjunction_p3(self):
         """测试段落内出现典型 AI 翻译腔高频连词触发 AI_CONJUNCTION (P3)"""
         text = (
-            "第一段正常叙述。\n"
+            "背景第一段正常叙述。\n"
+            "背景第二段正常叙述。\n"
+            "背景第三段正常叙述。\n"
             "毫无疑问敌人并没有给他喘息的机会。\n"
             "与此同时，另一边的战场也陷入了胶着。\n"
             "不可否认的是，这一招确实威力惊人。\n"

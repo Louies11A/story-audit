@@ -22,6 +22,7 @@ __all__ = [
     "get_all_genres",
     "get_genre_metadata",
     "resolve_canonical_genre",
+    "_count_keyword_occurrences",
 ]
 
 
@@ -66,6 +67,10 @@ for g_name, data in GENRE_REGISTRY.items():
         ALIAS_TO_GENRE[al] = g_name
         ALIAS_TO_GENRE[al.replace(" ", "")] = g_name
 
+# P3-06: 补充武侠相关别名至东方仙侠，避免返回 None
+for _wuxia_alias in ("武侠", "传统武侠", "新武侠"):
+    ALIAS_TO_GENRE[_wuxia_alias] = "东方仙侠"
+
 
 def get_all_genres() -> List[str]:
     """返回支持的全部规范题材名称列表（42 题材）"""
@@ -93,6 +98,21 @@ def resolve_canonical_genre(name_or_alias: Optional[str]) -> Optional[str]:
         if al in clean or (len(clean) >= 2 and clean in al):
             return canonical
     return None
+
+
+def _count_keyword_occurrences(text: str, kw: str) -> int:
+    """
+    统计关键词在文本中的出现频次。
+    对纯 ASCII 英文单词（如 HR、KPI）施加 \b 单词边界匹配，避免如 through 误匹配 hr。
+    """
+    if not text or not kw:
+        return 0
+    kw_low = kw.lower()
+    if kw.isascii() and kw.isalnum():
+        import re as _re
+        pattern = rf"\b{_re.escape(kw_low)}\b"
+        return len(_re.findall(pattern, text))
+    return text.count(kw_low)
 
 
 def _extract_text(text_or_chapters: Any, max_chars: int = 20000) -> str:
@@ -180,8 +200,7 @@ def detect_genre(
     for genre, data in GENRE_REGISTRY.items():
         # A. 独特专有特征词（High Weight: 权重 5.0，具有决定性排他力）
         for kw in data.get("high_weight", []):
-            kw_low = kw.lower()
-            cnt = norm_text.count(kw_low)
+            cnt = _count_keyword_occurrences(norm_text, kw)
             if cnt > 0:
                 delta = 5.0 * (1.0 + math.log(cnt))
                 scores[genre] += delta
@@ -189,8 +208,7 @@ def detect_genre(
 
         # B. 标准领域词汇（Standard: 权重 2.0）
         for kw in data.get("standard", []):
-            kw_low = kw.lower()
-            cnt = norm_text.count(kw_low)
+            cnt = _count_keyword_occurrences(norm_text, kw)
             if cnt > 0:
                 delta = 2.0 * (1.0 + math.log(cnt))
                 scores[genre] += delta
@@ -198,8 +216,7 @@ def detect_genre(
 
         # C. 核心动作动词（Verbs: 权重 2.5）
         for kw in data.get("verbs", []):
-            kw_low = kw.lower()
-            cnt = norm_text.count(kw_low)
+            cnt = _count_keyword_occurrences(norm_text, kw)
             if cnt > 0:
                 delta = 2.5 * (1.0 + math.log(cnt))
                 scores[genre] += delta
@@ -207,8 +224,7 @@ def detect_genre(
 
         # D. 角色称谓与专属关系（Roles: 权重 2.5）
         for kw in data.get("roles", []):
-            kw_low = kw.lower()
-            cnt = norm_text.count(kw_low)
+            cnt = _count_keyword_occurrences(norm_text, kw)
             if cnt > 0:
                 delta = 2.5 * (1.0 + math.log(cnt))
                 scores[genre] += delta
