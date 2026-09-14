@@ -146,6 +146,28 @@ def test_f07_stream_marks_failed_when_state_save_fails(project):
     assert all("运行清单" in key for key in changed), changed
 
 
+def test_f07_batch_summary_failure_marks_run_failed(project):
+    """修复 4：批量汇总渲染失败不得静默报告 completed。"""
+    with patch.object(
+        story_audit, "render_scope_batch_summary", side_effect=RuntimeError("注入汇总渲染失败")
+    ):
+        chapters, summary = _split(_collect(project, scope_str="1-2"))
+    assert [item["status"] for item in chapters] == ["completed", "completed"]
+    assert summary["run_status"] == "failed"
+    assert summary["exit_code"] == 3
+    assert summary["reports_published"] is False
+    assert "批量汇总报告生成失败" in summary["error"]
+    assert summary["batch_summary_path"] == "" and summary["latest_report_path"] == ""
+
+    manifest = json.loads(Path(summary["manifest_path"]).read_text(encoding="utf-8"))
+    assert manifest["run_status"] == "failed"
+    assert all(entry["report_published"] is False for entry in manifest["chapters"])
+    assert not (project / "reports" / "LATEST_REPORT.md").exists()
+    assert not list((project / "reports").glob("BATCH_SUMMARY_SCOPE_*.md"))
+    assert not list((project / "reports" / "批量审查").glob("*_批量审查_第001-002章.md"))
+    assert not list((project / "reports" / "单章审查").rglob("*_审查报告.md"))
+
+
 def test_f07_stream_callback_and_invalid_scope(project):
     seen = []
     items = _collect(project, scope_str="1-2", on_chapter=seen.append)

@@ -263,6 +263,17 @@ def _restore_optional_bytes(path: Path, original: Optional[bytes]) -> None:
     path.write_bytes(original)
 
 
+def _restore_bytes_snapshot(snapshot: Optional[Dict[Path, Optional[bytes]]]) -> None:
+    """把若干文件恢复到快照字节（original 为 None 表示删除本次新建文件）。"""
+    if not snapshot:
+        return
+    for path, original in snapshot.items():
+        try:
+            _restore_optional_bytes(path, original)
+        except OSError:
+            pass
+
+
 def _write_bytes_safe(path: Path, data: bytes) -> None:
     """按字节原子写入（临时文件 + fsync + os.replace），用于原样归档历史产物。"""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1117,6 +1128,7 @@ def run_audit(
     _chapter_snapshot: Optional[List[ChapterItem]] = None,
     _audit_state: Optional[AuditState] = None,
     _staged_writes: Optional[Dict[Path, Union[str, bytes]]] = None,
+    _rollback_registry: Optional[List[Dict[Path, Optional[bytes]]]] = None,
 ) -> int:
     """执行单章审查管线，生成预审包与归档报告，返回退出码"""
     try:
@@ -1251,13 +1263,11 @@ def run_audit(
 
     def _rollback_ledger_writes() -> None:
         """回滚本轮账本写入（含删除本次新建文件），保证失败路径不留下半写产物。"""
-        if not ledger_snapshot:
-            return
-        for path, original in ledger_snapshot.items():
-            try:
-                _restore_optional_bytes(path, original)
-            except OSError:
-                pass
+        _restore_bytes_snapshot(ledger_snapshot)
+
+    if _rollback_registry is not None and ledger_snapshot:
+        # 供公开入口在未预期异常时回滚账本（覆盖非显式失败分支）。
+        _rollback_registry.append(ledger_snapshot)
 
     # 8.5 汇集平台卡尺违规项
     p_findings = platform_data.get("findings", [])
@@ -1975,6 +1985,7 @@ def run_scope_audit(
     use_author_memory: bool = False,
     silent: bool = False,
     allow_partial: Optional[bool] = None,
+    _rollback_registry: Optional[List[Dict[Path, Optional[bytes]]]] = None,
 ) -> int:
     """执行批量连审模式，生成大盘汇总报告与紧凑看板输出"""
     try:
@@ -2021,11 +2032,10 @@ def run_scope_audit(
 
     def _rollback_batch_ledger() -> None:
         """把账本恢复到批次开始前的字节（含删除本次新建文件）。"""
-        for path, original in batch_ledger_snapshot.items():
-            try:
-                _restore_optional_bytes(path, original)
-            except OSError:
-                pass
+        _restore_bytes_snapshot(batch_ledger_snapshot)
+
+    if _rollback_registry is not None and batch_ledger_snapshot:
+        _rollback_registry.append(batch_ledger_snapshot)
 
     # 运行时探测与跨批状态机继承
     effective_mode, fallback_reason = _resolve_precheck_mode(mode)
@@ -4064,6 +4074,7 @@ def iter_audit_scope(
     scope_summary_path = reports_dir / f"BATCH_SUMMARY_SCOPE_{scope_clean_name}.md"
     latest_report_path = reports_dir / "LATEST_REPORT.md"
     batch_summary_content = ""
+    batch_summary_error = ""
     try:
         expert_view = _refresh_expert_records(
             load_expert_result_records(get_expert_result_store_path(reports_dir)), p_dir
@@ -4085,7 +4096,9 @@ def iter_audit_scope(
             ),
         )
     except Exception as e:
-        summary_item["error"] = f"批量汇总报告生成失败: {e}"
+        # 汇总渲染失败必须显式失败：不得报 completed 或声称报告已发布。
+        batch_summary_error = f"批量汇总报告生成失败: {e}"
+        summary_item["error"] = batch_summary_error
     if batch_summary_content:
         staged_writes[scope_summary_path] = batch_summary_content
         staged_writes[batch_report_file] = batch_summary_content
@@ -4093,14 +4106,16 @@ def iter_audit_scope(
     state_path = get_audit_state_path(reports_dir)
     original_state = _read_optional_bytes(state_path)
     original_artifacts = {path: _read_optional_bytes(path) for path in staged_writes}
-    publish_error = ""
-    try:
-        save_audit_state(audit_state, reports_dir)
-        _flush_staged_writes_with_rollback(
-            staged_writes, state_path, original_state, original_artifacts
-        )
-    except Exception as e:
-        publish_error = str(e)
+    publish_error = batch_summary_error
+    if not publish_error:
+        try:
+            save_audit_state(audit_state, reports_dir)
+            _flush_staged_writes_with_rollback(
+                staged_writes, state_path, original_state, original_artifacts
+            )
+        except Exception as e:
+            publish_error = str(e)
+    if publish_error:
         _rollback_stream_ledger()
 
     exit_code = 0
@@ -4159,13 +4174,17 @@ def _package_size(payload: Dict[str, Any]) -> int:
     return len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
 
 
-def _ledger_evidence_pointer(json_path: Path, project_dir: Path, asset_id: str) -> Dict[str, Any]:
+def _relative_ledger_path(json_path: Path, project_dir: Path) -> str:
+    """账本文件的项目相对路径（无法相对化时退回绝对路径）。"""
     try:
-        ledger_rel = json_path.relative_to(project_dir).as_posix()
+        return json_path.relative_to(project_dir).as_posix()
     except ValueError:
-        ledger_rel = json_path.as_posix()
+        return json_path.as_posix()
+
+
+def _ledger_evidence_pointer(json_path: Path, project_dir: Path, asset_id: str) -> Dict[str, Any]:
     return {
-        "ledger_path": ledger_rel,
+        "ledger_path": _relative_ledger_path(json_path, project_dir),
         "json_pointer": f"/assets/{asset_id}/history",
         "query_hint": "query_asset_history(project_dir, name=<名称>, owner=<所有者>, offset=<已被省略的条数>)",
     }
@@ -4246,10 +4265,11 @@ def run_build_context_package(
         asset_id: len(item.history) if isinstance(item.history, list) else 0
         for asset_id, item in state.assets.items()
     }
-    omissions: List[Dict[str, Any]] = []
+    filtered_records: List[Dict[str, str]] = []
+    dropped_records: List[Dict[str, str]] = []
     assets_in_package = package["ledger_snapshot"]["active_assets"]
 
-    # 1) 实体过滤：未命中实体从包内移除，但保留省略清单与定位信息
+    # 1) 实体过滤：未命中实体从包内移除，省略清单在预算裁剪后统一生成
     if entity_filter:
         def matches(asset: Dict[str, Any]) -> bool:
             for target in entity_filter:
@@ -4265,38 +4285,15 @@ def run_build_context_package(
             if matches(asset):
                 kept.append(asset)
                 continue
-            omissions.append({
-                "kind": "asset_filtered",
+            filtered_records.append({
                 "asset_id": str(asset.get("id") or ""),
                 "asset_name": str(asset.get("name") or ""),
                 "owner": str(asset.get("owner") or ""),
-                "omitted_entries": len(asset.get("history") or []),
-                "reason": "未命中 entities 过滤条件",
-                "full_evidence": _ledger_evidence_pointer(
-                    json_path, project_dir, str(asset.get("id") or "")
-                ),
             })
         package["ledger_snapshot"]["active_assets"] = kept
         assets_in_package = kept
 
-    # 2) 如实记录 build_pre_audit_bundle 自身的最近 5 条截断
-    for asset in assets_in_package:
-        asset_id = str(asset.get("id") or "")
-        stored = stored_history.get(asset_id, 0)
-        kept_count = len(asset.get("history") or [])
-        if stored > kept_count:
-            omissions.append({
-                "kind": "asset_history",
-                "asset_id": asset_id,
-                "asset_name": str(asset.get("name") or ""),
-                "owner": str(asset.get("owner") or ""),
-                "omitted_entries": stored - kept_count,
-                "kept_entries": kept_count,
-                "reason": "预审包默认仅保留每项资产最近 5 条流水",
-                "full_evidence": _ledger_evidence_pointer(json_path, project_dir, asset_id),
-            })
-
-    # 3) 规模预算：先压缩历史，再裁剪资产，最后压缩边界切片
+    # 2) 规模预算：先压缩历史，再裁剪资产，最后压缩边界切片
     used_bytes = _package_size(package)
     if budget is not None and used_bytes > budget:
         for keep_count in (3, 1, 0):
@@ -4327,16 +4324,10 @@ def run_build_context_package(
                 if _package_size(package) > budget:
                     kept_assets.pop()
                     package["ledger_snapshot"]["active_assets"] = kept_assets
-                    omissions.append({
-                        "kind": "asset_omitted",
+                    dropped_records.append({
                         "asset_id": str(asset.get("id") or ""),
                         "asset_name": str(asset.get("name") or ""),
                         "owner": str(asset.get("owner") or ""),
-                        "omitted_entries": len(asset.get("history") or []),
-                        "reason": "超出规模预算，整项资产未随上下文交付",
-                        "full_evidence": _ledger_evidence_pointer(
-                            json_path, project_dir, str(asset.get("id") or "")
-                        ),
                     })
             assets_in_package = package["ledger_snapshot"]["active_assets"]
             used_bytes = _package_size(package)
@@ -4350,18 +4341,83 @@ def run_build_context_package(
         package["ledger_snapshot"]["history_budget_applied"] = True
 
     used_bytes = _package_size(package)
+    # 省略清单必须在预算裁剪之后生成：计数与包内实际保留条数保持一致。
+    omissions: List[Dict[str, Any]] = []
+    for record in filtered_records:
+        stored = stored_history.get(record["asset_id"], 0)
+        omissions.append({
+            "kind": "asset_filtered",
+            "asset_id": record["asset_id"],
+            "asset_name": record["asset_name"],
+            "owner": record["owner"],
+            "omitted_entries": stored,
+            "kept_entries": 0,
+            "budget_trimmed": False,
+            "reason": "未命中 entities 过滤条件，整项资产未随上下文交付",
+            "full_evidence": _ledger_evidence_pointer(
+                json_path, project_dir, record["asset_id"]
+            ),
+        })
+    for record in dropped_records:
+        stored = stored_history.get(record["asset_id"], 0)
+        omissions.append({
+            "kind": "asset_omitted",
+            "asset_id": record["asset_id"],
+            "asset_name": record["asset_name"],
+            "owner": record["owner"],
+            "omitted_entries": stored,
+            "kept_entries": 0,
+            "budget_trimmed": True,
+            "reason": "超出规模预算：整项资产未随上下文交付",
+            "full_evidence": _ledger_evidence_pointer(
+                json_path, project_dir, record["asset_id"]
+            ),
+        })
+    for asset in assets_in_package:
+        asset_id = str(asset.get("id") or "")
+        stored = stored_history.get(asset_id, 0)
+        kept_count = len(asset.get("history") or [])
+        if stored <= kept_count:
+            continue
+        budget_trimmed = kept_count < min(stored, 5)
+        omissions.append({
+            "kind": "asset_history",
+            "asset_id": asset_id,
+            "asset_name": str(asset.get("name") or ""),
+            "owner": str(asset.get("owner") or ""),
+            "omitted_entries": stored - kept_count,
+            "kept_entries": kept_count,
+            "budget_trimmed": budget_trimmed,
+            "reason": (
+                f"超出规模预算：历史被压缩到 {kept_count} 条"
+                if budget_trimmed
+                else "预审包默认仅保留每项资产最近 5 条流水"
+            ),
+            "full_evidence": _ledger_evidence_pointer(json_path, project_dir, asset_id),
+        })
     hist_truncated = any(item["kind"] in ("asset_history", "asset_omitted") for item in omissions)
     omitted_assets = sum(1 for item in omissions if item["kind"] in ("asset_filtered", "asset_omitted"))
     insufficient = bool(omissions)
-    return 0, {
+    # 固定开销探针：清空资产后的包体大小即为不可压缩下限。
+    probe = dict(package)
+    probe_snapshot = dict(package.get("ledger_snapshot") or {})
+    probe_snapshot["active_assets"] = []
+    probe["ledger_snapshot"] = probe_snapshot
+    fixed_overhead_bytes = _package_size(probe)
+    payload = {
         "chapter": float(curr_chapter.index),
         "text_version": text_version,
         "package": package,
         "budget": {
             "requested": budget is not None,
             "limit_bytes": budget,
+            "scope": "package",
             "used_bytes": used_bytes,
             "within_budget": True if budget is None else used_bytes <= budget,
+            "fixed_overhead_bytes": fixed_overhead_bytes,
+            "minimal_package_bytes": fixed_overhead_bytes,
+            "packet_bytes": 0,
+            "over_budget_reason": "",
         },
         "omissions": omissions,
         "insufficient_context": {
@@ -4379,6 +4435,16 @@ def run_build_context_package(
             "omissions": len(omissions),
         },
     }
+    if budget is not None and used_bytes > budget:
+        payload["budget"]["over_budget_reason"] = (
+            "已裁剪至最小（无资产、历史清零、边界切片压缩）仍超出预算："
+            f"固定开销 {fixed_overhead_bytes} 字节（meta/继承项/诊断等不可压缩部分）"
+            f"高于预算 {budget} 字节。"
+        )
+    # 预算口径为 package；packet_bytes 供宿主判断整体返回体规模（含省略回执，近似值）。
+    payload["budget"]["packet_bytes"] = _package_size(payload)
+    payload["budget"]["packet_bytes"] = _package_size(payload)
+    return 0, payload
 
 
 def run_query_asset_history(
@@ -4467,7 +4533,7 @@ def run_query_asset_history(
                 "timestamp": entry.get("timestamp"),
                 "location": {
                     "asset_id": asset.id,
-                    "ledger_path": json_path.name,
+                    "ledger_path": _relative_ledger_path(json_path, project_dir),
                     "json_pointer": f"/assets/{asset.id}/history/{index}",
                 },
             }
@@ -4525,6 +4591,7 @@ def audit_chapter(
     Returns:
         Tuple[int, Path]: (状态码, 报告路径)。成功或发现缺陷时返回具体归档报告路径，失败未生成报告时返回空路径 Path("")
     """
+    ledger_rollback_registry: List[Dict[Path, Optional[bytes]]] = []
     try:
         p_dir = _resolve_project_dir(project_dir)
         summary: Dict[str, Any] = {}
@@ -4541,8 +4608,12 @@ def audit_chapter(
             platform=platform,
             use_author_memory=author_memory,
             allow_partial=allow_partial,
+            _rollback_registry=ledger_rollback_registry,
         )
-    except (OSError, SafeIOError, TypeError, ValueError) as e:
+    except Exception as e:
+        # 非显式失败分支（未预期异常）同样不得留下半写账本。
+        for snapshot in ledger_rollback_registry:
+            _restore_bytes_snapshot(snapshot)
         _report_api_error(e, silent)
         return 3, Path("")
     report_path = summary.get("archived_report_path")
@@ -4582,6 +4653,7 @@ def audit_scope(
     Returns:
         Tuple[int, Path]: (状态码, 大盘汇总报告路径)
     """
+    ledger_rollback_registry: List[Dict[Path, Optional[bytes]]] = []
     try:
         p_dir = _resolve_project_dir(project_dir)
         exit_code = run_scope_audit(
@@ -4595,8 +4667,12 @@ def audit_scope(
             use_author_memory=author_memory,
             silent=silent,
             allow_partial=allow_partial,
+            _rollback_registry=ledger_rollback_registry,
         )
-    except (OSError, SafeIOError, TypeError, ValueError) as e:
+    except Exception as e:
+        # 非显式失败分支（未预期异常）同样不得留下半写账本。
+        for snapshot in ledger_rollback_registry:
+            _restore_bytes_snapshot(snapshot)
         _report_api_error(e, silent)
         return 3, Path("")
     if exit_code == 3:
@@ -5161,6 +5237,11 @@ def build_context_package(
 
     预审包默认只保留每项资产最近 5 条流水，本入口会把该截断如实列入省略清单，
     宿主可用 :func:`query_asset_history` 取回更早证据后再下结论。
+
+    预算口径：``budget`` 只约束上下文包本体（``budget.scope == "package"``），
+    省略清单属于诊断回执、不计入该预算；整体返回体规模见 ``budget.packet_bytes``。
+    当预算低于 meta/继承项等固定开销时，包体会被裁剪到最小并返回
+    ``budget.over_budget_reason``（``within_budget`` 保持真实值，不会伪报通过）。
 
     Args:
         project_dir: 小说项目根目录（Path 或 str，默认当前目录）

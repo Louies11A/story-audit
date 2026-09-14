@@ -82,6 +82,27 @@ def _pending_pairs(project: Path):
     )
 
 
+def test_unexpected_exception_after_ledger_write_rolls_back_ledger(project):
+    """修复 6：账本写入之后的未预期异常也必须回滚账本。"""
+    (project / "正文" / "第001章.txt").write_text(
+        "第一章\n他握紧了钥匙。\n"
+        '<!-- audit:stash name="海门钥匙" origin="第1章" status="pending" -->\n',
+        encoding="utf-8",
+    )
+    before = _snapshot(project)
+    with patch.object(
+        story_audit, "render_audit_report", side_effect=RuntimeError("注入渲染异常")
+    ):
+        assert story_audit.audit_chapter(project, chapter_index=1, mode="solo", silent=True) == (
+            3,
+            Path(""),
+        )
+    assert _snapshot(project) == before
+    assert not (project / "资源账本.json").exists()
+    assert not (project / "设定" / "资源账本.json").exists()
+    assert not get_audit_state_path(project / "reports").exists()
+
+
 def test_f05_legacy_state_still_preserves_old_report(project):
     """P2：旧状态没有 chapter_versions 时，首次版本变化也必须归档旧报告。"""
     _audit(project, [1, 2])

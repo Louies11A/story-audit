@@ -63,6 +63,73 @@ def _snapshot(project: Path):
     }
 
 
+def test_f09_omission_counts_match_package_after_budget_trimming():
+    """修复 1：预算裁剪后省略清单计数必须与包内实际保留条数一致。"""
+    project = _make_project()
+    _save_assets(project, {"ast_0001": _asset(1, 8)})
+    code, full = story_audit.build_context_package(project, chapter_index=1, silent=True)
+    assert code == 0
+    full_bytes = full["budget"]["used_bytes"]
+
+    seen_kept = set()
+    seen_dropped = False
+    for budget in range(full_bytes, 300, -137):
+        code, payload = story_audit.build_context_package(
+            project, chapter_index=1, budget=budget, silent=True
+        )
+        assert code == 0
+        assets = payload["package"]["ledger_snapshot"]["active_assets"]
+        if assets:
+            kept = len(assets[0]["history"])
+            seen_kept.add(kept)
+            entries = [item for item in payload["omissions"] if item["kind"] == "asset_history"]
+            assert len(entries) == 1
+            entry = entries[0]
+            assert entry["kept_entries"] == kept
+            assert entry["omitted_entries"] == 8 - kept
+            assert entry["budget_trimmed"] is (kept < 5)
+            assert entry["full_evidence"]["json_pointer"] == "/assets/ast_0001/history"
+        else:
+            seen_dropped = True
+            dropped = [item for item in payload["omissions"] if item["kind"] == "asset_omitted"]
+            assert len(dropped) == 1
+            assert dropped[0]["omitted_entries"] == 8
+            assert dropped[0]["kept_entries"] == 0
+            assert dropped[0]["budget_trimmed"] is True
+            assert dropped[0]["reason"].startswith("超出规模预算")
+
+    assert {3, 1, 0} <= seen_kept
+    assert seen_dropped is True
+
+
+def test_f09_tiny_budget_reports_fixed_overhead_and_packet_bytes():
+    """修复 2/3：极小预算说明固定开销，并给出整体返回体规模与预算口径。"""
+    project = _make_project()
+    _save_assets(project, {"ast_0001": _asset(1, 8)})
+    code, payload = story_audit.build_context_package(
+        project, chapter_index=1, budget=200, silent=True
+    )
+    assert code == 0
+    budget = payload["budget"]
+    assert budget["scope"] == "package"
+    assert budget["fixed_overhead_bytes"] > 0
+    assert budget["minimal_package_bytes"] == budget["fixed_overhead_bytes"]
+    assert budget["used_bytes"] == budget["minimal_package_bytes"]
+    assert budget["within_budget"] is False
+    assert "固定开销" in budget["over_budget_reason"]
+    assert payload["package"]["ledger_snapshot"]["active_assets"] == []
+    assert payload["insufficient_context"]["insufficient_context"] is True
+
+    actual_packet_bytes = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+    assert budget["packet_bytes"] >= budget["used_bytes"]
+    assert abs(budget["packet_bytes"] - actual_packet_bytes) <= 64
+
+    code, unrestricted = story_audit.build_context_package(project, chapter_index=1, silent=True)
+    assert code == 0
+    assert unrestricted["budget"]["within_budget"] is True
+    assert unrestricted["budget"]["over_budget_reason"] == ""
+
+
 def test_f09_small_ledger_has_no_omissions():
     """小账本不产生多余省略标记。"""
     project = _make_project()
@@ -153,6 +220,7 @@ def test_f09_query_asset_history_returns_older_entries_with_locations():
     indexes = [entry["history_index"] for entry in payload["entries"]]
     assert indexes == [2, 1, 0]
     assert payload["entries"][0]["location"]["json_pointer"] == "/assets/ast_0001/history/2"
+    assert payload["entries"][0]["location"]["ledger_path"] == "设定/资源账本.json"
     assert payload["entries"][0]["reason"]
 
     code, filtered = story_audit.query_asset_history(
