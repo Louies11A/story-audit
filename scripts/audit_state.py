@@ -70,6 +70,8 @@ class AuditState:
     chapter_versions: Dict[str, str] = field(default_factory=dict)
     pending_rechecks: List[Dict[str, Any]] = field(default_factory=list)
     version_events: List[Dict[str, Any]] = field(default_factory=list)
+    # F08 新增可选字段：作者/专家问题处置记录（含处置时的正文版本）。
+    finding_dispositions: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -98,6 +100,7 @@ class AuditState:
             "resolved_items",
             "pending_rechecks",
             "version_events",
+            "finding_dispositions",
         ):
             items = data.get(key, [])
             if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
@@ -125,6 +128,7 @@ class AuditState:
             chapter_versions=chapter_versions,
             pending_rechecks=list(data.get("pending_rechecks", [])),
             version_events=list(data.get("version_events", [])),
+            finding_dispositions=list(data.get("finding_dispositions", [])),
         )
 
 
@@ -177,6 +181,7 @@ def get_inherited_items(state: AuditState) -> Dict[str, Any]:
         "completed_count": len(state.completed_chapters),
         "open_defects": list(state.open_defects),
         "foreshadowing_commitments": list(state.foreshadowing_commitments),
+        "finding_dispositions": list(state.finding_dispositions),
     }
 
 
@@ -865,12 +870,48 @@ def render_inherited_items_section(inherited: Dict[str, Any]) -> str:
             chap = d.get("chapter", "-")
             sev = d.get("severity", "P1")
             cat = d.get("category", "causal")
+            markers: List[str] = []
             # 专家缺陷身份包含平台（与确定性缺陷约定一致），跨平台归档会保留多条记录，
             # 此处标注平台，避免读者把同一发现的不同平台裁决误读为重复条目。
             if str(d.get("source") or "") == "expert":
                 platform = str(d.get("platform") or "")
-                cat = f"{cat}（专家：{platform}）" if platform else f"{cat}（专家）"
+                markers.append(f"专家：{platform}" if platform else "专家")
+            rule = d.get("rule") if isinstance(d.get("rule"), dict) else {}
+            if rule:
+                markers.append(
+                    "规则 {}@{}".format(
+                        rule.get("rule_id") or "-", rule.get("rule_version") or "-"
+                    )
+                )
+            if markers:
+                cat = f"{cat}（{'；'.join(markers)}）"
             issue = d.get("issue", "").replace("|", "｜")
+            extras: List[str] = []
+            if rule:
+                for label, key in (("命中条件", "condition"), ("阈值", "threshold"), ("上下文", "context")):
+                    value = str(rule.get(key) or "").strip()
+                    if value:
+                        extras.append(f"{label}：{value[:80]}")
+            disposition = d.get("disposition") if isinstance(d.get("disposition"), dict) else {}
+            if disposition:
+                label = {
+                    "accepted": "接受",
+                    "deferred": "暂缓",
+                    "false_positive": "误报",
+                }.get(str(disposition.get("decision") or ""), str(disposition.get("decision") or "-"))
+                if disposition.get("needs_reverification"):
+                    state_text = "正文已变化，需重新核验"
+                elif disposition.get("exempt"):
+                    state_text = "已免除跟踪"
+                else:
+                    state_text = "仍保留在开放缺陷"
+                extras.append(
+                    "处置：{}（{}；{}）".format(
+                        label, str(disposition.get("source") or "-"), state_text
+                    )
+                )
+            if extras:
+                issue = f"{issue}｜{'；'.join(extras)}"
             fix = d.get("fix", "严格依事实对齐").replace("|", "｜")
             lines.append(f"| {idx} | 第{chap}章 | {sev} | {cat} | {issue} | {fix} |")
         lines.append("")

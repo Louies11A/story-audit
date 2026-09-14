@@ -19,7 +19,7 @@ import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 # 确保技能根目录在 sys.path 中，支持 python scripts/story_audit.py 直接独立调用
 _SKILL_ROOT = Path(__file__).resolve().parent.parent
@@ -102,6 +102,18 @@ from scripts.expert_results import (
     render_expert_summary_markdown,
 )
 from scripts.types import BoundaryContext, ChapterItem, Finding, FormatFinding, PatchSpec, format_factual_fix
+
+
+# F08：问题处置与规则解释。规则版本用于标记确定性规则的判定口径。
+RULE_METADATA_VERSION = "2026.09"
+DISPOSITION_DECISIONS = ("accepted", "deferred", "false_positive")
+DISPOSITION_LABELS = {"accepted": "接受", "deferred": "暂缓", "false_positive": "误报"}
+# 事实冲突类与平台门禁不得被作者偏好自动免除。
+PROTECTED_DISPOSITION_CATEGORIES = ("causal", "factual", "consistency")
+PROTECTED_DISPOSITION_CHECKERS = ("platform_rubric",)
+
+# F07：流式审查运行清单目录（reports/批量审查/运行清单/）。
+RUN_MANIFEST_DIRNAME = "运行清单"
 
 
 
@@ -287,6 +299,28 @@ def _clip_event_text(text: Any, limit: int = 300) -> str:
     if len(value) <= limit:
         return value
     return value[:limit] + "..."
+
+
+def _explicit_violation_rule(message: str) -> Dict[str, Any]:
+    """显式标记类确定性规则的元数据（规则 id、版本、阈值、命中条件、上下文）。"""
+    return {
+        "rule_id": "explicit_violation",
+        "rule_version": RULE_METADATA_VERSION,
+        "threshold": "P0/P1 显式标记",
+        "condition": "正文出现 audit:p0/p1 注释或【Px: ...】显式标记",
+        "context": _clip_event_text(message, 120),
+    }
+
+
+def _platform_rubric_rule(platform: str, location: str, evidence: str) -> Dict[str, Any]:
+    """平台门禁类确定性规则的元数据；阈值以 references/rubrics 的卡尺为准。"""
+    return {
+        "rule_id": f"platform_rubric:{platform}",
+        "rule_version": RULE_METADATA_VERSION,
+        "threshold": f"见 references/rubrics/{platform}.md 对应门禁阈值",
+        "condition": f"{platform} 平台卡尺规则命中（{location or '位置未记录'}）",
+        "context": _clip_event_text(evidence, 120),
+    }
 
 
 def _rollback_chapter_write(
@@ -1097,6 +1131,7 @@ def run_audit(
                 "checker": "explicit_violation",
                 "platform": platform,
                 "status": "open",
+                "rule": _explicit_violation_rule(v["message"]),
             })
 
     # 平台红线与严重门禁拦截
@@ -1112,6 +1147,7 @@ def run_audit(
             defect["checker"] = "platform_rubric"
             defect["platform"] = platform
             defect["status"] = "open"
+            defect["rule"] = _platform_rubric_rule(platform, pf.location, pf.evidence)
             detected_defects.append(defect)
 
     curr_text_version = _text_content_version(curr_text)
@@ -1162,8 +1198,9 @@ def run_audit(
     try:
         # 已归档的专家执行状态按当前正文重新判定过期后随继承栏目进入报告与预审包。
         expert_view = _refresh_expert_records(expert_records, project_dir)
-        inherited_items = _attach_expert_summaries(
-            get_inherited_items(audit_state), expert_view
+        inherited_items = _attach_disposition_states(
+            _attach_expert_summaries(get_inherited_items(audit_state), expert_view),
+            project_dir,
         )
     except Exception as e:
         _rollback_ledger_writes()
@@ -1356,6 +1393,10 @@ def run_audit(
             "exit_code": exit_code,
             "status": status_str,
             "archived_report_path": archived_report_path,
+            # F07：流式入口与运行清单需要的正文版本与预审包定位。
+            "text_version": curr_text_version,
+            "pre_bundle": bundle,
+            "pre_bundle_path": bundle_path,
         })
 
     return exit_code
@@ -1930,8 +1971,9 @@ def run_scope_audit(
         fallback_reason=fallback_reason,
         platform=platform,
         run_id=run_id,
-        inherited_items=_attach_expert_summaries(
-            get_inherited_items(audit_state), expert_view
+        inherited_items=_attach_disposition_states(
+            _attach_expert_summaries(get_inherited_items(audit_state), expert_view),
+            project_dir,
         ),
     )
 
@@ -3162,6 +3204,588 @@ def run_confirm_asset_event(
     return 0, json_path
 
 
+def _find_finding_entry(
+    audit_state: AuditState,
+    finding_id: str,
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    """按稳定问题编号查找缺陷条目，返回 (条目, 所在列表名)。"""
+    target = str(finding_id or "").strip()
+    if not target:
+        return None, ""
+    for name, items in (("open_defects", audit_state.open_defects), ("resolved_items", audit_state.resolved_items)):
+        for item in items:
+            if isinstance(item, dict) and str(item.get("id") or "") == target:
+                return item, name
+    return None, ""
+
+
+def _is_disposition_protected(entry: Dict[str, Any]) -> bool:
+    """事实冲突类与平台门禁发现不得由作者偏好自动免除。"""
+    category = str(entry.get("category") or "")
+    checker = str(entry.get("checker") or "")
+    return category in PROTECTED_DISPOSITION_CATEGORIES or checker in PROTECTED_DISPOSITION_CHECKERS
+
+
+def _disposition_view(record: Dict[str, Any], current_version: str) -> Dict[str, Any]:
+    view = dict(record)
+    view["current_text_version"] = current_version
+    view["needs_reverification"] = bool(record.get("text_version")) and (
+        current_version != str(record.get("text_version") or "")
+    )
+    return view
+
+
+def _attach_disposition_states(
+    inherited_items: Dict[str, Any],
+    project_dir: Path,
+) -> Dict[str, Any]:
+    """把处置记录及“正文变化需重新核验”视图挂入继承栏目，供报告呈现。"""
+    records = [
+        item
+        for item in (inherited_items.get("finding_dispositions") or [])
+        if isinstance(item, dict)
+    ]
+    if not records:
+        return inherited_items
+    views: Dict[str, Dict[str, Any]] = {}
+    for record in records:
+        chapter = record.get("chapter")
+        current_version = (
+            _chapter_current_text_version(project_dir, float(chapter))
+            if isinstance(chapter, (int, float)) and not isinstance(chapter, bool)
+            else ""
+        )
+        views[str(record.get("finding_id") or "")] = _disposition_view(record, current_version)
+    attached = dict(inherited_items or {})
+    attached["finding_dispositions"] = list(views.values())
+    annotated: List[Any] = []
+    for item in attached.get("open_defects") or []:
+        if isinstance(item, dict):
+            copy = dict(item)
+            view = views.get(str(copy.get("id") or ""))
+            if view is not None:
+                copy["disposition"] = view
+            annotated.append(copy)
+        else:
+            annotated.append(item)
+    attached["open_defects"] = annotated
+    return attached
+
+
+def run_record_finding_disposition(
+    project_dir: Path,
+    finding_id: str,
+    decision: str = "accepted",
+    reason: str = "",
+    source: str = "author",
+    silent: bool = False,
+) -> Tuple[int, Path]:
+    """登记问题处置（接受/暂缓/误报），记录处置时的正文版本。"""
+    try:
+        _validate_boolean_options(silent=silent)
+        if not isinstance(finding_id, str) or not finding_id.strip():
+            raise ValueError("必须提供稳定问题编号 (finding_id)")
+        if not isinstance(decision, str) or decision.strip().lower() not in DISPOSITION_DECISIONS:
+            raise ValueError("处置结论 (decision) 只能是 accepted/deferred/false_positive")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("必须提供处置原因 (reason)")
+        if not isinstance(source, str) or source.strip().lower() not in VALID_COORDINATION_SOURCES:
+            raise ValueError("处置来源 (source) 只能是 author 或 expert")
+    except ValueError as e:
+        _report_api_error(e, silent)
+        return 3, Path("")
+
+    decision_value = decision.strip().lower()
+    source_value = source.strip().lower()
+    reason_value = reason.strip()
+    target_id = finding_id.strip()
+    reports_dir = project_dir / "reports"
+    try:
+        audit_state = load_audit_state(reports_dir)
+    except Exception as e:
+        _report_api_error(e, silent)
+        return 3, Path("")
+
+    entry, location = _find_finding_entry(audit_state, target_id)
+    if entry is None:
+        _report_api_error(
+            ValueError(f"未找到问题编号 {target_id}（处置只针对持久化缺陷记录）"), silent
+        )
+        return 3, Path("")
+
+    chapter = entry.get("chapter")
+    current_version = (
+        _chapter_current_text_version(project_dir, float(chapter))
+        if isinstance(chapter, (int, float)) and not isinstance(chapter, bool)
+        else ""
+    )
+    protected = _is_disposition_protected(entry)
+    exempt = decision_value == "false_positive" and not protected
+    existing = next(
+        (
+            item
+            for item in audit_state.finding_dispositions
+            if isinstance(item, dict) and str(item.get("finding_id") or "") == target_id
+        ),
+        None,
+    )
+    if (
+        existing is not None
+        and str(existing.get("decision") or "") == decision_value
+        and str(existing.get("reason") or "") == reason_value
+        and str(existing.get("source") or "") == source_value
+        and str(existing.get("text_version") or "") == current_version
+    ):
+        # 相同证据、相同结论、相同正文版本：幂等空操作，不改写状态文件。
+        return 0, get_audit_state_path(reports_dir)
+
+    timestamp = datetime.now(timezone.utc).isoformat()
+    record = {
+        "finding_id": target_id,
+        "chapter": float(chapter) if isinstance(chapter, (int, float)) and not isinstance(chapter, bool) else None,
+        "severity": str(entry.get("severity") or ""),
+        "category": str(entry.get("category") or ""),
+        "issue": str(entry.get("issue") or ""),
+        "rule": dict(entry.get("rule")) if isinstance(entry.get("rule"), dict) else {},
+        "decision": decision_value,
+        "source": source_value,
+        "reason": reason_value,
+        "decided_at": timestamp,
+        "text_version": current_version,
+        "exempt": exempt,
+        "retained_in_open_defects": not exempt,
+        "finding_location": location,
+    }
+    if existing is not None:
+        history = existing.get("history")
+        if not isinstance(history, list):
+            history = []
+        history.append(
+            {
+                "decision": str(existing.get("decision") or ""),
+                "source": str(existing.get("source") or ""),
+                "reason": str(existing.get("reason") or ""),
+                "text_version": str(existing.get("text_version") or ""),
+                "decided_at": str(existing.get("decided_at") or ""),
+            }
+        )
+        record["history"] = history
+        existing.clear()
+        existing.update(record)
+    else:
+        record["history"] = []
+        audit_state.finding_dispositions.append(record)
+
+    if exempt and location == "open_defects":
+        # 误报且非事实/门禁类：移出开放缺陷，但保留原始发现与严重度作为历史。
+        audit_state.open_defects = [
+            item for item in audit_state.open_defects if item is not entry
+        ]
+        resolved = dict(entry)
+        resolved["status"] = "resolved"
+        resolved["resolution"] = "false_positive_dismissed"
+        resolved["resolution_reason"] = reason_value
+        resolved["resolution_source"] = source_value
+        resolved["resolution_text_version"] = current_version
+        resolved["resolved_at"] = timestamp
+        audit_state.resolved_items.append(resolved)
+
+    try:
+        state_path = save_audit_state(audit_state, reports_dir)
+    except Exception as e:
+        _report_api_error(e, silent)
+        return 3, Path("")
+    if not silent:
+        safe_console_print(
+            "问题 {} 处置已登记：{}{}".format(
+                target_id,
+                DISPOSITION_LABELS.get(decision_value, decision_value),
+                "（因事实/平台门禁约束仍保留在开放缺陷）" if protected and decision_value == "false_positive" else "",
+            )
+        )
+    return 0, state_path
+
+
+def run_get_finding_dispositions(
+    project_dir: Path,
+    silent: bool = False,
+) -> Tuple[int, Dict[str, Any]]:
+    """查询问题处置记录，并按当前正文版本标记是否需要重新核验。"""
+    try:
+        _validate_boolean_options(silent=silent)
+    except ValueError as e:
+        _report_api_error(e, silent)
+        return 3, {}
+    reports_dir = project_dir / "reports"
+    try:
+        audit_state = load_audit_state(reports_dir)
+    except Exception as e:
+        _report_api_error(e, silent)
+        return 3, {}
+
+    dispositions: List[Dict[str, Any]] = []
+    for record in audit_state.finding_dispositions:
+        if not isinstance(record, dict):
+            continue
+        chapter = record.get("chapter")
+        current_version = (
+            _chapter_current_text_version(project_dir, float(chapter))
+            if isinstance(chapter, (int, float)) and not isinstance(chapter, bool)
+            else ""
+        )
+        view = _disposition_view(record, current_version)
+        _entry, location = _find_finding_entry(audit_state, str(record.get("finding_id") or ""))
+        view["finding_status"] = location or "missing"
+        dispositions.append(view)
+    return 0, {
+        "dispositions": dispositions,
+        "counts": {
+            "total": len(dispositions),
+            "needs_reverification": sum(1 for item in dispositions if item["needs_reverification"]),
+            "exempt": sum(1 for item in dispositions if item.get("exempt")),
+        },
+    }
+
+
+def get_run_manifest_path(reports_dir: Path, run_id: str) -> Path:
+    """流式审查运行清单路径：reports/批量审查/运行清单/{run_id}.json"""
+    return reports_dir / "批量审查" / RUN_MANIFEST_DIRNAME / f"{run_id}.json"
+
+
+def _write_run_manifest(manifest_path: Path, payload: Dict[str, Any]) -> None:
+    """原子写入运行清单（进度诊断产物，允许在失败时保留并标注 run_status）。"""
+    write_file_safe(manifest_path, json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def iter_audit_scope(
+    project_dir: Union[str, Path] = ".",
+    scope_str: str = "",
+    platform: str = "generic",
+    genre: str = "auto",
+    mode: str = "auto",
+    strict: bool = False,
+    force: bool = False,
+    author_memory: bool = False,
+    allow_partial: Optional[bool] = None,
+    silent: bool = False,
+    on_chapter: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> Iterator[Dict[str, Any]]:
+    """逐章流式审查入口（F07）
+
+    逐章返回结构化结果（``kind="chapter"``：章号、正文指纹、发现、预审包内容与路径、
+    归档报告路径、序号与总数、执行状态），结束时返回一条 ``kind="run_summary"`` 的
+    运行汇总；每次运行都会写出 ``reports/批量审查/运行清单/{run_id}.json`` 清单。
+
+    章节报告与预审包沿用既有发布规则（状态优先 + 暂存回滚）：中途失败时已完成章节的
+    结果仍会逐章返回供宿主继续专家处理，但报告不会发布，清单会显式标注
+    ``run_status="failed"`` 并区分已完成/失败/未执行章节。
+
+    Args:
+        project_dir: 小说项目根目录（Path 或 str，默认当前目录）
+        scope_str: 批量范围（如 ``"1-30"``）
+        platform/genre/mode/strict/force/author_memory/allow_partial/silent: 与 audit_scope 同名参数
+        on_chapter: 可选回调，每产出一章结果时调用一次（回调异常会被忽略，不影响审查）
+
+    Yields:
+        Dict[str, Any]: 逐章结果与最终的 ``run_summary`` 汇总项
+    """
+    started_at = datetime.now(timezone.utc).isoformat()
+    run_id = uuid.uuid4().hex[:12]
+    summary_item: Dict[str, Any] = {
+        "kind": "run_summary",
+        "run_id": run_id,
+        "phase": "validation_failed",
+        "run_status": "failed",
+        "exit_code": 3,
+        "scope": scope_str if isinstance(scope_str, str) else "",
+        "total": 0,
+        "completed": 0,
+        "failed": 0,
+        "not_executed": 0,
+        "reports_published": False,
+        "manifest_path": "",
+        "report_paths": {},
+        "error": "",
+        "started_at": started_at,
+    }
+    try:
+        p_dir = _resolve_project_dir(project_dir)
+        _validate_boolean_options(strict=strict, force=force, silent=silent, author_memory=author_memory)
+        if allow_partial is not None:
+            _validate_boolean_options(allow_partial=allow_partial)
+        platform, mode, genre = _normalize_audit_options(platform, mode, genre)
+        s_min, s_max = parse_scope_range(scope_str)
+        scope_clean = "".join(scope_str.split())
+    except (OSError, TypeError, ValueError) as e:
+        _report_api_error(e, silent)
+        summary_item["error"] = str(e)
+        summary_item["finished_at"] = datetime.now(timezone.utc).isoformat()
+        yield summary_item
+        return
+
+    reports_dir = p_dir / "reports"
+    manifest_path = get_run_manifest_path(reports_dir, run_id)
+    summary_item["manifest_path"] = str(manifest_path)
+    summary_item["scope"] = scope_clean
+
+    def _finish_early(message: str) -> Dict[str, Any]:
+        _report_api_error(ValueError(message), silent)
+        summary_item["error"] = message
+        summary_item["finished_at"] = datetime.now(timezone.utc).isoformat()
+        return summary_item
+
+    chapters = ChapterResolver().discover_chapters(p_dir)
+    target_chapters = [item for item in chapters if s_min <= item.index <= s_max]
+    if not chapters:
+        yield _finish_early("未发现任何章节文件")
+        return
+    if not target_chapters:
+        yield _finish_early(f"范围 {scope_clean} 内未发现章节")
+        return
+    try:
+        _validate_unique_targets(target_chapters)
+    except ValueError as e:
+        yield _finish_early(str(e))
+        return
+    try:
+        audit_state = load_audit_state(reports_dir)
+    except Exception as e:
+        yield _finish_early(f"读取审计状态失败: {e}")
+        return
+
+    total = len(target_chapters)
+    effective_allow_partial = allow_partial if allow_partial is not None else bool(s_min > 1.0)
+    manifest: Dict[str, Any] = {
+        "run_id": run_id,
+        "scope": scope_clean,
+        "platform": platform,
+        "mode": mode,
+        "genre": genre,
+        "strict": strict,
+        "created_at": started_at,
+        "updated_at": started_at,
+        "run_status": "running",
+        "exit_code": None,
+        "counts": {"total": total, "completed": 0, "failed": 0, "not_executed": total},
+        "chapters": [],
+    }
+    try:
+        _write_run_manifest(manifest_path, manifest)
+    except Exception as e:
+        summary_item["error"] = f"运行清单写入失败: {e}"
+
+    batch_json_path, batch_md_path = locate_ledger_paths(p_dir)
+    stream_ledger_snapshot: Dict[Path, Optional[bytes]] = {
+        batch_json_path: _read_optional_bytes(batch_json_path),
+        batch_md_path: _read_optional_bytes(batch_md_path),
+    }
+
+    def _rollback_stream_ledger() -> None:
+        for path, original in stream_ledger_snapshot.items():
+            try:
+                _restore_optional_bytes(path, original)
+            except OSError:
+                pass
+
+    def _emit_manifest() -> None:
+        manifest["updated_at"] = datetime.now(timezone.utc).isoformat()
+        try:
+            _write_run_manifest(manifest_path, manifest)
+        except Exception:
+            pass
+
+    staged_writes: Dict[Path, Union[str, bytes]] = {}
+    has_p0 = False
+    has_p1 = False
+    for sequence, chap in enumerate(target_chapters, 1):
+        item_started = datetime.now(timezone.utc).isoformat()
+        summary: Dict[str, Any] = {}
+        code = run_audit(
+            p_dir,
+            target_chapter_index=chap.index,
+            strict=strict,
+            force=force,
+            write_latest_report=False,
+            silent=True,
+            summary_collector=summary,
+            genre=genre,
+            mode=mode,
+            platform=platform,
+            use_author_memory=author_memory,
+            inherited_items=None,
+            allow_partial=effective_allow_partial,
+            _chapter_snapshot=chapters,
+            _audit_state=audit_state,
+            _staged_writes=staged_writes,
+        )
+        item_finished = datetime.now(timezone.utc).isoformat()
+        bundle = summary.get("pre_bundle") if isinstance(summary.get("pre_bundle"), dict) else {}
+        item: Dict[str, Any] = {
+            "kind": "chapter",
+            "run_id": run_id,
+            "manifest_path": str(manifest_path),
+            "sequence": sequence,
+            "total": total,
+            "chapter": float(chap.index),
+            "chapter_title": chap.title,
+            "text_version": str(summary.get("text_version") or ""),
+            "exit_code": code,
+            "status": "completed" if code != 3 else "failed",
+            "error": "" if code != 3 else f"第 {chap.index:g} 章审查失败（exit_code=3）",
+            "findings": [
+                finding.to_dict() if hasattr(finding, "to_dict") else finding
+                for finding in (summary.get("findings") or [])
+            ],
+            "p0_list": list(summary.get("p0_list") or []),
+            "p1_list": list(summary.get("p1_list") or []),
+            "p2_count": int(summary.get("p2_count") or 0),
+            "p3_count": int(summary.get("p3_count") or 0),
+            "open_defects": list(summary.get("open_defects") or []),
+            "word_count": int(summary.get("word_count") or 0),
+            "paragraph_count": int(summary.get("paragraph_count") or 0),
+            "bundle": bundle,
+            "bundle_path": str(summary.get("pre_bundle_path") or ""),
+            "report_path": str(summary.get("archived_report_path") or ""),
+            "report_published": False,
+            "started_at": item_started,
+            "finished_at": item_finished,
+        }
+        if code == 3:
+            manifest["chapters"].append({
+                "chapter": float(chap.index),
+                "sequence": sequence,
+                "total": total,
+                "status": "failed",
+                "text_version": item["text_version"],
+                "report_path": item["report_path"],
+                "report_published": False,
+                "bundle_path": item["bundle_path"],
+                "exit_code": 3,
+                "started_at": item_started,
+                "finished_at": item_finished,
+                "error": item["error"],
+            })
+            for pending in target_chapters[sequence:]:
+                manifest["chapters"].append({
+                    "chapter": float(pending.index),
+                    "sequence": target_chapters.index(pending) + 1,
+                    "total": total,
+                    "status": "not_executed",
+                    "text_version": "",
+                    "report_path": "",
+                    "report_published": False,
+                    "bundle_path": "",
+                    "exit_code": None,
+                    "started_at": "",
+                    "finished_at": "",
+                    "error": "",
+                })
+            manifest["counts"] = {
+                "total": total,
+                "completed": sequence - 1,
+                "failed": 1,
+                "not_executed": max(total - sequence, 0),
+            }
+            manifest["run_status"] = "failed"
+            manifest["exit_code"] = 3
+            _emit_manifest()
+            _rollback_stream_ledger()
+            if on_chapter is not None:
+                try:
+                    on_chapter(item)
+                except Exception:
+                    pass
+            yield item
+            summary_item.update({
+                "phase": "finished",
+                "run_status": "failed",
+                "exit_code": 3,
+                "completed": sequence - 1,
+                "failed": 1,
+                "not_executed": max(total - sequence, 0),
+                "error": item["error"],
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+            })
+            yield summary_item
+            return
+
+        if code == 2:
+            has_p0 = True
+        elif code == 1:
+            has_p1 = True
+        manifest["chapters"].append({
+            "chapter": float(chap.index),
+            "sequence": sequence,
+            "total": total,
+            "status": "completed",
+            "text_version": item["text_version"],
+            "report_path": item["report_path"],
+            "report_published": False,
+            "bundle_path": item["bundle_path"],
+            "exit_code": code,
+            "started_at": item_started,
+            "finished_at": item_finished,
+            "error": "",
+        })
+        manifest["counts"] = {
+            "total": total,
+            "completed": sequence,
+            "failed": 0,
+            "not_executed": max(total - sequence, 0),
+        }
+        _emit_manifest()
+        if on_chapter is not None:
+            try:
+                on_chapter(item)
+            except Exception:
+                pass
+        yield item
+
+    # 全部章节审查完成：状态优先 + 暂存回滚发布（沿用 F01 语义）。
+    audit_state.last_scope = scope_clean
+    for chap in target_chapters:
+        if chap.index not in audit_state.completed_chapters:
+            audit_state.completed_chapters.append(chap.index)
+    audit_state.completed_chapters.sort()
+    state_path = get_audit_state_path(reports_dir)
+    original_state = _read_optional_bytes(state_path)
+    original_artifacts = {path: _read_optional_bytes(path) for path in staged_writes}
+    publish_error = ""
+    try:
+        save_audit_state(audit_state, reports_dir)
+        _flush_staged_writes_with_rollback(
+            staged_writes, state_path, original_state, original_artifacts
+        )
+    except Exception as e:
+        publish_error = str(e)
+        _rollback_stream_ledger()
+
+    exit_code = 0
+    if not publish_error:
+        exit_code = 2 if has_p0 else (1 if has_p1 and strict else 0)
+    run_status = "failed" if publish_error else "completed"
+    for entry in manifest["chapters"]:
+        entry["report_published"] = bool(run_status == "completed" and entry["status"] == "completed")
+    manifest["run_status"] = run_status
+    manifest["exit_code"] = exit_code if not publish_error else 3
+    _emit_manifest()
+
+    summary_item.update({
+        "phase": "finished",
+        "run_status": run_status,
+        "exit_code": exit_code if not publish_error else 3,
+        "total": total,
+        "completed": total,
+        "failed": 0,
+        "not_executed": 0,
+        "reports_published": run_status == "completed",
+        "report_paths": {str(entry["chapter"]): entry["report_path"] for entry in manifest["chapters"]},
+        "error": publish_error,
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+    })
+    yield summary_item
+
+
 def audit_chapter(
     project_dir: Union[str, Path] = ".",
     chapter_index: Optional[float] = None,
@@ -3730,6 +4354,81 @@ def confirm_asset_event(
         return 3, Path("")
 
 
+def record_finding_disposition(
+    project_dir: Union[str, Path] = ".",
+    finding_id: str = "",
+    decision: str = "accepted",
+    reason: str = "",
+    source: str = "author",
+    silent: bool = False,
+) -> Tuple[int, Path]:
+    """问题处置登记纯 Python API（F08）
+
+    按稳定问题编号登记作者/专家处置（``accepted`` 接受 / ``deferred`` 暂缓 /
+    ``false_positive`` 误报），记录处置时的正文版本与原因。事实冲突类
+    （``causal``/``factual``/``consistency``）与平台门禁发现不允许被自动免除：
+    这类处置会被记录但缺陷仍保留在 ``open_defects``；其余发现的 ``false_positive``
+    处置会把缺陷移入历史并保留原始严重度与证据。
+
+    Args:
+        project_dir: 小说项目根目录（Path 或 str，默认当前目录）
+        finding_id: 持久化缺陷的稳定编号（``open_defects``/``resolved_items`` 中的 ``id``）
+        decision: ``accepted`` / ``deferred`` / ``false_positive``
+        reason: 处置原因（必填）
+        source: 处置来源，``author`` 或 ``expert``
+        silent: 是否静默输出
+
+    Returns:
+        Tuple[int, Path]: (状态码, 审计状态文件路径)；失败时返回 ``(3, Path(""))``
+    """
+    try:
+        p_dir = _resolve_project_dir(project_dir)
+    except (OSError, TypeError, ValueError) as e:
+        _report_api_error(e, silent)
+        return 3, Path("")
+    try:
+        return run_record_finding_disposition(
+            project_dir=p_dir,
+            finding_id=finding_id,
+            decision=decision,
+            reason=reason,
+            source=source,
+            silent=silent,
+        )
+    except (OSError, SafeIOError, TypeError, ValueError) as e:
+        _report_api_error(e, silent)
+        return 3, Path("")
+
+
+def get_finding_dispositions(
+    project_dir: Union[str, Path] = ".",
+    silent: bool = False,
+) -> Tuple[int, Dict[str, Any]]:
+    """问题处置查询纯 Python API（F08）
+
+    返回全部处置记录及规则元数据快照，并按当前正文指纹计算
+    ``needs_reverification``：正文与处置时版本不一致的记录必须重新核验。
+
+    Args:
+        project_dir: 小说项目根目录（Path 或 str，默认当前目录）
+        silent: 是否静默输出
+
+    Returns:
+        Tuple[int, Dict[str, Any]]: (状态码, ``{"dispositions", "counts"}``)；
+        失败时返回 ``(3, {})``
+    """
+    try:
+        p_dir = _resolve_project_dir(project_dir)
+    except (OSError, TypeError, ValueError) as e:
+        _report_api_error(e, silent)
+        return 3, {}
+    try:
+        return run_get_finding_dispositions(project_dir=p_dir, silent=silent)
+    except (OSError, SafeIOError, TypeError, ValueError) as e:
+        _report_api_error(e, silent)
+        return 3, {}
+
+
 __all__ = [
     # 核心纯 Python API
     "audit_chapter",
@@ -3756,6 +4455,11 @@ __all__ = [
     # F06 资产候选变更与确认入口
     "preview_asset_changes",
     "confirm_asset_event",
+    # F07/F08 流式审查与问题处置入口
+    "iter_audit_scope",
+    "get_run_manifest_path",
+    "record_finding_disposition",
+    "get_finding_dispositions",
     # 底层执行管线与别名兼容
     "run_audit",
     "run_scope_audit",
@@ -3770,6 +4474,8 @@ __all__ = [
     "run_record_issue_closure",
     "run_preview_asset_changes",
     "run_confirm_asset_event",
+    "run_record_finding_disposition",
+    "run_get_finding_dispositions",
     # 预审包与报告生成
     "build_pre_audit_bundle",
     "render_audit_report",
