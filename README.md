@@ -135,6 +135,10 @@
 - 记录已完成章节、当前批次以及**“上一批未解决的开放缺陷与伏笔承诺”**；
 - 下一批连审启动时自动装载为 `Inherited Items`，供宿主继续核验跨批因果与伏笔；存储和继承本身不构成语义审查结论。
 
+确定性复审只更新本轮实际运行检查器覆盖的问题。专家、人工、来源未知的旧记录及未覆盖的平台问题会继续保留；同一确定性发现重复审查不会累积。确定性问题经重扫不再命中时，状态保留关闭原因、复核依据和正文版本，供后续追溯。
+
+审查产物采用状态优先发布：先原子保存 `.audit_state.json`，成功后才写预审包、LATEST 与归档报告。批量执行期间各章产物只在内存暂存，中途失败或最终保存失败时不落盘，避免报告与持久状态互相矛盾。
+
 ---
 
 ## 四、标准化报告契约 (Report Contract)
@@ -200,6 +204,8 @@ status_code, summary_path = audit_scope(project_dir, scope_str="1-5", platform="
 # 连审第 6 章至第 10 章，自动装载上一批未解决的开放缺陷与伏笔承诺作为 Inherited Items
 status_code, summary_path = audit_scope(project_dir, scope_str="6-10", platform="qidian")
 ```
+
+每次成功批量审查都会保存独立历史报告，保留小数章号并使用唯一运行编号。返回的范围汇总路径及 `reports/LATEST_REPORT.md` 仍提供最近结果；追溯以 `reports/批量审查/` 中的独立历史为准。
 
 ### 3. 作者画像与偏好联动 (`AuthorMemory`)
 
