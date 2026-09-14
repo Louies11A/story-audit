@@ -86,7 +86,6 @@ from scripts.expert_results import (
     STORE_SCHEMA_VERSION,
     build_expert_result_record,
     compute_text_fingerprint,
-    expert_summary_signature,
     expert_result_summary_entries,
     get_expert_result_store_path,
     get_expert_summary_path,
@@ -1025,13 +1024,29 @@ def run_audit(
     has_new_tags = _record_foreshadowing_tags(state.foreshadowing_stash, new_tags, curr_chapter.index)
     foreshadowing_commitments = _collect_foreshadowing_commitments(state.foreshadowing_stash)
     # 首次标签可建立双轨；仅有人工 Markdown 时保留原稿，承诺仍进入审计状态。
+    ledger_snapshot: Optional[Dict[Path, Optional[bytes]]] = None
     if has_new_tags and (json_path.exists() or not md_path.exists()):
         try:
+            # 账本与审计状态必须同一提交点：先快照原字节，后续任何失败都回滚到原样。
+            ledger_snapshot = {
+                json_path: _read_optional_bytes(json_path),
+                md_path: _read_optional_bytes(md_path),
+            }
             save_ledger_state(state, json_path, md_path, force=force)
         except Exception as e:
             if not silent:
                 print(f"[错误] 持久化新伏笔至账本失败: {e}", file=sys.stderr)
             return 3
+
+    def _rollback_ledger_writes() -> None:
+        """回滚本轮账本写入（含删除本次新建文件），保证失败路径不留下半写产物。"""
+        if not ledger_snapshot:
+            return
+        for path, original in ledger_snapshot.items():
+            try:
+                _restore_optional_bytes(path, original)
+            except OSError:
+                pass
 
     # 8.5 汇集平台卡尺违规项
     p_findings = platform_data.get("findings", [])
@@ -1144,6 +1159,7 @@ def run_audit(
             get_inherited_items(audit_state), expert_view
         )
     except Exception as e:
+        _rollback_ledger_writes()
         if not silent:
             print(f"[错误] 读取专家结果归档失败: {e}", file=sys.stderr)
         return 3
@@ -1199,19 +1215,32 @@ def run_audit(
         archived_report_path: report_content,
     }
     # 正文版本变化时先把旧归档报告原样搬进历史目录，杜绝静默覆盖旧裁决。
-    if (
-        previous_version
-        and previous_version != curr_text_version
-        and archived_report_path.is_file()
-    ):
-        history_path = get_report_history_path(
-            reports_dir, curr_chapter.index, previous_version
-        )
-        if not history_path.exists():
-            pending_writes[history_path] = archived_report_path.read_bytes()
-    # 过期判定视图发生变化时，随本轮产物原子刷新专家汇总渲染（归档 JSON 保持不变）。
-    summary_stale = expert_summary_signature(expert_view) != expert_summary_signature(expert_records)
-    if expert_view and summary_stale:
+    if archived_report_path.is_file():
+        if previous_version:
+            # 指纹一致说明现有归档对应当前版本，可安全覆盖；否则先归档旧版本。
+            needs_history = previous_version != curr_text_version
+            history_version = previous_version
+        else:
+            # 旧状态没有章节指纹表：无法证明现有归档对应当前版本，保守归档为 unknown。
+            needs_history = True
+            history_version = "unknown"
+        if needs_history:
+            history_path = get_report_history_path(
+                reports_dir, curr_chapter.index, history_version
+            )
+            if not history_path.exists():
+                try:
+                    pending_writes[history_path] = archived_report_path.read_bytes()
+                except OSError as e:
+                    _rollback_ledger_writes()
+                    if not silent:
+                        print(
+                            f"[错误] 旧归档报告保护失败，已放弃本轮发布: {e}", file=sys.stderr
+                        )
+                    return 3
+    # 汇总按当前视图重写（含正文回退到已审版本的情形），保证报告与汇总判定一致；
+    # 归档 JSON 仍只由提交路径写入，读取路径不改写归档本身。
+    if expert_view:
         pending_writes[get_expert_summary_path(reports_dir)] = render_expert_summary_markdown(
             expert_view, generated_at=datetime.now(timezone.utc).isoformat()
         )
@@ -1233,10 +1262,17 @@ def run_audit(
             audit_state.completed_chapters.append(c_idx)
             audit_state.completed_chapters.sort()
         audit_state.last_scope = f"{c_idx:g}"
-        save_audit_state(audit_state, reports_dir)
-        _flush_staged_writes_with_rollback(
-            pending_writes, state_path, original_state, original_artifacts
-        )
+        try:
+            save_audit_state(audit_state, reports_dir)
+            _flush_staged_writes_with_rollback(
+                pending_writes, state_path, original_state, original_artifacts
+            )
+        except Exception as e:
+            # 账本与状态同一提交点：发布失败时连同本轮账本写入一起回滚。
+            _rollback_ledger_writes()
+            if not silent:
+                print(f"[错误] 发布审查产物失败: {e}", file=sys.stderr)
+            return 3
     else:
         # 保留内部直接调用（非公开 API）既有行为：不写 LATEST，也不改持久状态。
         state_path = get_audit_state_path(reports_dir)
@@ -1244,9 +1280,15 @@ def run_audit(
         original_artifacts = {
             path: _read_optional_bytes(path) for path in pending_writes
         }
-        _flush_staged_writes_with_rollback(
-            pending_writes, state_path, original_state, original_artifacts
-        )
+        try:
+            _flush_staged_writes_with_rollback(
+                pending_writes, state_path, original_state, original_artifacts
+            )
+        except Exception as e:
+            _rollback_ledger_writes()
+            if not silent:
+                print(f"[错误] 发布审查产物失败: {e}", file=sys.stderr)
+            return 3
 
     if not silent:
         print(f"=== story-audit 深度审查报告 ===")

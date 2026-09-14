@@ -17,6 +17,7 @@ from scripts.audit_state import (
     load_audit_state,
     save_audit_state,
 )
+from scripts.ledger_engine import LedgerState, save_ledger_state
 from scripts.safe_io import SafeIOWriteError
 
 
@@ -79,6 +80,70 @@ def _pending_pairs(project: Path):
     return sorted(
         (item["chapter"], item["scope"]) for item in _pending_payload(project)["pending"]
     )
+
+
+def test_f05_legacy_state_still_preserves_old_report(project):
+    """P2：旧状态没有 chapter_versions 时，首次版本变化也必须归档旧报告。"""
+    _audit(project, [1, 2])
+    archive_path = project / "reports" / "单章审查" / "001-100章" / "第001章_审查报告.md"
+    original_report = archive_path.read_bytes()
+    assert "补丁引入的新问题" not in original_report.decode("utf-8")
+
+    # 模拟升级前状态文件：移除 F05 新增字段后原样写回。
+    state_path = get_audit_state_path(project / "reports")
+    legacy_state = json.loads(state_path.read_text(encoding="utf-8"))
+    for key in ("chapter_versions", "pending_rechecks", "version_events"):
+        legacy_state.pop(key, None)
+    state_path.write_text(json.dumps(legacy_state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    (project / "正文" / "第001章.txt").write_text(
+        '第一章\n他握紧了钥匙。\n雪停了。<!-- audit:p1 message="补丁引入的新问题" -->\n',
+        encoding="utf-8",
+    )
+    assert story_audit.audit_chapter(project, chapter_index=1, mode="solo", silent=True)[0] == 0
+
+    history_dir = project / "reports" / "单章审查" / "历史" / "001-100章"
+    history_files = sorted(history_dir.glob("第001章_审查报告_v*.md"))
+    assert len(history_files) == 1
+    assert history_files[0].read_bytes() == original_report
+    assert "unknown" in history_files[0].name
+    assert "补丁引入的新问题" in archive_path.read_text(encoding="utf-8")
+
+    # 版本表已重建：同版本重复审查不再产生新的历史副本。
+    assert story_audit.audit_chapter(project, chapter_index=1, mode="solo", silent=True)[0] == 0
+    assert len(sorted(history_dir.glob("第001章_审查报告_v*.md"))) == 1
+
+
+@pytest.mark.parametrize("existing_ledger", [False, True], ids=["no-ledger", "existing-ledger"])
+def test_f05_state_save_failure_rolls_back_ledger_writes(project, existing_ledger):
+    """P3-1：状态保存失败时账本写入必须一并回滚，失败路径全仓库字节不变。"""
+    if existing_ledger:
+        save_ledger_state(
+            LedgerState(),
+            project / "设定" / "资源账本.json",
+            project / "设定" / "资源账本.md",
+        )
+    (project / "正文" / "第001章.txt").write_text(
+        "第一章\n他握紧了钥匙。\n风停了。\n"
+        '<!-- audit:stash name="海门钥匙" origin="第1章" status="pending" -->\n',
+        encoding="utf-8",
+    )
+    before = _snapshot(project)
+
+    with patch.object(story_audit, "save_audit_state", side_effect=SafeIOWriteError("模拟状态保存失败")):
+        assert story_audit.audit_chapter(project, chapter_index=1, mode="solo", silent=True) == (3, Path(""))
+
+    assert _snapshot(project) == before
+    assert not (project / "reports" / "LATEST_REPORT.md").exists()
+    assert not get_audit_state_path(project / "reports").exists()
+    if existing_ledger:
+        assert (project / "设定" / "资源账本.json").is_file()
+        assert (project / "设定" / "资源账本.md").is_file()
+    else:
+        # 本轮新建的账本文件必须被删除，项目树回到初始状态。
+        assert not (project / "设定" / "资源账本.json").exists()
+        assert not (project / "资源账本.json").exists()
+        assert not (project / "资源账本.md").exists()
 
 
 def test_f05_patch_registers_chapter_and_seam_rechecks_only(project):

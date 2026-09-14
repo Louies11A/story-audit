@@ -126,6 +126,27 @@ def test_f04_contract_validates_status_fingerprint_and_findings(project):
     assert story_audit.ExpertResult is ExpertResult
     assert story_audit.compute_text_fingerprint is compute_text_fingerprint
 
+def test_f04_summary_follows_report_after_text_reverts(project):
+    """P3-2：正文回退到已审指纹后，报告与 EXPERT_SUMMARY.md 必须一致地回到未过期。"""
+    version = _fingerprint(project, 1)
+    result = _result(text_fingerprint=version, findings=[_finding("回退一致性结论")])
+    assert story_audit.archive_expert_results(project, results=[result], silent=True)[0] == 0
+    summary_path = get_expert_summary_path(project / "reports")
+
+    (project / "正文" / "第001章.txt").write_text(CHAPTER_ONE + "他合上了箱盖。\n", encoding="utf-8")
+    assert story_audit.audit_chapter(project, chapter_index=1, silent=True)[0] == 0
+    assert "需重新执行专家审查" in summary_path.read_text(encoding="utf-8")
+
+    (project / "正文" / "第001章.txt").write_text(CHAPTER_ONE, encoding="utf-8")
+    code, report = story_audit.audit_chapter(project, chapter_index=1, silent=True)
+    assert code == 0
+    report_text = report.read_text(encoding="utf-8")
+    summary_text = summary_path.read_text(encoding="utf-8")
+    assert "需重新执行专家审查" not in report_text
+    assert "需重新执行专家审查" not in summary_text
+    assert "完成" in summary_text
+    assert "已过期：0" in summary_text
+
 
 def test_f04_archive_presents_all_execution_states_in_summary_and_reports(project, capsys):
     results = [
