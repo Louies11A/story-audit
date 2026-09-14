@@ -17,6 +17,7 @@ import re
 import sys
 import tempfile
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
@@ -3902,250 +3903,291 @@ def iter_audit_scope(
         except Exception:
             pass
 
-    staged_writes: Dict[Path, Union[str, bytes]] = {}
-    chapter_summaries: List[Dict[str, Any]] = []
-    has_p0 = False
-    has_p1 = False
-    for sequence, chap in enumerate(target_chapters, 1):
-        item_started = datetime.now(timezone.utc).isoformat()
-        summary: Dict[str, Any] = {}
-        code = run_audit(
-            p_dir,
-            target_chapter_index=chap.index,
-            strict=strict,
-            force=force,
-            write_latest_report=False,
-            silent=True,
-            summary_collector=summary,
-            genre=genre,
-            mode=mode,
-            platform=platform,
-            use_author_memory=author_memory,
-            inherited_items=None,
-            allow_partial=effective_allow_partial,
-            _chapter_snapshot=chapters,
-            _audit_state=audit_state,
-            _staged_writes=staged_writes,
-        )
-        item_finished = datetime.now(timezone.utc).isoformat()
-        bundle = summary.get("pre_bundle") if isinstance(summary.get("pre_bundle"), dict) else {}
-        item: Dict[str, Any] = {
-            "kind": "chapter",
-            "run_id": run_id,
-            "manifest_path": str(manifest_path),
-            "sequence": sequence,
-            "total": total,
-            "chapter": float(chap.index),
-            "chapter_title": chap.title,
-            "text_version": str(summary.get("text_version") or ""),
-            "exit_code": code,
-            "status": "completed" if code != 3 else "failed",
-            "error": "" if code != 3 else f"第 {chap.index:g} 章审查失败（exit_code=3）",
-            "findings": [
-                {
-                    **(finding.to_dict() if hasattr(finding, "to_dict") else dict(finding)),
+    completed_normally = False
+    try:
+        staged_writes: Dict[Path, Union[str, bytes]] = {}
+        chapter_summaries: List[Dict[str, Any]] = []
+        has_p0 = False
+        has_p1 = False
+        for sequence, chap in enumerate(target_chapters, 1):
+            item_started = datetime.now(timezone.utc).isoformat()
+            summary: Dict[str, Any] = {}
+            code = run_audit(
+                p_dir,
+                target_chapter_index=chap.index,
+                strict=strict,
+                force=force,
+                write_latest_report=False,
+                silent=True,
+                summary_collector=summary,
+                genre=genre,
+                mode=mode,
+                platform=platform,
+                use_author_memory=author_memory,
+                inherited_items=None,
+                allow_partial=effective_allow_partial,
+                _chapter_snapshot=chapters,
+                _audit_state=audit_state,
+                _staged_writes=staged_writes,
+            )
+            item_finished = datetime.now(timezone.utc).isoformat()
+            bundle = summary.get("pre_bundle") if isinstance(summary.get("pre_bundle"), dict) else {}
+            item: Dict[str, Any] = {
+                "kind": "chapter",
+                "run_id": run_id,
+                "manifest_path": str(manifest_path),
+                "sequence": sequence,
+                "total": total,
+                "chapter": float(chap.index),
+                "chapter_title": chap.title,
+                "text_version": str(summary.get("text_version") or ""),
+                "exit_code": code,
+                "status": "completed" if code != 3 else "failed",
+                "error": "" if code != 3 else f"第 {chap.index:g} 章审查失败（exit_code=3）",
+                "findings": [
+                    {
+                        **(finding.to_dict() if hasattr(finding, "to_dict") else dict(finding)),
+                        "chapter": float(chap.index),
+                    }
+                    for finding in (summary.get("findings") or [])
+                ],
+                "p0_list": list(summary.get("p0_list") or []),
+                "p1_list": list(summary.get("p1_list") or []),
+                "p2_count": int(summary.get("p2_count") or 0),
+                "p3_count": int(summary.get("p3_count") or 0),
+                "open_defects": list(summary.get("open_defects") or []),
+                "word_count": int(summary.get("word_count") or 0),
+                "paragraph_count": int(summary.get("paragraph_count") or 0),
+                "bundle": bundle,
+                # 共享预审包缓存路径（单文件缓存，仅最后一次审查内容；逐章内容以 bundle 为准）。
+                "shared_bundle_cache_path": str(summary.get("pre_bundle_path") or ""),
+                "report_path": str(summary.get("archived_report_path") or ""),
+                "report_published": False,
+                "started_at": item_started,
+                "finished_at": item_finished,
+            }
+            if code == 3:
+                manifest["chapters"].append({
                     "chapter": float(chap.index),
+                    "sequence": sequence,
+                    "total": total,
+                    "status": "failed",
+                    "text_version": item["text_version"],
+                    "report_path": item["report_path"],
+                    "report_published": False,
+                    "shared_bundle_cache_path": item["shared_bundle_cache_path"],
+                    "exit_code": 3,
+                    "started_at": item_started,
+                    "finished_at": item_finished,
+                    "error": item["error"],
+                })
+                for pending in target_chapters[sequence:]:
+                    manifest["chapters"].append({
+                        "chapter": float(pending.index),
+                        "sequence": target_chapters.index(pending) + 1,
+                        "total": total,
+                        "status": "not_executed",
+                        "text_version": "",
+                        "report_path": "",
+                        "report_published": False,
+                        "shared_bundle_cache_path": "",
+                        "exit_code": None,
+                        "started_at": "",
+                        "finished_at": "",
+                        "error": "",
+                    })
+                manifest["counts"] = {
+                    "total": total,
+                    "completed": sequence - 1,
+                    "failed": 1,
+                    "not_executed": max(total - sequence, 0),
                 }
-                for finding in (summary.get("findings") or [])
-            ],
-            "p0_list": list(summary.get("p0_list") or []),
-            "p1_list": list(summary.get("p1_list") or []),
-            "p2_count": int(summary.get("p2_count") or 0),
-            "p3_count": int(summary.get("p3_count") or 0),
-            "open_defects": list(summary.get("open_defects") or []),
-            "word_count": int(summary.get("word_count") or 0),
-            "paragraph_count": int(summary.get("paragraph_count") or 0),
-            "bundle": bundle,
-            # 共享预审包缓存路径（单文件缓存，仅最后一次审查内容；逐章内容以 bundle 为准）。
-            "shared_bundle_cache_path": str(summary.get("pre_bundle_path") or ""),
-            "report_path": str(summary.get("archived_report_path") or ""),
-            "report_published": False,
-            "started_at": item_started,
-            "finished_at": item_finished,
-        }
-        if code == 3:
+                manifest["run_status"] = "failed"
+                manifest["exit_code"] = 3
+                _emit_manifest()
+                _rollback_stream_ledger()
+                if on_chapter is not None:
+                    try:
+                        on_chapter(item)
+                    except Exception:
+                        pass
+                yield item
+                summary_item.update({
+                    "phase": "finished",
+                    "run_status": "failed",
+                    "exit_code": 3,
+                    "completed": sequence - 1,
+                    "failed": 1,
+                    "not_executed": max(total - sequence, 0),
+                    "error": item["error"],
+                    "finished_at": datetime.now(timezone.utc).isoformat(),
+                })
+                completed_normally = True
+                yield summary_item
+                return
+
+            if code == 2:
+                has_p0 = True
+            elif code == 1:
+                has_p1 = True
+            chapter_summaries.append(summary)
             manifest["chapters"].append({
                 "chapter": float(chap.index),
                 "sequence": sequence,
                 "total": total,
-                "status": "failed",
+                "status": "completed",
                 "text_version": item["text_version"],
                 "report_path": item["report_path"],
                 "report_published": False,
                 "shared_bundle_cache_path": item["shared_bundle_cache_path"],
-                "exit_code": 3,
+                "exit_code": code,
                 "started_at": item_started,
                 "finished_at": item_finished,
-                "error": item["error"],
+                "error": "",
             })
-            for pending in target_chapters[sequence:]:
-                manifest["chapters"].append({
-                    "chapter": float(pending.index),
-                    "sequence": target_chapters.index(pending) + 1,
-                    "total": total,
-                    "status": "not_executed",
-                    "text_version": "",
-                    "report_path": "",
-                    "report_published": False,
-                    "shared_bundle_cache_path": "",
-                    "exit_code": None,
-                    "started_at": "",
-                    "finished_at": "",
-                    "error": "",
-                })
             manifest["counts"] = {
                 "total": total,
-                "completed": sequence - 1,
-                "failed": 1,
+                "completed": sequence,
+                "failed": 0,
                 "not_executed": max(total - sequence, 0),
             }
-            manifest["run_status"] = "failed"
-            manifest["exit_code"] = 3
             _emit_manifest()
-            _rollback_stream_ledger()
             if on_chapter is not None:
                 try:
                     on_chapter(item)
                 except Exception:
                     pass
             yield item
-            summary_item.update({
-                "phase": "finished",
-                "run_status": "failed",
-                "exit_code": 3,
-                "completed": sequence - 1,
-                "failed": 1,
-                "not_executed": max(total - sequence, 0),
-                "error": item["error"],
-                "finished_at": datetime.now(timezone.utc).isoformat(),
-            })
-            yield summary_item
-            return
 
-        if code == 2:
-            has_p0 = True
-        elif code == 1:
-            has_p1 = True
-        chapter_summaries.append(summary)
-        manifest["chapters"].append({
-            "chapter": float(chap.index),
-            "sequence": sequence,
-            "total": total,
-            "status": "completed",
-            "text_version": item["text_version"],
-            "report_path": item["report_path"],
-            "report_published": False,
-            "shared_bundle_cache_path": item["shared_bundle_cache_path"],
-            "exit_code": code,
-            "started_at": item_started,
-            "finished_at": item_finished,
-            "error": "",
-        })
-        manifest["counts"] = {
-            "total": total,
-            "completed": sequence,
-            "failed": 0,
-            "not_executed": max(total - sequence, 0),
-        }
-        _emit_manifest()
-        if on_chapter is not None:
-            try:
-                on_chapter(item)
-            except Exception:
-                pass
-        yield item
-
-    # 全部章节审查完成：状态优先 + 暂存回滚发布（沿用 F01 语义）。
-    audit_state.last_scope = scope_clean
-    for chap in target_chapters:
-        if chap.index not in audit_state.completed_chapters:
-            audit_state.completed_chapters.append(chap.index)
-    audit_state.completed_chapters.sort()
-    # F07/A3：成功路径补齐与 audit_scope 一致的批量汇总产物（失败运行仍只保留运行清单）。
-    effective_mode, fallback_reason = _resolve_precheck_mode(mode)
-    batch_dir = reports_dir / "批量审查"
-    today = datetime.now().strftime("%Y-%m-%d")
-    s_fmt = _format_history_chapter_number(s_min)
-    e_fmt = _format_history_chapter_number(s_max)
-    history_run_id, batch_report_file = _resolve_batch_history_path(
-        batch_dir, today, s_fmt, e_fmt, run_id
-    )
-    scope_clean_name = scope_clean
-    scope_summary_path = reports_dir / f"BATCH_SUMMARY_SCOPE_{scope_clean_name}.md"
-    latest_report_path = reports_dir / "LATEST_REPORT.md"
-    batch_summary_content = ""
-    batch_summary_error = ""
-    try:
-        expert_view = _refresh_expert_records(
-            load_expert_result_records(get_expert_result_store_path(reports_dir)), p_dir
+        # 全部章节审查完成：状态优先 + 暂存回滚发布（沿用 F01 语义）。
+        audit_state.last_scope = scope_clean
+        for chap in target_chapters:
+            if chap.index not in audit_state.completed_chapters:
+                audit_state.completed_chapters.append(chap.index)
+        audit_state.completed_chapters.sort()
+        # F07/A3：成功路径补齐与 audit_scope 一致的批量汇总产物（失败运行仍只保留运行清单）。
+        effective_mode, fallback_reason = _resolve_precheck_mode(mode)
+        batch_dir = reports_dir / "批量审查"
+        today = datetime.now().strftime("%Y-%m-%d")
+        s_fmt = _format_history_chapter_number(s_min)
+        e_fmt = _format_history_chapter_number(s_max)
+        history_run_id, batch_report_file = _resolve_batch_history_path(
+            batch_dir, today, s_fmt, e_fmt, run_id
         )
-        batch_summary_content = render_scope_batch_summary(
-            scope_str=scope_clean,
-            s_min=s_min,
-            s_max=s_max,
-            chapter_summaries=chapter_summaries,
-            strict=strict,
-            requested_mode=mode,
-            effective_mode=effective_mode,
-            fallback_reason=fallback_reason,
-            platform=platform,
-            run_id=history_run_id,
-            inherited_items=_attach_disposition_states(
-                _attach_expert_summaries(get_inherited_items(audit_state), expert_view),
-                p_dir,
-            ),
-        )
-    except Exception as e:
-        # 汇总渲染失败必须显式失败：不得报 completed 或声称报告已发布。
-        batch_summary_error = f"批量汇总报告生成失败: {e}"
-        summary_item["error"] = batch_summary_error
-    if batch_summary_content:
-        staged_writes[scope_summary_path] = batch_summary_content
-        staged_writes[batch_report_file] = batch_summary_content
-        staged_writes[latest_report_path] = batch_summary_content
-    state_path = get_audit_state_path(reports_dir)
-    original_state = _read_optional_bytes(state_path)
-    original_artifacts = {path: _read_optional_bytes(path) for path in staged_writes}
-    publish_error = batch_summary_error
-    if not publish_error:
+        scope_clean_name = scope_clean
+        scope_summary_path = reports_dir / f"BATCH_SUMMARY_SCOPE_{scope_clean_name}.md"
+        latest_report_path = reports_dir / "LATEST_REPORT.md"
+        batch_summary_content = ""
+        batch_summary_error = ""
         try:
-            save_audit_state(audit_state, reports_dir)
-            _flush_staged_writes_with_rollback(
-                staged_writes, state_path, original_state, original_artifacts
+            expert_view = _refresh_expert_records(
+                load_expert_result_records(get_expert_result_store_path(reports_dir)), p_dir
+            )
+            batch_summary_content = render_scope_batch_summary(
+                scope_str=scope_clean,
+                s_min=s_min,
+                s_max=s_max,
+                chapter_summaries=chapter_summaries,
+                strict=strict,
+                requested_mode=mode,
+                effective_mode=effective_mode,
+                fallback_reason=fallback_reason,
+                platform=platform,
+                run_id=history_run_id,
+                inherited_items=_attach_disposition_states(
+                    _attach_expert_summaries(get_inherited_items(audit_state), expert_view),
+                    p_dir,
+                ),
             )
         except Exception as e:
-            publish_error = str(e)
-    if publish_error:
-        _rollback_stream_ledger()
+            # 汇总渲染失败必须显式失败：不得报 completed 或声称报告已发布。
+            batch_summary_error = f"批量汇总报告生成失败: {e}"
+            summary_item["error"] = batch_summary_error
+        if batch_summary_content:
+            staged_writes[scope_summary_path] = batch_summary_content
+            staged_writes[batch_report_file] = batch_summary_content
+            staged_writes[latest_report_path] = batch_summary_content
+        state_path = get_audit_state_path(reports_dir)
+        original_state = _read_optional_bytes(state_path)
+        original_artifacts = {path: _read_optional_bytes(path) for path in staged_writes}
+        publish_error = batch_summary_error
+        if not publish_error:
+            try:
+                save_audit_state(audit_state, reports_dir)
+                _flush_staged_writes_with_rollback(
+                    staged_writes, state_path, original_state, original_artifacts
+                )
+            except Exception as e:
+                publish_error = str(e)
+        if publish_error:
+            _rollback_stream_ledger()
 
-    exit_code = 0
-    if not publish_error:
-        exit_code = 2 if has_p0 else (1 if has_p1 and strict else 0)
-    run_status = "failed" if publish_error else "completed"
-    for entry in manifest["chapters"]:
-        entry["report_published"] = bool(run_status == "completed" and entry["status"] == "completed")
-    manifest["run_status"] = run_status
-    manifest["exit_code"] = exit_code if not publish_error else 3
-    _emit_manifest()
+        exit_code = 0
+        if not publish_error:
+            exit_code = 2 if has_p0 else (1 if has_p1 and strict else 0)
+        run_status = "failed" if publish_error else "completed"
+        for entry in manifest["chapters"]:
+            entry["report_published"] = bool(run_status == "completed" and entry["status"] == "completed")
+        manifest["run_status"] = run_status
+        manifest["exit_code"] = exit_code if not publish_error else 3
+        _emit_manifest()
 
-    summary_item.update({
-        "phase": "finished",
-        "run_status": run_status,
-        "exit_code": exit_code if not publish_error else 3,
-        "total": total,
-        "completed": total,
-        "failed": 0,
-        "not_executed": 0,
-        "reports_published": run_status == "completed",
-        "report_paths": {str(entry["chapter"]): entry["report_path"] for entry in manifest["chapters"]},
-        "batch_summary_path": str(scope_summary_path) if batch_summary_content else "",
-        "batch_archive_path": str(batch_report_file) if batch_summary_content else "",
-        "latest_report_path": str(latest_report_path) if batch_summary_content else "",
-        "error": publish_error,
-        "finished_at": datetime.now(timezone.utc).isoformat(),
-    })
-    yield summary_item
+        summary_item.update({
+            "phase": "finished",
+            "run_status": run_status,
+            "exit_code": exit_code if not publish_error else 3,
+            "total": total,
+            "completed": total,
+            "failed": 0,
+            "not_executed": 0,
+            "reports_published": run_status == "completed",
+            "report_paths": {str(entry["chapter"]): entry["report_path"] for entry in manifest["chapters"]},
+            "batch_summary_path": str(scope_summary_path) if batch_summary_content else "",
+            "batch_archive_path": str(batch_report_file) if batch_summary_content else "",
+            "latest_report_path": str(latest_report_path) if batch_summary_content else "",
+            "error": publish_error,
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+        })
+        completed_normally = True
+        yield summary_item
+    finally:
+        if not completed_normally:
+            _rollback_stream_ledger()
+            manifest["run_status"] = "interrupted"
+            manifest["exit_code"] = 130
+            manifest["updated_at"] = datetime.now(timezone.utc).isoformat()
+            existing_chapters = {entry["chapter"] for entry in manifest["chapters"]}
+            for entry in manifest["chapters"]:
+                if entry.get("status") == "running":
+                    entry["status"] = "interrupted"
+            for pending in target_chapters:
+                if float(pending.index) not in existing_chapters:
+                    manifest["chapters"].append({
+                        "chapter": float(pending.index),
+                        "sequence": target_chapters.index(pending) + 1,
+                        "total": total,
+                        "status": "interrupted",
+                        "text_version": "",
+                        "report_path": "",
+                        "report_published": False,
+                        "shared_bundle_cache_path": "",
+                        "exit_code": None,
+                        "started_at": "",
+                        "finished_at": "",
+                        "error": "",
+                    })
+            _emit_manifest()
 
+
+
+@contextmanager
+def audit_scope_stream(*args, **kwargs) -> Iterator[Iterator[Dict[str, Any]]]:
+    """包装 iter_audit_scope 的上下文管理器，确保退出上下文时自动安全关闭生成器。"""
+    gen = iter_audit_scope(*args, **kwargs)
+    try:
+        yield gen
+    finally:
+        gen.close()
 
 def _normalize_context_entities(entities: Any) -> List[Dict[str, str]]:
     """规整实体过滤条件：支持名称字符串或 {name, owner} 字典。"""
@@ -4442,7 +4484,6 @@ def run_build_context_package(
             f"高于预算 {budget} 字节。"
         )
     # 预算口径为 package；packet_bytes 供宿主判断整体返回体规模（含省略回执，近似值）。
-    payload["budget"]["packet_bytes"] = _package_size(payload)
     payload["budget"]["packet_bytes"] = _package_size(payload)
     return 0, payload
 
@@ -5345,6 +5386,7 @@ __all__ = [
     "confirm_asset_event",
     # F07/F08 流式审查与问题处置入口
     "iter_audit_scope",
+    "audit_scope_stream",
     "get_run_manifest_path",
     "record_finding_disposition",
     "get_finding_dispositions",

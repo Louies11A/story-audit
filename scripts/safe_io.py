@@ -1,34 +1,37 @@
+# -*- coding: utf-8 -*-
 """
 统一安全文件 I/O 与原子备份器 (safe_io.py)
 
-功能职责：
-1. 自动嗅探文件编码（utf-8-sig -> utf-8 -> gb18030）；
-2. 识别与在内存中规整换行符（CRLF 及孤立 CR 规整为 LF）；
-3. 严格无损还原原稿换行与编码写入，采用同目录临时文件原子替换；
-4. 原子生成镜像备份，支持时间戳碰撞自动递增，杜绝主流程异常导致的原稿损毁。
+核心职责：
+1. 自动探测文件编码（utf-8-sig -> utf-8 -> gb18030）。
+2. 识别并在内存中规范化换行符（CRLF 及孤立 CR 转换为 LF）。
+3. 严格保持原原稿换行符写回，基于同目录临时文件原子替换。
+4. 原子级镜像备份，支持时间戳与防碰撞自动递增，杜绝异常情况下的原稿损毁。
 """
 
 import codecs
 import os
 import re
+import sys
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
-from typing import Tuple, Union
+from typing import Optional, Tuple, Union
 
 
-class SafeIOError(Exception):
-    """SafeIO 基础异常类"""
+class SafeIOError(OSError):
+    """SafeIO 基础异常，继承自 OSError 以兼容标准 I/O 异常捕获"""
     pass
 
 
 class SafeIOReadError(SafeIOError):
-    """文件读取、解码或 I/O 探测失败异常"""
+    """文件读取与安全 I/O 探测失败异常"""
     pass
 
 
 class SafeIOWriteError(SafeIOError):
-    """文件写入、原子替换或目录创建失败异常"""
+    """文件写入、原子替换与目录创建失败异常"""
     pass
 
 
@@ -46,26 +49,45 @@ __all__ = [
 MAX_SAFE_FILE_SIZE = 20 * 1024 * 1024  # 20MB 上限
 
 
+def _atomic_replace_with_retry(
+    src: Union[Path, str],
+    dst: Union[Path, str],
+    max_retries: int = 5,
+) -> None:
+    """原子替换文件，在 Windows 下遇到短时文件锁/占用（PermissionError）进行微延迟退避重试。"""
+    src_path = str(src)
+    dst_path = str(dst)
+    for attempt in range(max_retries + 1):
+        try:
+            os.replace(src_path, dst_path)
+            return
+        except PermissionError:
+            if sys.platform == "win32" and attempt < max_retries:
+                time.sleep(0.01 * (2 ** attempt))
+                continue
+            raise
+
+
 def read_file_safe(
     path: Union[Path, str],
     max_size: int = MAX_SAFE_FILE_SIZE,
 ) -> Tuple[str, str, str]:
     """安全读取文件并探测编码与换行符。
 
-    增加文件大小上限（默认 20MB）及二进制空字节 \x00 探测。
-    按顺序尝试解码：utf-8-sig -> utf-8 -> gb18030
-    换行符识别：若包含 \r\n 则 detected_newline 为 "\r\n"，否则为 "\n"
-    内存规整：将读取的内容在内存中把 CRLF 与孤立 CR 统一规整为 \n
+    检查文件大小上限（默认 20MB），二进制空字节 \x00 探测。
+    按顺序探测解码：utf-8-sig -> utf-8 -> gb18030
+    换行符识别规则：包含 \r\n 则 detected_newline 为 "\r\n"，否则为 "\n"
+    内存规范化换行符：读取成功后在内存中把 CRLF 及孤立 CR 统一转换为 \n
 
     Args:
         path: 文件路径（Path 或字符串）
-        max_size: 最大允许读取的文件字节大小，默认 20MB
+        max_size: 允许读取的最大文件字节大小（默认 20MB）
 
     Returns:
         (normalized_content, detected_encoding, detected_newline)
 
     Raises:
-        SafeIOReadError: 文件不存在、超大、包含二进制空字节或所有编码尝试均失败时抛出
+        SafeIOReadError: 文件不存在、超大、包含空字节或所有编码尝试均失败时抛出
     """
     file_path = Path(path)
     if not file_path.is_file():
@@ -99,10 +121,12 @@ def read_file_safe(
         try:
             decoded = raw_bytes.decode("utf-8-sig")
             detected_encoding = "utf-8-sig"
-        except UnicodeDecodeError:
-            decoded = None
+        except UnicodeDecodeError as e:
+            raise SafeIOReadError(
+                f"文件包含 UTF-8 BOM 但字节序列损坏，拒绝回退至 GB18030 以防止乱码破坏原稿: {file_path}"
+            ) from e
 
-    # 2. 回退顺序：utf-8 -> gb18030
+    # 2. 依次尝试 utf-8 -> gb18030
     if decoded is None:
         for enc in ("utf-8", "gb18030"):
             try:
@@ -120,7 +144,7 @@ def read_file_safe(
     # 3. 换行符识别
     detected_newline = "\r\n" if "\r\n" in decoded else "\n"
 
-    # 4. 内存规整为 LF（包含孤立 \r 彻底清除）
+    # 4. 内存规范化为 LF，包含孤立 \r 的规范化
     normalized_content = re.sub(r"\r\n|\r", "\n", decoded)
 
     return normalized_content, detected_encoding, detected_newline
@@ -132,13 +156,13 @@ def write_file_safe(
     encoding: str = "utf-8",
     newline: str = "\n",
 ) -> None:
-    """安全原子写入文件，自动创建父目录并精确保持换行与编码。
+    """安全原子写入文件，自动创建父目录并精确保持换行符编码。
 
-    采用同目录临时文件 + fsync + os.replace 原子替换机制，杜绝直接截断目标文件风险。
+    采用同目录临时文件 + fsync + 原子替换机制，杜绝直接截断目标文件风险。
 
     Args:
         path: 目标文件路径（Path 或字符串）
-        content: 待写入内容（内存中通常为 \n 规整格式）
+        content: 待写入内容（内存中通常为 \n 换行格式）
         encoding: 目标编码（默认 utf-8）
         newline: 目标换行符（"\n" 或 "\r\n"，默认 "\n"）
 
@@ -151,13 +175,14 @@ def write_file_safe(
     except OSError as e:
         raise SafeIOWriteError(f"创建目标父目录失败 {target_path.parent}: {e}") from e
 
-    # 格式化目标换行符（孤立 \r 统一归整）
+    # 格式化目标换行符，孤立 \r 统一规范化
     if newline == "\r\n":
         final_content = re.sub(r"\r\n|\r", "\n", content).replace("\n", "\r\n")
     else:
         final_content = re.sub(r"\r\n|\r", "\n", content)
 
     temp_path_str: Union[str, None] = None
+    temp_fd: Optional[int] = None
     try:
         temp_fd, temp_path_str = tempfile.mkstemp(
             dir=target_path.parent,
@@ -169,8 +194,13 @@ def write_file_safe(
             f.flush()
             os.fsync(f.fileno())
 
-        os.replace(temp_path_str, target_path)
+        _atomic_replace_with_retry(temp_path_str, target_path)
     except Exception as e:
+        if temp_fd is not None:
+            try:
+                os.close(temp_fd)
+            except OSError:
+                pass
         if temp_path_str and os.path.exists(temp_path_str):
             try:
                 os.remove(temp_path_str)
@@ -189,7 +219,7 @@ def create_atomic_backup(
 
     备份文件名格式：
     首次备份：{source_path.stem}_{timestamp}{source_path.suffix}.bak
-    若已存在同名备份：{source_path.stem}_{timestamp}_{counter:02d}{source_path.suffix}.bak
+    已存在同秒备份：{source_path.stem}_{timestamp}_{counter:02d}{source_path.suffix}.bak
     时间戳格式：YYYYMMDD_HHMMSS
 
     Args:
@@ -205,7 +235,7 @@ def create_atomic_backup(
     """
     src = Path(source_path)
     if not src.is_file():
-        raise FileNotFoundError(f"源文件不存在或非普通文件: {src}")
+        raise FileNotFoundError(f"源文件不存在或不是普通文件: {src}")
 
     dst_dir = Path(backup_dir)
     try:
@@ -217,7 +247,7 @@ def create_atomic_backup(
     base_filename = f"{src.stem}_{timestamp}{src.suffix}.bak"
     target_backup_path = dst_dir / base_filename
 
-    # 时间戳碰撞防御：若同名备份文件已存在，自增后缀 _01, _02...
+    # 时间戳碰撞处理：若同秒内备份文件已存在，增加后缀 _01, _02...
     if target_backup_path.exists():
         counter = 1
         while True:
@@ -229,6 +259,7 @@ def create_atomic_backup(
             counter += 1
 
     temp_path_str: Union[str, None] = None
+    temp_fd: Optional[int] = None
     try:
         temp_fd, temp_path_str = tempfile.mkstemp(
             dir=dst_dir,
@@ -245,8 +276,13 @@ def create_atomic_backup(
             temp_file.flush()
             os.fsync(temp_file.fileno())
 
-        os.replace(temp_path_str, target_backup_path)
+        _atomic_replace_with_retry(temp_path_str, target_backup_path)
     except Exception as e:
+        if temp_fd is not None:
+            try:
+                os.close(temp_fd)
+            except OSError:
+                pass
         if temp_path_str and os.path.exists(temp_path_str):
             try:
                 os.remove(temp_path_str)

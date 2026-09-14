@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from scripts.types import Finding
+from scripts.safe_io import read_file_safe
 
 EXPERT_STATUS_COMPLETED = "completed"
 EXPERT_STATUS_FAILED = "failed"
@@ -331,7 +332,7 @@ def load_expert_result_records(store_path: Path) -> List[Dict[str, Any]]:
     path = Path(store_path)
     if not path.is_file():
         return []
-    data = json.loads(path.read_text(encoding="utf-8"))
+    data = json.loads(read_file_safe(path)[0])
     if isinstance(data, dict):
         records = data.get("results", [])
     elif isinstance(data, list):
