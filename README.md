@@ -313,14 +313,26 @@ status_code, state_path = adjudicate_foreshadowing(
 宿主执行完语义审查后，用统一契约回传实际结果；底层只接收真实执行结果，不代为调用专家。
 
 ```python
+from scripts.safe_io import read_file_safe
 from scripts.story_audit import ExpertResult, archive_expert_results, compute_text_fingerprint
+from scripts.types import Finding
 
+chapter_text, _, _ = read_file_safe(project_dir / "正文" / "第001章.txt")
 result = ExpertResult(
     expert="因果审查员",
     status="completed",              # completed / failed / not_executed
     chapters=[1],
-    text_fingerprint=compute_text_fingerprint(project_dir, 1),
-    findings=[{"severity": "P1", "category": "causal", "issue": "钥匙来源缺失", "fix": "统一来源"}],
+    text_fingerprint=compute_text_fingerprint({1: chapter_text}),
+    findings=[
+        Finding(
+            severity="P1",
+            category="causal",
+            location="第001章 行2",
+            evidence="他握紧了钥匙。",
+            issue="钥匙来源缺失",
+            fix="【事实对齐】补齐来源交代。",
+        )
+    ],
 )
 
 status_code, summary_path = archive_expert_results(project_dir, [result])
@@ -333,7 +345,15 @@ status_code, summary_path = archive_expert_results(project_dir, [result])
 `apply_fix` 写回成功后会登记补丁事件，并把第 N 章报告与第 N+1 章接缝检查登记为待复审项：
 
 ```python
-from scripts.story_audit import get_pending_rechecks, is_chapter_version_audited, record_issue_closure, resolve_recheck
+from scripts.audit_state import load_audit_state
+from scripts.safe_io import read_file_safe
+from scripts.story_audit import (
+    compute_text_fingerprint,
+    get_pending_rechecks,
+    is_chapter_version_audited,
+    record_issue_closure,
+    resolve_recheck,
+)
 
 status_code, pending = get_pending_rechecks(project_dir)
 # pending["pending"] 每项含 chapter、scope（chapter/seam）、当前正文版本与 needs_reaudit
@@ -342,8 +362,10 @@ status_code, pending = get_pending_rechecks(project_dir)
 resolve_recheck(project_dir, chapter=1, scope="chapter", resolution="已人工复核", source="author")
 record_issue_closure(project_dir, chapter=1, issue="钥匙来源缺失", reason="已统一来源", source="author")
 
-# 完成章号不再等于当前版本已审：用指纹判断
-current = is_chapter_version_audited(project_dir, chapter=1)
+# 完成章号不再等于当前版本已审：用正文指纹判断
+chapter_text, _, _ = read_file_safe(project_dir / "正文" / "第001章.txt")
+state = load_audit_state(project_dir / "reports")
+audited = is_chapter_version_audited(state, 1, compute_text_fingerprint({1: chapter_text}))
 ```
 
 正文版本变化后旧归档报告会被保存到 `reports/单章审查/历史/`，不会被静默覆盖。
