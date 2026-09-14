@@ -31,13 +31,20 @@ from scripts.chapter_resolver import ChapterResolver
 from scripts.genre_detector import GenreProfile, detect_genre, resolve_canonical_genre
 from scripts.format_scanner import scan_typography_flaws
 from scripts.ledger_engine import (
+    ASSET_EVENT_DECISIONS,
+    ASSET_EVENT_DIRECTIONS,
     AssetItem,
     LedgerDirtyError,
     LedgerState,
     check_dirty_state,
+    categorize_asset,
     ensure_ledger_recovered,
     create_volume_checkpoint,
+    extract_heuristic_asset_changes,
     extract_heuristic_assets,
+    find_asset_by_identity,
+    make_asset_event_id,
+    make_confirmed_asset_id,
     parse_chinese_or_arabic_number,
     read_file_safe,
     save_ledger_state,
@@ -1778,6 +1785,21 @@ def run_scope_audit(
     reports_dir = project_dir / "reports"
     run_id = uuid.uuid4().hex[:12]
 
+    # 批量失败必须回滚账本：批次内各章可能已经写入 资源账本.json/.md。
+    batch_json_path, batch_md_path = locate_ledger_paths(project_dir)
+    batch_ledger_snapshot: Dict[Path, Optional[bytes]] = {
+        batch_json_path: _read_optional_bytes(batch_json_path),
+        batch_md_path: _read_optional_bytes(batch_md_path),
+    }
+
+    def _rollback_batch_ledger() -> None:
+        """把账本恢复到批次开始前的字节（含删除本次新建文件）。"""
+        for path, original in batch_ledger_snapshot.items():
+            try:
+                _restore_optional_bytes(path, original)
+            except OSError:
+                pass
+
     # 运行时探测与跨批状态机继承
     effective_mode, fallback_reason = _resolve_precheck_mode(mode)
     try:
@@ -1833,6 +1855,7 @@ def run_scope_audit(
             _staged_writes=staged_writes,
         )
         if code == 3:
+            _rollback_batch_ledger()
             if not silent:
                 safe_console_print(f"[错误] 第 {chap.index:g} 章审查失败，批量审查已停止。", file=sys.stderr)
             return 3
@@ -1934,6 +1957,7 @@ def run_scope_audit(
     try:
         save_audit_state(audit_state, reports_dir)
     except Exception as e:
+        _rollback_batch_ledger()
         if not silent:
             safe_console_print(f"[错误] 保存审计状态失败: {e}", file=sys.stderr)
         return 3
@@ -1942,6 +1966,7 @@ def run_scope_audit(
             staged_writes, state_path, original_state, original_artifacts
         )
     except Exception as e:
+        _rollback_batch_ledger()
         if not silent:
             safe_console_print(f"[错误] 写入审查产物失败: {e}", file=sys.stderr)
         return 3
@@ -2820,6 +2845,311 @@ def run_record_issue_closure(
     return 0, state_path
 
 
+def _normalize_asset_event(event: Any, owner: Optional[str] = None) -> Dict[str, Any]:
+    """校验并规整资产变更事件；启发式无法判断的语义必须由宿主显式提供。"""
+    if not isinstance(event, dict):
+        raise ValueError("event 必须是预览返回的候选字典或宿主自建的事件字段字典")
+
+    name = event.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("资产事件必须提供非空名称 (name)")
+    name_value = name.strip()
+
+    owner_value = owner if isinstance(owner, str) and owner.strip() else event.get("owner", "主角")
+    if not isinstance(owner_value, str) or not owner_value.strip():
+        raise ValueError("资产事件必须提供非空所有者 (owner)")
+
+    direction = event.get("direction", "gain")
+    if not isinstance(direction, str) or direction.strip().lower() not in ASSET_EVENT_DIRECTIONS:
+        raise ValueError("增减方向 (direction) 只能是 gain 或 consume")
+    direction_value = direction.strip().lower()
+
+    quantity = event.get("quantity")
+    if (
+        isinstance(quantity, bool)
+        or not isinstance(quantity, (int, float))
+        or not math.isfinite(float(quantity))
+        or quantity <= 0
+    ):
+        raise ValueError("数量 (quantity) 必须是有限的正当数值")
+
+    unit = event.get("unit", "")
+    if unit is None:
+        unit = ""
+    if not isinstance(unit, str):
+        raise ValueError("单位 (unit) 必须为字符串")
+
+    chapter = event.get("chapter", event.get("origin_chapter"))
+    if (
+        isinstance(chapter, bool)
+        or not isinstance(chapter, (int, float))
+        or not math.isfinite(float(chapter))
+        or chapter < 0
+    ):
+        raise ValueError("章号 (chapter) 必须是有限的非负数值")
+
+    line_number = event.get("line_number")
+    if line_number is not None and (
+        isinstance(line_number, bool) or not isinstance(line_number, int) or line_number <= 0
+    ):
+        raise ValueError("位置行号 (line_number) 必须是正整数或 null")
+    column = event.get("column")
+    if column is not None and (
+        isinstance(column, bool) or not isinstance(column, int) or column <= 0
+    ):
+        raise ValueError("位置列号 (column) 必须是正整数或 null")
+
+    evidence = event.get("evidence", "")
+    if evidence is None:
+        evidence = ""
+    if not isinstance(evidence, str):
+        raise ValueError("原文证据 (evidence) 必须为字符串")
+
+    category = event.get("category")
+    if category is not None and not isinstance(category, str):
+        raise ValueError("资产类别 (category) 必须为字符串或 null")
+
+    candidate_source = "heuristic" if str(event.get("source") or "") == "heuristic" else "host"
+    event_id = event.get("event_id")
+    if not isinstance(event_id, str) or not event_id.strip():
+        event_id = make_asset_event_id(
+            chapter, line_number, column, name_value, owner_value, direction_value, quantity, unit
+        )
+
+    return {
+        "event_id": event_id.strip(),
+        "name": name_value,
+        "owner": owner_value.strip(),
+        "direction": direction_value,
+        "quantity": quantity,
+        "unit": unit.strip(),
+        "chapter": float(chapter),
+        "line_number": line_number,
+        "column": column,
+        "evidence": evidence.strip(),
+        "category": (category or "").strip(),
+        "candidate_source": candidate_source,
+    }
+
+
+def run_preview_asset_changes(
+    project_dir: Path,
+    scope_str: Optional[str] = None,
+    chapter_index: Optional[float] = None,
+    owner: Optional[str] = None,
+    silent: bool = False,
+) -> Tuple[int, Dict[str, Any]]:
+    """候选资产变更预览：只读扫描，不写账本，也不把候选写成既定事实。"""
+    try:
+        _validate_boolean_options(silent=silent)
+        _validate_chapter_index(chapter_index)
+        if scope_str is not None and chapter_index is not None:
+            raise ValueError("scope_str 与 chapter_index 只能二选一")
+        if scope_str is None and chapter_index is None:
+            raise ValueError("必须提供 scope_str 或 chapter_index")
+        if scope_str is not None and (not isinstance(scope_str, str) or not scope_str.strip()):
+            raise ValueError("scope_str 必须是非空字符串或 None")
+        if owner is not None and (not isinstance(owner, str) or not owner.strip()):
+            raise ValueError("owner 必须是非空字符串或 None")
+    except ValueError as e:
+        _report_api_error(e, silent)
+        return 3, {}
+
+    json_path, _ = locate_ledger_paths(project_dir)
+    try:
+        state = load_ledger_state(json_path)
+    except Exception as e:
+        _report_api_error(e, silent)
+        return 3, {}
+
+    chapters = ChapterResolver().discover_chapters(project_dir)
+    if not chapters:
+        _report_api_error(ValueError("未发现任何章节文件，无法预览候选变更"), silent)
+        return 3, {}
+    try:
+        if scope_str is not None:
+            s_min, s_max = parse_scope_range(scope_str)
+            targets = [item for item in chapters if s_min <= item.index <= s_max]
+        else:
+            target = _select_unique_chapter(chapters, chapter_index)
+            targets = [target] if target is not None else []
+        if not targets:
+            raise ValueError("指定范围内未发现章节")
+        _validate_unique_targets(targets)
+    except ValueError as e:
+        _report_api_error(e, silent)
+        return 3, {}
+
+    owner_value = owner.strip() if isinstance(owner, str) and owner.strip() else "主角"
+    candidates: List[Dict[str, Any]] = []
+    try:
+        for chapter in targets:
+            text, _, _ = read_file_safe(chapter.path)
+            for change in extract_heuristic_asset_changes(
+                text, chapter.index, owner=owner_value
+            ):
+                existing = find_asset_by_identity(state, change["name"], change["owner"])
+                change["existing_asset_id"] = existing.id if existing is not None else ""
+                change["existing_quantity"] = existing.quantity if existing is not None else None
+                candidates.append(change)
+    except (OSError, SafeIOError, ValueError) as e:
+        _report_api_error(e, silent)
+        return 3, {}
+
+    counts = {
+        "total": len(candidates),
+        "gain": sum(1 for item in candidates if item["direction"] == "gain"),
+        "consume": sum(1 for item in candidates if item["direction"] == "consume"),
+        "matched_existing": sum(1 for item in candidates if item["existing_asset_id"]),
+    }
+    return 0, {
+        "candidates": candidates,
+        "chapters": [float(chapter.index) for chapter in targets],
+        "counts": counts,
+    }
+
+
+def run_confirm_asset_event(
+    project_dir: Path,
+    event: Any,
+    decision: str = "accept",
+    owner: Optional[str] = None,
+    reason: str = "",
+    source: str = "author",
+    silent: bool = False,
+) -> Tuple[int, Path]:
+    """确认或否决候选资产变更，并按 event_id 幂等提交到账本。"""
+    try:
+        _validate_boolean_options(silent=silent)
+        if not isinstance(decision, str) or decision.strip().lower() not in ASSET_EVENT_DECISIONS:
+            raise ValueError("裁决 (decision) 只能是 accept 或 reject")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("必须提供裁决原因 (reason)")
+        if not isinstance(source, str) or source.strip().lower() not in VALID_COORDINATION_SOURCES:
+            raise ValueError("裁决来源 (source) 只能是 author 或 expert")
+        if owner is not None and (not isinstance(owner, str) or not owner.strip()):
+            raise ValueError("owner 必须是非空字符串或 None")
+        payload = _normalize_asset_event(event, owner=owner)
+    except ValueError as e:
+        _report_api_error(e, silent)
+        return 3, Path("")
+
+    decision_value = decision.strip().lower()
+    source_value = source.strip().lower()
+    reason_value = reason.strip()
+    json_path, md_path = locate_ledger_paths(project_dir)
+    try:
+        state = load_ledger_state(json_path)
+    except Exception as e:
+        _report_api_error(e, silent)
+        return 3, Path("")
+
+    event_id = payload["event_id"]
+    existing_event = next(
+        (
+            item
+            for item in state.asset_events
+            if isinstance(item, dict) and str(item.get("event_id") or "") == event_id
+        ),
+        None,
+    )
+    if existing_event is not None:
+        if str(existing_event.get("decision") or "") == decision_value:
+            # 幂等：同一事件重复提交不重复扣账、不重复写流水，也不改写账本。
+            return 0, json_path
+        _report_api_error(
+            ValueError(
+                f"事件 {event_id} 已按 {existing_event.get('decision')} 裁决，不能改判为 {decision_value}"
+            ),
+            silent,
+        )
+        return 3, Path("")
+
+    asset = find_asset_by_identity(state, payload["name"], payload["owner"])
+    unit_value = payload["unit"] or (asset.unit if asset is not None else "个")
+    category_value = payload["category"] or (
+        asset.category if asset is not None else categorize_asset(payload["name"])
+    )
+    before: Optional[Union[int, float]] = None
+    after: Optional[Union[int, float]] = None
+    if decision_value == "reject":
+        # 否决只留裁决记录，不改动任何数量。
+        pass
+    else:
+        if asset is None:
+            if payload["direction"] == "consume":
+                _report_api_error(
+                    ValueError(
+                        f"资产 {payload['name']}（{payload['owner']}）尚无账本记录，不能直接扣账"
+                    ),
+                    silent,
+                )
+                return 3, Path("")
+            asset_id = make_confirmed_asset_id(payload["name"], payload["owner"])
+            if asset_id in state.assets:
+                index = 2
+                while f"{asset_id}_{index}" in state.assets:
+                    index += 1
+                asset_id = f"{asset_id}_{index}"
+            asset = AssetItem(
+                id=asset_id,
+                name=payload["name"],
+                category=category_value,
+                quantity=0,
+                unit=unit_value,
+                owner=payload["owner"],
+                current_holder=payload["owner"],
+                status="ACQUIRED",
+                origin_chapter=payload["chapter"],
+            )
+            state.assets[asset.id] = asset
+        before = asset.quantity
+        delta: Union[int, float] = (
+            payload["quantity"] if payload["direction"] == "gain" else -payload["quantity"]
+        )
+        # 复用既有数量语义（含归零与丹药耗材耗尽自动流转 CONSUMED）。
+        asset.modify_quantity(delta, chapter=payload["chapter"], reason=f"{reason_value}（事件 {event_id}）")
+        after = asset.quantity
+
+    state.asset_events.append({
+        "event_id": event_id,
+        "name": payload["name"],
+        "owner": payload["owner"],
+        "current_holder": asset.current_holder if asset is not None else payload["owner"],
+        "category": category_value,
+        "unit": unit_value,
+        "direction": payload["direction"],
+        "quantity": payload["quantity"],
+        "chapter": payload["chapter"],
+        "line_number": payload["line_number"],
+        "column": payload["column"],
+        "evidence": payload["evidence"],
+        "candidate_source": payload["candidate_source"],
+        "decision": decision_value,
+        "source": source_value,
+        "reason": reason_value,
+        "decided_at": datetime.now(timezone.utc).isoformat(),
+        "asset_id": asset.id if asset is not None else "",
+        "quantity_before": before,
+        "quantity_after": after,
+        "status_after": asset.status if asset is not None else "",
+    })
+    state.last_updated_chapter = max(
+        float(state.last_updated_chapter or 0.0), float(payload["chapter"])
+    )
+
+    try:
+        save_ledger_state(state, json_path, md_path, force=False)
+    except Exception as e:
+        _report_api_error(e, silent)
+        return 3, Path("")
+    if not silent:
+        safe_console_print(
+            f"资产事件 {event_id} 已按 {decision_value} 提交：{payload['owner']}/{payload['name']}"
+        )
+    return 0, json_path
+
+
 def audit_chapter(
     project_dir: Union[str, Path] = ".",
     chapter_index: Optional[float] = None,
@@ -3299,6 +3629,95 @@ def record_issue_closure(
         return 3, Path("")
 
 
+def preview_asset_changes(
+    project_dir: Union[str, Path] = ".",
+    scope_str: Optional[str] = None,
+    chapter_index: Optional[float] = None,
+    owner: Optional[str] = None,
+    silent: bool = False,
+) -> Tuple[int, Dict[str, Any]]:
+    """资产候选变更预览纯 Python API
+
+    只读扫描指定范围，返回结构化候选（event_id、名称、所有者、增减方向与数量、单位、
+    章号、行号、原文证据、来源），并附带账本中同身份资产的现状。预览不会修改
+    ``资源账本.json/.md``，候选也不会被当作既定事实；是否入账必须由宿主或作者显式确认。
+
+    Args:
+        project_dir: 小说项目根目录（Path 或 str，默认当前目录）
+        scope_str: 扫描范围（如 ``"1-3"``，与 chapter_index 二选一）
+        chapter_index: 单章号（与 scope_str 二选一）
+        owner: 候选归属所有者覆盖值（默认 ``主角``，启发式无法判断归属）
+        silent: 是否静默输出
+
+    Returns:
+        Tuple[int, Dict[str, Any]]: (状态码, ``{"candidates", "chapters", "counts"}``)；
+        失败时返回 ``(3, {})``
+    """
+    try:
+        p_dir = _resolve_project_dir(project_dir)
+    except (OSError, TypeError, ValueError) as e:
+        _report_api_error(e, silent)
+        return 3, {}
+    try:
+        return run_preview_asset_changes(
+            project_dir=p_dir,
+            scope_str=scope_str,
+            chapter_index=chapter_index,
+            owner=owner,
+            silent=silent,
+        )
+    except (OSError, SafeIOError, TypeError, ValueError) as e:
+        _report_api_error(e, silent)
+        return 3, {}
+
+
+def confirm_asset_event(
+    project_dir: Union[str, Path] = ".",
+    event: Optional[Any] = None,
+    decision: str = "accept",
+    owner: Optional[str] = None,
+    reason: str = "",
+    source: str = "author",
+    silent: bool = False,
+) -> Tuple[int, Path]:
+    """资产变更确认/否决纯 Python API（按 event_id 幂等提交）
+
+    接受预览返回的候选字典，也接受宿主自建的事件字段字典（名称、方向、数量、章号等）。
+    ``accept`` 会复用 ``AssetItem.modify_quantity`` / ``transition`` 既有语义入账，
+    ``reject`` 只登记裁决不改动数量；同一 event_id 重复提交不重复加账/扣账，改判返回错误码。
+
+    Args:
+        project_dir: 小说项目根目录（Path 或 str，默认当前目录）
+        event: 候选事件字典（预览结果或宿主自建字段）
+        decision: ``accept`` 或 ``reject``
+        owner: 所有者覆盖值（默认取事件内的 owner，再回退 ``主角``）
+        reason: 裁决原因（必填）
+        source: 裁决来源，``author`` 或 ``expert``
+        silent: 是否静默输出
+
+    Returns:
+        Tuple[int, Path]: (状态码, 账本 JSON 路径)；失败时返回 ``(3, Path(""))``
+    """
+    try:
+        p_dir = _resolve_project_dir(project_dir)
+    except (OSError, TypeError, ValueError) as e:
+        _report_api_error(e, silent)
+        return 3, Path("")
+    try:
+        return run_confirm_asset_event(
+            project_dir=p_dir,
+            event=event,
+            decision=decision,
+            owner=owner,
+            reason=reason,
+            source=source,
+            silent=silent,
+        )
+    except (OSError, SafeIOError, TypeError, ValueError) as e:
+        _report_api_error(e, silent)
+        return 3, Path("")
+
+
 __all__ = [
     # 核心纯 Python API
     "audit_chapter",
@@ -3322,6 +3741,9 @@ __all__ = [
     "is_chapter_version_audited",
     "get_chapter_version",
     "get_report_history_path",
+    # F06 资产候选变更与确认入口
+    "preview_asset_changes",
+    "confirm_asset_event",
     # 底层执行管线与别名兼容
     "run_audit",
     "run_scope_audit",
@@ -3334,6 +3756,8 @@ __all__ = [
     "run_get_pending_rechecks",
     "run_resolve_recheck",
     "run_record_issue_closure",
+    "run_preview_asset_changes",
+    "run_confirm_asset_event",
     # 预审包与报告生成
     "build_pre_audit_bundle",
     "render_audit_report",

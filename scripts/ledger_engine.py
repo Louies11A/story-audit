@@ -11,6 +11,7 @@
 7. 从 Markdown 反向增量同步更新 JSON 数据源。
 """
 
+import hashlib
 import json
 import math
 import os
@@ -113,6 +114,14 @@ HEURISTIC_ACQUISITION_VERBS: Set[str] = {
 }
 
 HEURISTIC_ENEMY_VERBS: Set[str] = {"击毁", "击沉", "打烂", "摧毁", "炸沉", "包抄", "呼啸而来", "截击", "逼近", "海盗船", "敌方"}
+
+# F06：候选变更方向与裁决取值；消耗动词仅用于预览标注，最终裁决始终由宿主/作者给出。
+ASSET_EVENT_DIRECTIONS: Set[str] = {"gain", "consume"}
+ASSET_EVENT_DECISIONS: Set[str] = {"accept", "reject"}
+HEURISTIC_CONSUMPTION_VERBS: Set[str] = {
+    "消耗", "用掉", "用去", "耗费", "花费", "支付", "失去", "损失", "损坏",
+    "焚毁", "烧毁", "服用", "吃掉", "扣除", "支出", "耗尽", "报销",
+}
 
 class LedgerDirtyError(Exception):
     """防脏写拦截器异常：Markdown 编辑时间晚于 JSON 数据源"""
@@ -275,6 +284,8 @@ class LedgerState:
     last_updated_chapter: float = 0.0
     assets: Dict[str, AssetItem] = field(default_factory=dict)
     foreshadowing_stash: List[Dict[str, Any]] = field(default_factory=list)
+    # F06 可选新键：候选变更的确认/否决裁决流水；旧账本缺少该键时按空值加载。
+    asset_events: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         """序列化为字典结构"""
@@ -282,6 +293,7 @@ class LedgerState:
             "last_updated_chapter": self.last_updated_chapter,
             "assets": {k: v.to_dict() for k, v in self.assets.items()},
             "foreshadowing_stash": list(self.foreshadowing_stash),
+            "asset_events": [dict(item) for item in self.asset_events],
         }
 
     @classmethod
@@ -295,6 +307,22 @@ class LedgerState:
         stash = d.get("foreshadowing_stash", [])
         if not isinstance(stash, list) or any(not isinstance(item, dict) for item in stash):
             raise ValueError("账本 foreshadowing_stash 必须为对象列表")
+        raw_events = d.get("asset_events", [])
+        if not isinstance(raw_events, list) or any(not isinstance(item, dict) for item in raw_events):
+            raise ValueError("账本 asset_events 必须为对象列表")
+        for event in raw_events:
+            for text_key in (
+                "event_id", "name", "owner", "current_holder", "category", "unit",
+                "direction", "evidence", "decision", "source", "reason", "decided_at",
+            ):
+                if text_key in event and not isinstance(event[text_key], str):
+                    raise ValueError(f"资产事件 {text_key} 必须为字符串")
+            for num_key in ("chapter", "quantity", "line_number", "column", "quantity_before", "quantity_after"):
+                value = event.get(num_key)
+                if value is None:
+                    continue
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+                    raise ValueError(f"资产事件 {num_key} 必须为有限数值或 null")
         for item in stash:
             for text_key in ("name", "origin", "status"):
                 if text_key in item and not isinstance(item[text_key], str):
@@ -316,6 +344,7 @@ class LedgerState:
             last_updated_chapter=float(d.get("last_updated_chapter", 0.0)),
             assets=assets,
             foreshadowing_stash=list(stash),
+            asset_events=[dict(item) for item in raw_events],
         )
 
 
@@ -585,6 +614,128 @@ def extract_heuristic_assets(text: str, chapter_index: float, genre: Optional[st
         })
         idx += 1
 
+    return results
+
+
+def categorize_asset(name: str) -> str:
+    """公开入口：按名称启发式推断标准资产类别"""
+    return _categorize_asset(str(name or ""))
+
+
+def _event_chapter_token(chapter: Any) -> str:
+    try:
+        value = float(chapter)
+    except (TypeError, ValueError, OverflowError):
+        return str(chapter)
+    return str(int(value)) if value.is_integer() else f"{value:g}"
+
+
+def make_asset_event_id(
+    chapter: Any,
+    line_number: Any,
+    column: Any,
+    name: str,
+    owner: str,
+    direction: str,
+    quantity: Any,
+    unit: str,
+) -> str:
+    """构造候选变更的稳定身份：章号 + 行列 + 身份 + 方向 + 数量 + 单位。"""
+    basis = "|".join(
+        [
+            _event_chapter_token(chapter),
+            str(line_number if line_number is not None else ""),
+            str(column if column is not None else ""),
+            str(name or "").strip(),
+            str(owner or "").strip(),
+            str(direction or "").strip(),
+            repr(quantity),
+            str(unit or "").strip(),
+        ]
+    )
+    return "asset-event-" + hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
+
+
+def make_confirmed_asset_id(name: str, owner: str) -> str:
+    """确认新增资产时的确定性身份：名称 + 所有者，避免同名不同所有者互相覆盖。"""
+    slug = re.sub(r'[^a-zA-Z0-9一-龥]', '', str(name or ""))[:12] or "asset"
+    digest = hashlib.sha256(
+        f"{str(name or '').strip()}|{str(owner or '').strip()}".encode("utf-8")
+    ).hexdigest()[:8]
+    return f"ast_evt_{slug}_{digest}"
+
+
+def find_asset_by_identity(state: "LedgerState", name: str, owner: str) -> Optional[AssetItem]:
+    """按 (名称, 所有者) 定位资产条目；同名不同所有者必须是两条独立记录。"""
+    target_name = str(name or "").strip()
+    if not target_name:
+        return None
+    target_owner = str(owner or "").strip()
+    for asset_id in sorted(state.assets):
+        item = state.assets[asset_id]
+        if item.name.strip() == target_name and item.owner.strip() == target_owner:
+            return item
+    return None
+
+
+def extract_heuristic_asset_changes(
+    text: str,
+    chapter_index: float,
+    owner: str = "主角",
+) -> List[Dict[str, Any]]:
+    """按出现次数提取候选资产变更（gain/consume）。
+
+    预览只做启发式标注：数量 + 单位 + 物资名称同现时给出候选，方向由同一小句内的
+    消耗动词判定；是否属于真实变更始终由宿主或作者裁决，本函数不会改动账本。
+    """
+    if not text:
+        return []
+    owner_value = str(owner or "主角").strip() or "主角"
+    results: List[Dict[str, Any]] = []
+    enemy_factions = {"敌方", "敌军", "敌舰", "敌艇", "海盗", "黑旗帮", "铁钩帮", "水匪", "变异体", "丧尸"}
+    loot_verbs = {"缴获", "打捞", "俘获", "搜刮", "战利品", "起出", "入库"}
+    for line_number, raw_line in enumerate(text.splitlines(), 1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        for match in HEURISTIC_NATURAL_PATTERN.finditer(line):
+            name = _clean_asset_name((match.group("desc") or "") + match.group("kw"))
+            if len(name) < 2:
+                continue
+            if any(faction in name for faction in enemy_factions) and not any(
+                verb in line for verb in loot_verbs
+            ):
+                continue
+            try:
+                quantity = parse_chinese_or_arabic_number(match.group("num"))
+            except (ValueError, OverflowError):
+                continue
+            if isinstance(quantity, bool) or not isinstance(quantity, (int, float)):
+                continue
+            if not math.isfinite(float(quantity)) or quantity <= 0:
+                continue
+            unit = match.group("unit")
+            # 方向判定只看同一小句前缀，避免“先获得后消耗”整行串味。
+            segment_start = max(line.rfind(delimiter, 0, match.start()) for delimiter in "，,。！？；;、") + 1
+            prefix = line[segment_start:match.start()]
+            direction = "consume" if any(verb in prefix for verb in HEURISTIC_CONSUMPTION_VERBS) else "gain"
+            results.append({
+                "event_id": make_asset_event_id(
+                    chapter_index, line_number, match.start() + 1, name, owner_value, direction, quantity, unit
+                ),
+                "name": name,
+                "owner": owner_value,
+                "current_holder": owner_value,
+                "category": _categorize_asset(name),
+                "direction": direction,
+                "quantity": quantity,
+                "unit": unit,
+                "chapter": float(chapter_index),
+                "line_number": line_number,
+                "column": match.start() + 1,
+                "evidence": match.group(0),
+                "source": "heuristic",
+            })
     return results
 
 
