@@ -4132,6 +4132,372 @@ def iter_audit_scope(
     yield summary_item
 
 
+def _normalize_context_entities(entities: Any) -> List[Dict[str, str]]:
+    """规整实体过滤条件：支持名称字符串或 {name, owner} 字典。"""
+    if entities is None:
+        return []
+    if not isinstance(entities, (list, tuple)):
+        raise ValueError("entities 必须是名称或 {name, owner} 字典的列表")
+    normalized: List[Dict[str, str]] = []
+    for raw in entities:
+        if isinstance(raw, str):
+            name = raw.strip()
+            owner = ""
+        elif isinstance(raw, dict):
+            name = str(raw.get("name") or "").strip()
+            owner = str(raw.get("owner") or "").strip()
+        else:
+            raise ValueError("entities 只能包含名称字符串或 {name, owner} 字典")
+        if not name:
+            raise ValueError("entities 中的名称不能为空")
+        normalized.append({"name": name, "owner": owner})
+    return normalized
+
+
+def _package_size(payload: Dict[str, Any]) -> int:
+    """序列化后的 UTF-8 字节数，作为规模预算的度量口径。"""
+    return len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+
+
+def _ledger_evidence_pointer(json_path: Path, project_dir: Path, asset_id: str) -> Dict[str, Any]:
+    try:
+        ledger_rel = json_path.relative_to(project_dir).as_posix()
+    except ValueError:
+        ledger_rel = json_path.as_posix()
+    return {
+        "ledger_path": ledger_rel,
+        "json_pointer": f"/assets/{asset_id}/history",
+        "query_hint": "query_asset_history(project_dir, name=<名称>, owner=<所有者>, offset=<已被省略的条数>)",
+    }
+
+
+def run_build_context_package(
+    project_dir: Path,
+    chapter_index: Optional[float] = None,
+    budget: Optional[int] = None,
+    entities: Any = None,
+    silent: bool = False,
+) -> Tuple[int, Dict[str, Any]]:
+    """按规模预算装配章节上下文，复用 build_pre_audit_bundle 的资产/伏笔/未决问题装配。"""
+    try:
+        _validate_boolean_options(silent=silent)
+        _validate_chapter_index(chapter_index)
+        if budget is not None and (
+            isinstance(budget, bool)
+            or not isinstance(budget, int)
+            or budget <= 0
+        ):
+            raise ValueError("budget 必须是正整数（字节预算）或 None")
+        entity_filter = _normalize_context_entities(entities)
+    except ValueError as e:
+        _report_api_error(e, silent)
+        return 3, {}
+
+    json_path, _ = locate_ledger_paths(project_dir)
+    try:
+        state = load_ledger_state(json_path)
+        audit_state = load_audit_state(project_dir / "reports")
+    except Exception as e:
+        _report_api_error(e, silent)
+        return 3, {}
+
+    chapters = ChapterResolver().discover_chapters(project_dir)
+    if not chapters:
+        _report_api_error(ValueError("未发现任何章节文件"), silent)
+        return 3, {}
+    try:
+        curr_chapter = _select_unique_chapter(chapters, chapter_index)
+    except ValueError as e:
+        _report_api_error(e, silent)
+        return 3, {}
+    if curr_chapter is None:
+        _report_api_error(ValueError(f"未找到指定章号: {chapter_index}"), silent)
+        return 3, {}
+    curr_pos = chapters.index(curr_chapter)
+    prev_chapter = chapters[curr_pos - 1] if curr_pos > 0 else None
+    try:
+        curr_text, curr_enc, curr_eol = read_file_safe(curr_chapter.path)
+        prev_text = read_file_safe(prev_chapter.path)[0] if prev_chapter is not None else None
+    except Exception as e:
+        _report_api_error(e, silent)
+        return 3, {}
+
+    genre_profile = detect_genre(curr_text)
+    boundary_ctx = extract_boundary_slices(prev_text, curr_text)
+    inherited_items = get_inherited_items(audit_state)
+    package = build_pre_audit_bundle(
+        project_dir=project_dir,
+        curr_chapter=curr_chapter,
+        prev_chapter=prev_chapter,
+        chapters=chapters,
+        state=state,
+        findings=[],
+        boundary_ctx=boundary_ctx,
+        curr_enc=curr_enc,
+        curr_eol=curr_eol,
+        gap_warnings=[],
+        genre_profile=genre_profile,
+        inherited_items=inherited_items,
+    )
+    text_version = _text_content_version(curr_text)
+    package["meta"]["text_version"] = text_version
+
+    stored_history = {
+        asset_id: len(item.history) if isinstance(item.history, list) else 0
+        for asset_id, item in state.assets.items()
+    }
+    omissions: List[Dict[str, Any]] = []
+    assets_in_package = package["ledger_snapshot"]["active_assets"]
+
+    # 1) 实体过滤：未命中实体从包内移除，但保留省略清单与定位信息
+    if entity_filter:
+        def matches(asset: Dict[str, Any]) -> bool:
+            for target in entity_filter:
+                if str(asset.get("name") or "").strip() != target["name"]:
+                    continue
+                if target["owner"] and str(asset.get("owner") or "").strip() != target["owner"]:
+                    continue
+                return True
+            return False
+
+        kept: List[Dict[str, Any]] = []
+        for asset in assets_in_package:
+            if matches(asset):
+                kept.append(asset)
+                continue
+            omissions.append({
+                "kind": "asset_filtered",
+                "asset_id": str(asset.get("id") or ""),
+                "asset_name": str(asset.get("name") or ""),
+                "owner": str(asset.get("owner") or ""),
+                "omitted_entries": len(asset.get("history") or []),
+                "reason": "未命中 entities 过滤条件",
+                "full_evidence": _ledger_evidence_pointer(
+                    json_path, project_dir, str(asset.get("id") or "")
+                ),
+            })
+        package["ledger_snapshot"]["active_assets"] = kept
+        assets_in_package = kept
+
+    # 2) 如实记录 build_pre_audit_bundle 自身的最近 5 条截断
+    for asset in assets_in_package:
+        asset_id = str(asset.get("id") or "")
+        stored = stored_history.get(asset_id, 0)
+        kept_count = len(asset.get("history") or [])
+        if stored > kept_count:
+            omissions.append({
+                "kind": "asset_history",
+                "asset_id": asset_id,
+                "asset_name": str(asset.get("name") or ""),
+                "owner": str(asset.get("owner") or ""),
+                "omitted_entries": stored - kept_count,
+                "kept_entries": kept_count,
+                "reason": "预审包默认仅保留每项资产最近 5 条流水",
+                "full_evidence": _ledger_evidence_pointer(json_path, project_dir, asset_id),
+            })
+
+    # 3) 规模预算：先压缩历史，再裁剪资产，最后压缩边界切片
+    used_bytes = _package_size(package)
+    if budget is not None and used_bytes > budget:
+        for keep_count in (3, 1, 0):
+            if used_bytes <= budget:
+                break
+            for asset in assets_in_package:
+                history = asset.get("history") or []
+                if len(history) > keep_count:
+                    trimmed = history[-keep_count:] if keep_count else []
+                    asset["history"] = trimmed
+                    asset["history_truncated_by_budget"] = True
+            used_bytes = _package_size(package)
+        if used_bytes > budget:
+            ordered = sorted(
+                assets_in_package,
+                key=lambda item: (
+                    -max(
+                        [float(entry.get("chapter") or 0) for entry in (item.get("history") or [])],
+                        default=float(item.get("origin_chapter") or 0),
+                    ),
+                    str(item.get("id") or ""),
+                ),
+            )
+            kept_assets: List[Dict[str, Any]] = []
+            for asset in ordered:
+                kept_assets.append(asset)
+                package["ledger_snapshot"]["active_assets"] = kept_assets
+                if _package_size(package) > budget:
+                    kept_assets.pop()
+                    package["ledger_snapshot"]["active_assets"] = kept_assets
+                    omissions.append({
+                        "kind": "asset_omitted",
+                        "asset_id": str(asset.get("id") or ""),
+                        "asset_name": str(asset.get("name") or ""),
+                        "owner": str(asset.get("owner") or ""),
+                        "omitted_entries": len(asset.get("history") or []),
+                        "reason": "超出规模预算，整项资产未随上下文交付",
+                        "full_evidence": _ledger_evidence_pointer(
+                            json_path, project_dir, str(asset.get("id") or "")
+                        ),
+                    })
+            assets_in_package = package["ledger_snapshot"]["active_assets"]
+            used_bytes = _package_size(package)
+        if used_bytes > budget:
+            boundary = package.get("boundary") or {}
+            for key in ("prev_tail_300", "curr_head_300"):
+                value = str(boundary.get(key) or "")
+                if len(value) > 120:
+                    boundary[key] = value[:120]
+            used_bytes = _package_size(package)
+        package["ledger_snapshot"]["history_budget_applied"] = True
+
+    used_bytes = _package_size(package)
+    hist_truncated = any(item["kind"] in ("asset_history", "asset_omitted") for item in omissions)
+    omitted_assets = sum(1 for item in omissions if item["kind"] in ("asset_filtered", "asset_omitted"))
+    insufficient = bool(omissions)
+    return 0, {
+        "chapter": float(curr_chapter.index),
+        "text_version": text_version,
+        "package": package,
+        "budget": {
+            "requested": budget is not None,
+            "limit_bytes": budget,
+            "used_bytes": used_bytes,
+            "within_budget": True if budget is None else used_bytes <= budget,
+        },
+        "omissions": omissions,
+        "insufficient_context": {
+            "history_truncated": hist_truncated,
+            "omitted_assets": omitted_assets,
+            "insufficient_context": insufficient,
+        },
+        "warning": (
+            "被省略条目不代表不存在冲突：请按 full_evidence 中的账本定位或用 "
+            "query_asset_history 取回完整流水后再下结论。"
+        ),
+        "counts": {
+            "assets_in_package": len(assets_in_package),
+            "assets_in_ledger": len(state.assets),
+            "omissions": len(omissions),
+        },
+    }
+
+
+def run_query_asset_history(
+    project_dir: Path,
+    name: str,
+    owner: Optional[str] = None,
+    limit: int = 20,
+    offset: int = 0,
+    chapter_range: Any = None,
+    silent: bool = False,
+) -> Tuple[int, Dict[str, Any]]:
+    """按需检索资产完整流水（可越过预审包最近 5 条截断），并给出行号/章号定位。"""
+    try:
+        _validate_boolean_options(silent=silent)
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("必须提供资产名称 (name)")
+        if owner is not None and (not isinstance(owner, str) or not owner.strip()):
+            raise ValueError("owner 必须是非空字符串或 None")
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise ValueError("limit 必须是正整数")
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ValueError("offset 必须是大于等于 0 的整数")
+        bounds: Optional[Tuple[float, float]] = None
+        if chapter_range is not None:
+            if isinstance(chapter_range, str):
+                bounds = parse_scope_range(chapter_range)
+            elif isinstance(chapter_range, (list, tuple)) and len(chapter_range) == 2:
+                low = float(chapter_range[0])
+                high = float(chapter_range[1])
+                if not math.isfinite(low) or not math.isfinite(high):
+                    raise ValueError("chapter_range 必须是有限章号")
+                bounds = (min(low, high), max(low, high))
+            else:
+                raise ValueError("chapter_range 必须是 'a-b' 字符串或 [起始章号, 结束章号]")
+    except (ValueError, TypeError) as e:
+        _report_api_error(e, silent)
+        return 3, {}
+
+    json_path, _ = locate_ledger_paths(project_dir)
+    try:
+        state = load_ledger_state(json_path)
+    except Exception as e:
+        _report_api_error(e, silent)
+        return 3, {}
+
+    if owner:
+        asset = find_asset_by_identity(state, name.strip(), owner.strip())
+    else:
+        # 未指定所有者时按名称匹配（按资产 id 排序取第一条，保持确定性）。
+        asset = next(
+            (
+                state.assets[asset_id]
+                for asset_id in sorted(state.assets)
+                if state.assets[asset_id].name.strip() == name.strip()
+            ),
+            None,
+        )
+    if asset is None:
+        _report_api_error(
+            ValueError(f"未找到资产 {name}（owner={owner or '未指定'}）"), silent
+        )
+        return 3, {}
+
+    history = asset.history if isinstance(asset.history, list) else []
+    located: List[Dict[str, Any]] = []
+    for index, entry in enumerate(history):
+        if not isinstance(entry, dict):
+            continue
+        chapter = entry.get("chapter")
+        if bounds is not None:
+            try:
+                value = float(chapter)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if not math.isfinite(value) or value < bounds[0] or value > bounds[1]:
+                continue
+        located.append(
+            {
+                "history_index": index,
+                "chapter": chapter,
+                "action": entry.get("action"),
+                "delta": entry.get("delta"),
+                "from_quantity": entry.get("from_quantity"),
+                "to_quantity": entry.get("to_quantity"),
+                "reason": entry.get("reason"),
+                "timestamp": entry.get("timestamp"),
+                "location": {
+                    "asset_id": asset.id,
+                    "ledger_path": json_path.name,
+                    "json_pointer": f"/assets/{asset.id}/history/{index}",
+                },
+            }
+        )
+    total = len(located)
+    # 默认按时间倒序返回：offset=0 为最近一条，offset 越大越早。
+    ordered = list(reversed(located))
+    page = ordered[offset:offset + limit]
+    return 0, {
+        "asset_id": asset.id,
+        "name": asset.name,
+        "owner": asset.owner,
+        "current_holder": asset.current_holder,
+        "quantity": asset.quantity,
+        "status": asset.status,
+        "unit": asset.unit,
+        "stored_history_len": len(history),
+        "matched_history_len": total,
+        "returned": len(page),
+        "offset": offset,
+        "limit": limit,
+        "has_more": offset + len(page) < total,
+        "chapter_range": list(bounds) if bounds else None,
+        "entries": page,
+        "warning": (
+            "这是账本流水原始记录；预审包默认只携带最近 5 条，更早证据需要按本入口检索后才能判断是否存在冲突。"
+        ),
+    }
+
+
 def audit_chapter(
     project_dir: Union[str, Path] = ".",
     chapter_index: Optional[float] = None,
@@ -4779,6 +5145,97 @@ def get_finding_dispositions(
         return 3, {}
 
 
+def build_context_package(
+    project_dir: Union[str, Path] = ".",
+    chapter_index: Optional[float] = None,
+    budget: Optional[int] = None,
+    entities: Any = None,
+    silent: bool = False,
+) -> Tuple[int, Dict[str, Any]]:
+    """上下文装配纯 Python API（F09）
+
+    复用 ``build_pre_audit_bundle`` 的资产/伏笔/未决问题装配，按规模预算裁剪并返回：
+    规模预算（limit/used/within_budget）、省略项目清单（省略了什么、为什么、完整证据的
+    账本定位与检索入口）、上下文不足标记（``history_truncated`` / ``omitted_assets`` /
+    ``insufficient_context``）以及“被省略不等于不存在冲突”的显式警告。
+
+    预审包默认只保留每项资产最近 5 条流水，本入口会把该截断如实列入省略清单，
+    宿主可用 :func:`query_asset_history` 取回更早证据后再下结论。
+
+    Args:
+        project_dir: 小说项目根目录（Path 或 str，默认当前目录）
+        chapter_index: 目标章号（None 表示最新章节）
+        budget: 序列化字节预算（正整数或 None 表示不裁剪）
+        entities: 实体过滤（名称字符串或 ``{"name": ..., "owner": ...}`` 列表）
+        silent: 是否静默输出
+
+    Returns:
+        Tuple[int, Dict[str, Any]]: (状态码, 上下文包)；失败时返回 ``(3, {})``
+    """
+    try:
+        p_dir = _resolve_project_dir(project_dir)
+    except (OSError, TypeError, ValueError) as e:
+        _report_api_error(e, silent)
+        return 3, {}
+    try:
+        return run_build_context_package(
+            project_dir=p_dir,
+            chapter_index=chapter_index,
+            budget=budget,
+            entities=entities,
+            silent=silent,
+        )
+    except (OSError, SafeIOError, TypeError, ValueError) as e:
+        _report_api_error(e, silent)
+        return 3, {}
+
+
+def query_asset_history(
+    project_dir: Union[str, Path] = ".",
+    name: str = "",
+    owner: Optional[str] = None,
+    limit: int = 20,
+    offset: int = 0,
+    chapter_range: Any = None,
+    silent: bool = False,
+) -> Tuple[int, Dict[str, Any]]:
+    """资产流水按需检索纯 Python API（F09）
+
+    支持取回预审包最近 5 条之外的指定历史（``offset`` 越大越早），每条结果携带
+    ``history_index`` 与账本 JSON Pointer 定位，便于宿主回填证据。
+
+    Args:
+        project_dir: 小说项目根目录（Path 或 str，默认当前目录）
+        name: 资产名称
+        owner: 所有者（可选，缺省按名称为准）
+        limit: 单页条数（正整数）
+        offset: 从最近一条起跳过的条数
+        chapter_range: 章号区间过滤（``"3-10"`` 或 ``[3, 10]``）
+        silent: 是否静默输出
+
+    Returns:
+        Tuple[int, Dict[str, Any]]: (状态码, 检索结果)；失败时返回 ``(3, {})``
+    """
+    try:
+        p_dir = _resolve_project_dir(project_dir)
+    except (OSError, TypeError, ValueError) as e:
+        _report_api_error(e, silent)
+        return 3, {}
+    try:
+        return run_query_asset_history(
+            project_dir=p_dir,
+            name=name,
+            owner=owner,
+            limit=limit,
+            offset=offset,
+            chapter_range=chapter_range,
+            silent=silent,
+        )
+    except (OSError, SafeIOError, TypeError, ValueError) as e:
+        _report_api_error(e, silent)
+        return 3, {}
+
+
 __all__ = [
     # 核心纯 Python API
     "audit_chapter",
@@ -4810,6 +5267,9 @@ __all__ = [
     "get_run_manifest_path",
     "record_finding_disposition",
     "get_finding_dispositions",
+    # F09 上下文装配与历史检索入口
+    "build_context_package",
+    "query_asset_history",
     # 底层执行管线与别名兼容
     "run_audit",
     "run_scope_audit",
@@ -4826,6 +5286,8 @@ __all__ = [
     "run_confirm_asset_event",
     "run_record_finding_disposition",
     "run_get_finding_dispositions",
+    "run_build_context_package",
+    "run_query_asset_history",
     # 预审包与报告生成
     "build_pre_audit_bundle",
     "render_audit_report",
